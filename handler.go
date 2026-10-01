@@ -1,0 +1,355 @@
+package masque
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/netip"
+	"strings"
+	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
+
+	"github.com/ArcCal/caddy-masque/internal/auth"
+	"github.com/ArcCal/caddy-masque/internal/ip"
+	"github.com/ArcCal/caddy-masque/internal/proto"
+)
+
+// DefaultTemplate is the path and query of the URI Template clients use
+// unless configured otherwise (RFC 9484 §3, the default well-known path).
+const DefaultTemplate = "/.well-known/masque/ip/{target}/{ipproto}/"
+
+const (
+	connectIP = "connect-ip"
+	// How long resolving a target host name may take (§4.1).
+	dnsTimeout = 5 * time.Second
+)
+
+func init() {
+	caddy.RegisterModule(Handler{})
+}
+
+// Handler answers CONNECT-IP requests (RFC 9484): extended CONNECT with
+// :protocol connect-ip over HTTP/2 and HTTP/3, and GET with Upgrade:
+// connect-ip over HTTP/1.1. Every other request, and any CONNECT-IP request
+// without valid credentials, goes to the next handler, so visitors and
+// probes see the site as usual and status codes only reach authenticated
+// users.
+type Handler struct {
+	// Path and query of the URI Template clients are configured with.
+	Template string `json:"template,omitempty"`
+
+	tpl  *proto.Template
+	app  *App
+	log  *zap.Logger
+	name string
+}
+
+// CaddyModule returns the Caddy module information.
+func (Handler) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{ID: "http.handlers.masque", New: func() caddy.Module { return new(Handler) }}
+}
+
+// Provision implements caddy.Provisioner.
+func (h *Handler) Provision(ctx caddy.Context) error {
+	if h.Template == "" {
+		h.Template = DefaultTemplate
+	}
+	tpl, err := proto.ParsePathTemplate(h.Template)
+	if err != nil {
+		return err
+	}
+	h.tpl = tpl
+	h.log = ctx.Logger()
+	app, err := ctx.AppIfConfigured("masque")
+	if errors.Is(err, caddy.ErrNotConfigured) {
+		return errors.New("the masque handler needs the masque app: add a masque block to the global options")
+	}
+	if err != nil {
+		return err
+	}
+	h.app = app.(*App)
+	return nil
+}
+
+// request describes a CONNECT-IP request whatever the HTTP version.
+type request struct {
+	transport string
+	http1     bool
+}
+
+func connectIPRequest(r *http.Request) (request, bool) {
+	switch r.ProtoMajor {
+	case 3:
+		// quic-go puts :protocol into Proto for extended CONNECT.
+		return request{transport: "HTTP/3"}, r.Method == http.MethodConnect && r.Proto == connectIP
+	case 2:
+		return request{transport: "HTTP/2"}, r.Method == http.MethodConnect && r.Header.Get(":protocol") == connectIP
+	default:
+		// RFC 9484 §4.2: GET with "Connection: Upgrade" and "Upgrade: connect-ip".
+		upgrade := false
+		for _, v := range r.Header.Values("Upgrade") {
+			upgrade = upgrade || strings.EqualFold(strings.TrimSpace(v), connectIP)
+		}
+		wants := false
+		for _, v := range r.Header.Values("Connection") {
+			for _, t := range strings.Split(v, ",") {
+				wants = wants || strings.EqualFold(strings.TrimSpace(t), "upgrade")
+			}
+		}
+		return request{transport: "HTTP/1.1", http1: true}, r.Method == http.MethodGet && upgrade && wants
+	}
+}
+
+// carriesContent reports header fields for content, which RFC 9297 §3.2
+// forbids on messages that use the Capsule Protocol.
+func carriesContent(r *http.Request) bool {
+	for _, k := range []string{"Content-Length", "Content-Type", "Transfer-Encoding"} {
+		if _, ok := r.Header[k]; ok {
+			return true
+		}
+	}
+	return r.ContentLength > 0 || len(r.TransferEncoding) > 0
+}
+
+// rejection is an answer to an authenticated request that cannot be served.
+type rejection struct {
+	status int
+	// Proxy error type (RFC 9209 §2.3) for a Proxy-Status field, which RFC
+	// 9484 §4.1 asks for when resolving the target fails.
+	proxyError string
+}
+
+func (h *Handler) reject(w http.ResponseWriter, rej rejection) error {
+	if rej.proxyError != "" {
+		w.Header().Set("Proxy-Status", "caddy-masque; error="+rej.proxyError)
+	}
+	w.WriteHeader(rej.status)
+	return nil
+}
+
+// ServeHTTP implements caddyhttp.MiddlewareHandler.
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	h.advertiseHTTP3(w, r)
+	req, ok := connectIPRequest(r)
+	if !ok {
+		return next.ServeHTTP(w, r)
+	}
+	vars, ok := h.tpl.Match(r.URL.RequestURI())
+	if !ok {
+		return next.ServeHTTP(w, r)
+	}
+	c := h.app.core
+	remote := r.RemoteAddr
+	user, ok, err := c.auth.Verify(r.Context(), r.Header.Get("Authorization"))
+	if errors.Is(err, auth.ErrBusy) {
+		// Like any web server under more load than it can take; whether the
+		// credentials were valid is not known.
+		return h.reject(w, rejection{status: http.StatusServiceUnavailable})
+	}
+	if err != nil {
+		return nil // the request was cancelled
+	}
+	if !ok {
+		if name, _, has := auth.ParseBasic(r.Header.Get("Authorization")); has {
+			if len(name) > 64 {
+				name = name[:64]
+			}
+			// zap quotes the client's text, so it cannot forge log lines.
+			h.log.Info("authentication failed", zap.String("remote", remote), zap.String("user", name), zap.String("transport", req.transport))
+		} else {
+			h.log.Debug("CONNECT-IP request without credentials", zap.String("remote", remote), zap.String("transport", req.transport))
+		}
+		return next.ServeHTTP(w, r)
+	}
+	log := h.log.With(zap.String("user", user.Name), zap.String("remote", remote), zap.String("transport", req.transport))
+	rejectLogged := func(rej rejection) error {
+		log.Info("rejected request", zap.Int("status", rej.status), zap.String("error", rej.proxyError))
+		return h.reject(w, rej)
+	}
+	// The recognized upgrade or extended CONNECT selects the Capsule
+	// Protocol, so the Capsule-Protocol header is not required (RFC 9297
+	// §3.4 only recommends it); content header fields make the request
+	// malformed (§3.2).
+	if carriesContent(r) {
+		return rejectLogged(rejection{status: http.StatusBadRequest})
+	}
+	for _, name := range []string{"target", "ipproto"} {
+		if _, has := vars[name]; h.tpl.HasVariable(name) && !has {
+			return rejectLogged(rejection{status: http.StatusBadRequest})
+		}
+	}
+	value := func(name string) string {
+		if v, has := vars[name]; has {
+			return v
+		}
+		return "*"
+	}
+	target, err1 := proto.ParseTarget(value("target"))
+	ipproto, err2 := proto.ParseIPProtocol(value("ipproto"))
+	if err1 != nil || err2 != nil {
+		return rejectLogged(rejection{status: http.StatusBadRequest})
+	}
+	sc, rej := h.resolveScope(r.Context(), target, ipproto)
+	if rej != nil {
+		return rejectLogged(*rej)
+	}
+	l := c.acquire(r.Context(), user, sc.routes.HasIPv4(), sc.routes.HasIPv6())
+	if l == nil {
+		if !c.auth.IsCurrent(user) {
+			return next.ServeHTTP(w, r)
+		}
+		return rejectLogged(rejection{status: http.StatusServiceUnavailable})
+	}
+	defer l.release()
+
+	tun, err := h.accept(w, r, req)
+	if err != nil {
+		log.Debug("could not start the tunnel", zap.Error(err))
+		return nil
+	}
+	s := &session{core: c, lease: l, scope: sc, tun: tun, log: log, icmp: ip.NewRateLimit()}
+	log.Info("session started", zap.Any("addresses", l.addrs))
+	// The request's context ends with the stream; a hijacked HTTP/1.1
+	// connection is no longer watched by the server, and ends with the
+	// tunnel itself. Removing the server revokes every session.
+	ctx := r.Context()
+	if req.http1 {
+		ctx = c.ctx
+	} else if srv, ok := ctx.Value(http.ServerContextKey).(*http.Server); ok {
+		c.endOnExit(srv)
+	}
+	why := s.run(ctx)
+	log.Info("session ended", zap.String("why", why), zap.Stringer("stats", &s.stats))
+	return nil
+}
+
+// advertiseHTTP3 adds the Alt-Svc header field (RFC 7838) Caddy adds when
+// it serves HTTP/3 itself, so the site looks the same to visitors.
+func (h *Handler) advertiseHTTP3(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor >= 3 {
+		return
+	}
+	local, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if local == nil {
+		return
+	}
+	ap, err := netip.ParseAddrPort(local.String())
+	if err != nil || !h.app.h3Ports[int(ap.Port())] {
+		return
+	}
+	w.Header().Set("Alt-Svc", fmt.Sprintf(`h3=":%d"; ma=2592000`, ap.Port()))
+}
+
+// resolveScope narrows the allowed destinations to the requested target and
+// protocol (RFC 9484 §4.6).
+func (h *Handler) resolveScope(ctx context.Context, target proto.Target, ipproto proto.IPProtocol) (scope, *rejection) {
+	if !ipproto.Any && proto.IsIPv6ExtensionHeader(ipproto.Number) {
+		// §4.8: proxies may reject scoping to extension header numbers.
+		return scope{}, &rejection{status: http.StatusBadRequest}
+	}
+	allowed := *h.app.core.allowed.Load()
+	var set = allowed
+	switch {
+	case target.Any:
+	case target.Host == "":
+		set = allowed.Intersect(target.Prefix)
+	default:
+		// The proxy resolves the name before answering and advertises
+		// routes for every address it can reach (§4.1, §4.6).
+		ctx, cancel := context.WithTimeout(ctx, dnsTimeout)
+		defer cancel()
+		addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", target.Host)
+		if err != nil {
+			e := "dns_error"
+			if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
+				e = "dns_timeout"
+			}
+			return scope{}, &rejection{status: http.StatusBadGateway, proxyError: e}
+		}
+		set = set.Families(false, false)
+		for _, a := range addrs {
+			a = a.Unmap()
+			set = set.Union(allowed.Intersect(netip.PrefixFrom(a, a.BitLen())))
+		}
+	}
+	if set.IsEmpty() {
+		// Not authorized for any destination in the scope (§4.6).
+		return scope{}, &rejection{status: http.StatusForbidden}
+	}
+	return scope{routes: set, protocol: ipproto.RouteProtocol()}, nil
+}
+
+func isTimeout(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && dnsErr.IsTimeout
+}
+
+// accept sends the successful response and returns the tunnel over the
+// request stream.
+func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (tunnel, error) {
+	if req.http1 {
+		// RFC 9484 §4.3.
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return nil, err
+		}
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\nCapsule-Protocol: ?1\r\n\r\n")
+		if err := brw.Flush(); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return &streamTunnel{
+			reader: newCapsuleReader(io.MultiReader(bufferedOf(brw.Reader), conn)),
+			w:      conn,
+			closer: func() { conn.Close() },
+		}, nil
+	}
+	// No Content-Type sniffing: the response has no content (RFC 9297 §3.2).
+	w.Header()["Content-Type"] = nil
+	w.Header().Set("Capsule-Protocol", "?1")
+	if r.ProtoMajor == 3 {
+		s, ok := unwrapStreamer(w)
+		if !ok {
+			return nil, errors.New("no HTTP/3 stream behind the response writer")
+		}
+		w.WriteHeader(http.StatusOK)
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			return nil, err
+		}
+		return newH3Tunnel(s.HTTPStream()), nil
+	}
+	w.WriteHeader(http.StatusOK)
+	rc := http.NewResponseController(w)
+	if err := rc.Flush(); err != nil {
+		return nil, err
+	}
+	body := r.Body
+	return &streamTunnel{
+		reader: newCapsuleReader(body),
+		w:      w,
+		flush:  rc.Flush,
+		closer: func() { body.Close() },
+	}, nil
+}
+
+// bufferedOf returns what the HTTP server read past the request headers.
+func bufferedOf(br *bufio.Reader) io.Reader {
+	n := br.Buffered()
+	if n == 0 {
+		return strings.NewReader("")
+	}
+	b, _ := br.Peek(n)
+	return strings.NewReader(string(b))
+}
+
+var (
+	_ caddy.Provisioner           = (*Handler)(nil)
+	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
+)
