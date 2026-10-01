@@ -222,8 +222,12 @@ func (s *session) readDatagrams(ctx context.Context) error {
 func (s *session) sendToClientLoop(ctx context.Context) error {
 	for {
 		select {
-		case p := <-s.lease.handle.toClient:
-			if err := s.sendToClient(p); err != nil {
+		case q := <-s.lease.handle.toClient:
+			if time.Since(q.at) > maxQueueDelay {
+				s.stats.dropped.Add(1)
+				continue
+			}
+			if err := s.sendToClient(q.pkt); err != nil {
 				return err
 			}
 		case <-ctx.Done():
