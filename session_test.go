@@ -63,13 +63,15 @@ type fakeTunnel struct {
 	out         chan any // capsules and datagrams (sentDatagram) to the client
 	aborted     atomic.Bool
 	closed      atomic.Bool
+	done        chan struct{} // closed by abort and close
+	doneOnce    sync.Once
 }
 
 type sentDatagram []byte
 
 func newFakeTunnel(quicDatagrams bool) *fakeTunnel {
 	return &fakeTunnel{capsules: make(chan proto.Capsule, 10), errs: make(chan error, 1), datagrams: make(chan []byte, 10),
-		quic: quicDatagrams, out: make(chan any, 100)}
+		quic: quicDatagrams, out: make(chan any, 100), done: make(chan struct{})}
 }
 
 func (t *fakeTunnel) readCapsule() (proto.Capsule, error) {
@@ -81,6 +83,8 @@ func (t *fakeTunnel) readCapsule() (proto.Capsule, error) {
 		return c, nil
 	case err := <-t.errs:
 		return nil, err
+	case <-t.done:
+		return nil, errors.New("stream closed")
 	}
 }
 
@@ -121,8 +125,15 @@ func (t *fakeTunnel) receiveDatagram(ctx context.Context) ([]byte, error) {
 }
 
 func (t *fakeTunnel) hasQUICDatagrams() bool { return t.quic }
-func (t *fakeTunnel) abort()                 { t.aborted.Store(true) }
-func (t *fakeTunnel) close()                 { t.closed.Store(true) }
+func (t *fakeTunnel) abort() {
+	t.aborted.Store(true)
+	t.doneOnce.Do(func() { close(t.done) })
+}
+
+func (t *fakeTunnel) close() {
+	t.closed.Store(true)
+	t.doneOnce.Do(func() { close(t.done) })
+}
 
 // next returns what the session sent the client next.
 func (t *fakeTunnel) next(tb testing.TB) any {

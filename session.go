@@ -94,11 +94,19 @@ func (s *session) run(ctx context.Context) string {
 		return err.Error()
 	}
 	ended := make(chan error, 3)
-	go func() { ended <- s.readCapsules() }()
-	if s.tun.hasQUICDatagrams() {
-		go func() { ended <- s.readDatagrams(ctx) }()
+	var wg sync.WaitGroup
+	spawn := func(f func() error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ended <- f()
+		}()
 	}
-	go func() { ended <- s.sendToClientLoop(ctx) }()
+	spawn(s.readCapsules)
+	if s.tun.hasQUICDatagrams() {
+		spawn(func() error { return s.readDatagrams(ctx) })
+	}
+	spawn(func() error { return s.sendToClientLoop(ctx) })
 	var err error
 	for err == nil {
 		select {
@@ -118,12 +126,16 @@ func (s *session) run(ctx context.Context) string {
 			}
 		}
 	}
+	// Unblock the goroutines and wait for them: nothing may use the
+	// stream after the handler returns.
+	cancel()
 	var abort errAbort
 	if errors.As(err, &abort) {
 		s.tun.abort()
 	} else {
 		s.tun.close()
 	}
+	wg.Wait()
 	if errors.Is(err, io.EOF) {
 		return "client closed the tunnel"
 	}
