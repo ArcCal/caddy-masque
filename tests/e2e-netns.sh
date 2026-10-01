@@ -596,6 +596,33 @@ start_client "$WORK/client-noname.toml" "$WORK/client-noname.log"
 check "a name that does not resolve is refused" wait_log "$WORK/client-noname.log" "could not resolve the target host name" 15
 stop_client
 
+echo "== clients reaching each other"
+client_config "$WORK/client-tablet-c2.toml" tablet "$TABLET_PW" 'ipv6 = false'
+tunnel_address_in() { in_ns "$1" ip -4 -o addr show dev masque0 | awk '{ sub("/.*", "", $4); print $4 }'; }
+write_server_config laptop tablet
+reload_server
+start_client "$WORK/client.toml" "$WORK/client-c2c.log"
+ip netns exec $NS_C2 env RUST_LOG=info "$CLIENT_BIN" -c "$WORK/client-tablet-c2.toml" >"$WORK/client-tablet-c2.log" 2>&1 &
+TABLET_PID=$!
+check "two clients are up" bash -c "$(declare -f wait_log); wait_log '$WORK/client-c2c.log' 'tunnel up' 15 && wait_log '$WORK/client-tablet-c2.log' 'tunnel up' 15"
+LAPTOP_ADDR=$(tunnel_address_in $NS_C)
+check_not "by default, one cannot reach the other ($LAPTOP_ADDR)" in_ns $NS_C2 ping -c1 -W2 "$LAPTOP_ADDR"
+write_server_config laptop tablet -- allow_client_to_client
+reload_server
+# Running sessions get the new routes; nobody reconnects.
+check "with allow_client_to_client after a reload, it can" bash -c \
+    "for i in \$(seq 10); do ip netns exec $NS_C2 ping -c1 -W1 $LAPTOP_ADDR >/dev/null 2>&1 && exit 0; sleep 0.5; done; exit 1"
+check "the server advertised the new routes" grep -q "routes changed with the configuration" "$WORK/server.log"
+check_not "without reconnecting" wait_log "$WORK/client-c2c.log" "tunnel up" 1 2
+write_server_config laptop tablet -- 'block 192.0.2.0/24'
+reload_server
+check "a destination blocked by a reload is unreachable at once" bash -c \
+    "sleep 1; ! ip netns exec $NS_C curl --noproxy '*' -s --max-time 3 http://$TARGET:8080/"
+kill -TERM "$TABLET_PID"; wait "$TABLET_PID" 2>/dev/null
+stop_client
+write_server_config laptop
+reload_server
+
 echo "== client shutdown cleans up"
 check_not "tunnel interface removed" in_ns $NS_C ip link show masque0
 check_not "policy routing rules removed" bash -c "ip netns exec $NS_C ip rule | grep -q 51889"

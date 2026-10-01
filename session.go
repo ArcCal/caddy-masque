@@ -17,11 +17,25 @@ import (
 	"github.com/ArcCal/caddy-masque/internal/routes"
 )
 
-// scope is what a session may reach: destinations and the IP protocol for
-// them (0: all). ICMP is always allowed (RFC 9484 §4.7.3).
+// scope is what a session may reach: the destinations it asked for (a
+// target's prefix, or the addresses its host name resolved to) that the
+// server allows, and the IP protocol for them (0: all). ICMP is always
+// allowed (RFC 9484 §4.7.3).
 type scope struct {
-	routes   routes.Set
-	protocol uint8
+	requested []netip.Prefix
+	protocol  uint8
+	routes    routes.Set
+}
+
+// anyDestination is the request of target "*".
+var anyDestination = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
+
+func newScope(allowed routes.Set, requested []netip.Prefix, protocol uint8) scope {
+	var set routes.Set
+	for _, p := range requested {
+		set = set.Union(allowed.Intersect(p))
+	}
+	return scope{requested: requested, protocol: protocol, routes: set}
 }
 
 func (s scope) allows(h ip.Header) bool {
@@ -39,9 +53,12 @@ type session struct {
 	core  *core
 	lease *lease
 	scope scope
-	tun   tunnel
-	log   *zap.Logger
-	stats stats
+	// The scope narrowed to what the server allows now and to the lease's
+	// address families; replaced when the configuration changes.
+	current atomic.Pointer[scope]
+	tun     tunnel
+	log     *zap.Logger
+	stats   stats
 	// Shared by the errors sent to the client and those sent to the network
 	// for its sake.
 	icmpMu sync.Mutex
@@ -72,7 +89,8 @@ func (s *session) run(ctx context.Context) string {
 	if err := s.tun.writeCapsule(assigned); err != nil {
 		return err.Error()
 	}
-	if err := s.tun.writeCapsule(proto.RouteAdvertisement(s.scope.routes.Routes(s.scope.protocol))); err != nil {
+	s.current.Store(s.narrow())
+	if err := s.advertise(); err != nil {
 		return err.Error()
 	}
 	ended := make(chan error, 3)
@@ -82,12 +100,23 @@ func (s *session) run(ctx context.Context) string {
 	}
 	go func() { ended <- s.sendToClientLoop(ctx) }()
 	var err error
-	select {
-	case err = <-ended:
-	case <-s.lease.handle.revoked:
-		err = errors.New(s.lease.handle.why)
-	case <-ctx.Done():
-		err = ctx.Err()
+	for err == nil {
+		select {
+		case err = <-ended:
+		case <-s.lease.handle.revoked:
+			err = errors.New(s.lease.handle.why)
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-s.lease.handle.rescope:
+			// The allowed destinations changed: the latest advertisement
+			// replaces the earlier ones (§4.7.3).
+			next := s.narrow()
+			if !next.routes.Equal(s.current.Load().routes) {
+				s.current.Store(next)
+				err = s.advertise()
+				s.log.Info("routes changed with the configuration", zap.Int("routes", len(next.routes.Routes(next.protocol))))
+			}
+		}
 	}
 	var abort errAbort
 	if errors.As(err, &abort) {
@@ -99,6 +128,23 @@ func (s *session) run(ctx context.Context) string {
 		return "client closed the tunnel"
 	}
 	return err.Error()
+}
+
+// narrow is the session's scope within what the server allows now, for the
+// address families the session has.
+func (s *session) narrow() *scope {
+	sc := newScope(*s.core.allowed.Load(), s.scope.requested, s.scope.protocol)
+	v4, v6 := false, false
+	for _, a := range s.lease.addrs {
+		v4, v6 = v4 || a.Is4(), v6 || a.Is6()
+	}
+	sc.routes = sc.routes.Families(v4, v6)
+	return &sc
+}
+
+func (s *session) advertise() error {
+	sc := s.current.Load()
+	return s.tun.writeCapsule(proto.RouteAdvertisement(sc.routes.Routes(sc.protocol)))
 }
 
 func (s *session) readCapsules() error {
@@ -173,7 +219,7 @@ func (s *session) clientPacket(payload []byte) error {
 		s.log.Debug("dropping packet with spoofed source", zap.Stringer("src", h.Src))
 		return nil
 	}
-	if !s.scope.allows(h) {
+	if !s.current.Load().allows(h) {
 		s.stats.dropped.Add(1)
 		if e := ip.DestUnreachable(pkt, s.core.gateway(!h.IsIPv4()), ip.AdminProhibited); e != nil && s.icmpAllow() {
 			return s.sendToClient(append([]byte{0}, e...))

@@ -247,19 +247,19 @@ func (h *Handler) advertiseHTTP3(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Alt-Svc", fmt.Sprintf(`h3=":%d"; ma=2592000`, ap.Port()))
 }
 
-// resolveScope narrows the allowed destinations to the requested target and
-// protocol (RFC 9484 §4.6).
+// resolveScope finds the destinations of the requested target, resolving a
+// host name (§4.1), and narrows them to those allowed (§4.6).
 func (h *Handler) resolveScope(ctx context.Context, target proto.Target, ipproto proto.IPProtocol) (scope, *rejection) {
 	if !ipproto.Any && proto.IsIPv6ExtensionHeader(ipproto.Number) {
 		// §4.8: proxies may reject scoping to extension header numbers.
 		return scope{}, &rejection{status: http.StatusBadRequest}
 	}
-	allowed := *h.app.core.allowed.Load()
-	var set = allowed
+	var requested []netip.Prefix
 	switch {
 	case target.Any:
+		requested = anyDestination
 	case target.Host == "":
-		set = allowed.Intersect(target.Prefix)
+		requested = []netip.Prefix{target.Prefix}
 	default:
 		// The proxy resolves the name before answering and advertises
 		// routes for every address it can reach (§4.1, §4.6).
@@ -273,17 +273,17 @@ func (h *Handler) resolveScope(ctx context.Context, target proto.Target, ipproto
 			}
 			return scope{}, &rejection{status: http.StatusBadGateway, proxyError: e}
 		}
-		set = set.Families(false, false)
 		for _, a := range addrs {
 			a = a.Unmap()
-			set = set.Union(allowed.Intersect(netip.PrefixFrom(a, a.BitLen())))
+			requested = append(requested, netip.PrefixFrom(a, a.BitLen()))
 		}
 	}
-	if set.IsEmpty() {
+	sc := newScope(*h.app.core.allowed.Load(), requested, ipproto.RouteProtocol())
+	if sc.routes.IsEmpty() {
 		// Not authorized for any destination in the scope (§4.6).
 		return scope{}, &rejection{status: http.StatusForbidden}
 	}
-	return scope{routes: set, protocol: ipproto.RouteProtocol()}, nil
+	return sc, nil
 }
 
 func isTimeout(err error) bool {
