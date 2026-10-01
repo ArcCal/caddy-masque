@@ -119,6 +119,8 @@ type caddyEnv struct {
 	cert    testCert
 	dev     *fakeDevice
 	storage string
+	// Extra settings of the HTTP server.
+	server map[string]any
 }
 
 // newCaddyEnv replaces the host network with a fake device and stops
@@ -147,7 +149,7 @@ func (e *caddyEnv) config(masque map[string]any) []byte {
 			"tls": map[string]any{"certificates": map[string]any{"load_pem": []any{
 				map[string]any{"certificate": e.cert.certPEM, "key": e.cert.keyPEM},
 			}}},
-			"http": map[string]any{"servers": map[string]any{"vpn": map[string]any{
+			"http": map[string]any{"servers": map[string]any{"vpn": e.serverConfig(map[string]any{
 				"listen":                  []string{fmt.Sprintf("127.0.0.1:%d", e.port)},
 				"tls_connection_policies": []any{map[string]any{}},
 				"automatic_https":         map[string]any{"disable": true},
@@ -155,7 +157,7 @@ func (e *caddyEnv) config(masque map[string]any) []byte {
 					map[string]any{"handler": "masque"},
 					map[string]any{"handler": "static_response", "status_code": 200, "body": "cover page"},
 				}}},
-			}}},
+			})}},
 		},
 	}
 	b, err := json.Marshal(cfg)
@@ -163,6 +165,13 @@ func (e *caddyEnv) config(masque map[string]any) []byte {
 		e.t.Fatal(err)
 	}
 	return b
+}
+
+func (e *caddyEnv) serverConfig(srv map[string]any) map[string]any {
+	for k, v := range e.server {
+		srv[k] = v
+	}
+	return srv
 }
 
 func masqueConfig(users ...string) map[string]any {
@@ -378,8 +387,10 @@ func TestCaddyServesConnectIP(t *testing.T) {
 			if c.header.Get("Capsule-Protocol") != "?1" {
 				t.Errorf("Capsule-Protocol %q", c.header.Get("Capsule-Protocol"))
 			}
-			if ct, ok := c.header["Content-Type"]; ok {
-				t.Errorf("Content-Type %q on a response without content", ct)
+			for _, h := range []string{"Content-Type", "Content-Length", "Transfer-Encoding"} {
+				if v, ok := c.header[h]; ok {
+					t.Errorf("%s %q on a Capsule Protocol response (RFC 9297 §3.2)", h, v)
+				}
 			}
 			v4, v6 := opening(t, c)
 			for _, pkt := range [][]byte{udp(v4.String(), "1.1.1.1", 50), udp(v6.String(), "2606:4700::1111", 50)} {
@@ -548,8 +559,8 @@ func TestCaddyReloads(t *testing.T) {
 			t.Errorf("%s: %v after the reload", transports[i].name, err)
 		}
 	}
-	// New blocks reach running sessions.
-	cfg["blocked_destinations"] = []string{"1.0.0.0/8"}
+	// More destinations reach running sessions as a new advertisement.
+	cfg["allow_client_to_client"] = true
 	if err := e.load(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -568,25 +579,50 @@ func TestCaddyReloads(t *testing.T) {
 	if err := e.load(bad); err == nil || !strings.Contains(err.Error(), "restart") {
 		t.Errorf("tunnel change: %v", err)
 	}
-	// Removing the user ends every tunnel.
-	if err := e.load(masqueConfig("bob")); err != nil {
-		t.Fatal(err)
-	}
-	for i, c := range clients {
-		done := make(chan error, 1)
-		go func() {
-			for {
-				if _, err := c.capsule(); err != nil {
-					done <- err
-					return
-				}
-			}
-		}()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			t.Errorf("%s: the tunnel of a removed user stays open", transports[i].name)
+	// Fewer destinations, or removing the user, end the tunnels.
+	for _, change := range []map[string]any{
+		{"blocked_destinations": []string{"1.0.0.0/8"}, "allow_client_to_client": true},
+		{"users": nil},
+	} {
+		next := masqueConfig("alice", "bob")
+		for k, v := range change {
+			next[k] = v
 		}
+		if change["users"] != nil || len(change) == 1 {
+			next = masqueConfig("bob")
+		}
+		if err := e.load(next); err != nil {
+			t.Fatal(err)
+		}
+		for i, c := range clients {
+			done := make(chan error, 1)
+			go func() {
+				for {
+					if _, err := c.capsule(); err != nil {
+						done <- err
+						return
+					}
+				}
+			}()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Errorf("%s: the tunnel stays open", transports[i].name)
+			}
+			c.close()
+		}
+		waitNoSessions(t)
+		if err := e.load(masqueConfig("alice", "bob")); err != nil {
+			t.Fatal(err)
+		}
+		clients = clients[:0]
+		for _, tr := range transports {
+			c := tr.dial(e, t, testPassword, anyTarget)
+			opening(t, c)
+			clients = append(clients, c)
+		}
+	}
+	for _, c := range clients {
 		c.close()
 	}
 	waitNoSessions(t)
@@ -680,5 +716,257 @@ func TestCaddyEndsBlockedTunnels(t *testing.T) {
 		if err := e.load(masqueConfig("alice")); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// Caddy's default read and write idle timeouts (one minute in 2.11), and
+// read and write timeouts, must not end idle tunnels.
+func TestCaddyTimeoutsDoNotEndTunnels(t *testing.T) {
+	e := newCaddyEnv(t)
+	e.server = map[string]any{
+		"read_idle_timeout": "500ms", "write_idle_timeout": "500ms",
+		"read_timeout": "1s", "write_timeout": "1s",
+	}
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	var clients []*tunnelClient
+	var addrs []netip.Addr
+	for _, tr := range transports {
+		c := tr.dial(e, t, testPassword, anyTarget)
+		if c.status != tr.ok {
+			t.Fatalf("%s: %d", tr.name, c.status)
+		}
+		v4, _ := opening(t, c)
+		clients = append(clients, c)
+		addrs = append(addrs, v4)
+	}
+	time.Sleep(2 * time.Second)
+	for i, c := range clients {
+		pkt := udp(addrs[i].String(), "1.1.1.1", 20)
+		if err := c.send(pkt); err != nil {
+			t.Errorf("%s: send after idling: %v", transports[i].name, err)
+			continue
+		}
+		if got := hostPacket(t, e.dev); !slices.Equal(got, pkt) {
+			t.Errorf("%s: wrong packet", transports[i].name)
+		}
+		e.dev.fromHost <- udp("1.1.1.1", addrs[i].String(), 20)
+		if _, err := c.recv(); err != nil {
+			t.Errorf("%s: receive after idling: %v", transports[i].name, err)
+		}
+		c.close()
+	}
+	waitNoSessions(t)
+}
+
+// A client that ends its side of the stream gets a clean end of the
+// response, not a reset.
+func TestCaddyCleanEndOfHTTP2Tunnels(t *testing.T) {
+	e := newCaddyEnv(t)
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	tr := &http2.Transport{TLSClientConfig: e.tlsConfig("h2"),
+		DialTLSContext: func(ctx context.Context, network, _ string, cfg *tls.Config) (net.Conn, error) {
+			return (&tls.Dialer{Config: cfg}).DialContext(ctx, network, fmt.Sprintf("127.0.0.1:%d", e.port))
+		}}
+	defer tr.CloseIdleConnections()
+	pr, pw := io.Pipe()
+	req, _ := http.NewRequest(http.MethodConnect, e.url(anyTarget), pr)
+	req.Header = http.Header{":protocol": {"connect-ip"}, "Authorization": {authorization(testPassword)}}
+	resp, err := tr.RoundTrip(req)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatal(resp, err)
+	}
+	reader := newCapsuleReader(resp.Body)
+	for range 2 {
+		if _, err := reader.next(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pw.Close() // END_STREAM from the client
+	if _, err := reader.next(); err != io.EOF {
+		t.Errorf("the server ended the stream with %v, want a clean end", err)
+	}
+	waitNoSessions(t)
+}
+
+// A client without HTTP/3 datagram support gets its packets in DATAGRAM
+// capsules (RFC 9297 §2.1.1, §3.5).
+func TestCaddyHTTP3WithoutDatagrams(t *testing.T) {
+	e := newCaddyEnv(t)
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, fmt.Sprintf("127.0.0.1:%d", e.port), http3.ConfigureTLSConfig(e.tlsConfig("h3")), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseWithError(0, "")
+	cc := (&http3.Transport{}).NewClientConn(conn)
+	<-cc.ReceivedSettings()
+	str, err := cc.OpenRequestStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(e.url(anyTarget))
+	if err := str.SendRequestHeader(&http.Request{Method: http.MethodConnect, Proto: "connect-ip", Host: u.Host, URL: u,
+		Header: http.Header{"Authorization": {authorization(testPassword)}}}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := str.ReadResponse()
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatal(resp, err)
+	}
+	c := &tunnelClient{}
+	streamClient(c, str, str)
+	v4, _ := opening(t, c)
+	pkt := udp(v4.String(), "1.1.1.1", 30)
+	if err := c.send(pkt); err != nil {
+		t.Fatal(err)
+	}
+	if got := hostPacket(t, e.dev); !slices.Equal(got, pkt) {
+		t.Error("wrong packet to the network")
+	}
+	back := udp("1.1.1.1", v4.String(), 1000)
+	e.dev.fromHost <- back
+	if got, err := c.recv(); err != nil || !slices.Equal(got, back) {
+		t.Errorf("DATAGRAM capsule: %v", err)
+	}
+}
+
+// A reload that fails after the masque app started leaves the previous
+// configuration in charge: its users, and HTTP/3 served by its handlers.
+func TestCaddyFailedReloadKeepsThePreviousConfig(t *testing.T) {
+	e := newCaddyEnv(t)
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	var cfg map[string]any
+	_ = json.Unmarshal(e.config(masqueConfig("bob")), &cfg)
+	servers := cfg["apps"].(map[string]any)["http"].(map[string]any)["servers"].(map[string]any)
+	servers["blocked"] = map[string]any{"listen": []string{busy.Addr().String()}}
+	b, _ := json.Marshal(cfg)
+	if err := caddy.Load(b, true); err == nil {
+		t.Fatal("a configuration with a busy port loaded")
+	}
+	for _, tr := range transports {
+		c := tr.dial(e, t, testPassword, anyTarget)
+		if c.status != tr.ok {
+			t.Errorf("%s: alice gets %d after the failed reload", tr.name, c.status)
+			continue
+		}
+		v4, _ := opening(t, c)
+		e.dev.fromHost <- udp("1.1.1.1", v4.String(), 10)
+		if _, err := c.recv(); err != nil {
+			t.Errorf("%s: %v", tr.name, err)
+		}
+		c.close()
+	}
+	waitNoSessions(t)
+}
+
+// Turning HTTP/3 over to the app by a reload, while Caddy's own HTTP/3
+// socket on the port is still open.
+func TestCaddyReloadTakesHTTP3Over(t *testing.T) {
+	e := newCaddyEnv(t)
+	cfg := masqueConfig("alice")
+	cfg["http3"] = false
+	if err := e.load(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	c := e.dialH3(t, testPassword, anyTarget)
+	if c.status != http.StatusOK {
+		t.Fatalf("status %d", c.status)
+	}
+	opening(t, c)
+	c.close()
+	// And back.
+	if err := e.load(cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitNoSessions(t)
+}
+
+func TestCaddyIPv6Target(t *testing.T) {
+	e := newCaddyEnv(t)
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	// RFC 9484 §4.6: colons and the slash are percent-encoded.
+	for _, tr := range transports {
+		c := tr.dial(e, t, testPassword, "/.well-known/masque/ip/2001%3Adb8%3A%3A%2F32/17/")
+		if c.status != tr.ok {
+			t.Fatalf("%s: %d", tr.name, c.status)
+		}
+		first, err := c.capsule()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a, ok := first.(proto.AddressAssign); !ok || len(a) != 1 || !a[0].Prefix.Addr().Is6() {
+			t.Errorf("%s: an IPv6 scope gets one IPv6 address: %v", tr.name, first)
+		}
+		second, err := c.capsule()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := proto.RouteAdvertisement{{Start: netip.MustParseAddr("2001:db8::"),
+			End: netip.MustParseAddr("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"), Protocol: 17}}
+		if !slices.Equal(second.(proto.RouteAdvertisement), want) {
+			t.Errorf("%s: routes %v", tr.name, second)
+		}
+		c.close()
+	}
+	waitNoSessions(t)
+}
+
+func TestCaddyMalformedHTTP1Requests(t *testing.T) {
+	e := newCaddyEnv(t)
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	send := func(request string) string {
+		conn, err := tls.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", e.port), e.tlsConfig("http/1.1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		fmt.Fprint(conn, request)
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Sprintf("%d %s", resp.StatusCode, b)
+	}
+	for _, c := range []struct{ name, head, want string }{
+		{"POST with valid credentials", "POST", "400 "},
+		{"GET without Connection: Upgrade", "GET-noconn", "400 "},
+	} {
+		method, conn := c.head, "Connection: Upgrade\r\n"
+		if method == "GET-noconn" {
+			method, conn = "GET", ""
+		}
+		got := send(fmt.Sprintf("%s %s HTTP/1.1\r\nHost: vpn.test\r\n%sUpgrade: connect-ip\r\nAuthorization: %s\r\nContent-Length: 0\r\n\r\n",
+			method, anyTarget, conn, authorization(testPassword)))
+		if !strings.HasPrefix(got, c.want) {
+			t.Errorf("%s: %q", c.name, got)
+		}
+	}
+	// Without valid credentials, the site answers.
+	got := send(fmt.Sprintf("POST %s HTTP/1.1\r\nHost: vpn.test\r\nUpgrade: connect-ip\r\nContent-Length: 0\r\n\r\n", anyTarget))
+	if got != "200 cover page" {
+		t.Errorf("anonymous: %q", got)
 	}
 }

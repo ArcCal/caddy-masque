@@ -44,6 +44,11 @@ func ParseTarget(value string) (Target, error) {
 		bits = n
 	}
 	if ip, err := netip.ParseAddr(addr); err == nil && ip.Zone() == "" {
+		// RFC 9484 §4.6: IPv4prefix = IPv4address ["%2F" 1*2DIGIT],
+		// IPv6prefix = IPv6address ["%2F" 1*3DIGIT].
+		if hasLen && ip.Is4() && len(lenStr) > 2 {
+			return Target{}, MalformedError("invalid prefix length in target")
+		}
 		if bits < 0 {
 			return Target{Prefix: Host(ip)}, nil
 		}
@@ -56,10 +61,12 @@ func ParseTarget(value string) (Target, error) {
 	if hasLen || strings.ContainsAny(addr, ":%") {
 		return Target{}, MalformedError("invalid IP prefix in target")
 	}
-	if !isHostName(addr) {
+	// A fully qualified name may end with the root's dot.
+	name := strings.TrimSuffix(addr, ".")
+	if !isHostName(name) {
 		return Target{}, MalformedError("target is not a valid host name")
 	}
-	return Target{Host: strings.ToLower(addr)}, nil
+	return Target{Host: strings.ToLower(name)}, nil
 }
 
 // Value is the target variable's value for this target.
@@ -86,7 +93,9 @@ func isHostName(s string) bool {
 		}
 		for i := 0; i < len(label); i++ {
 			c := label[i]
-			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+			// Letters, digits, hyphens, and underscores, which DNS names
+			// of services use.
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
 				return false
 			}
 		}

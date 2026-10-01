@@ -98,7 +98,9 @@ caddy masque-passwd --name iphone
 
 - 已连接的隧道**不断**，HTTP/3、HTTP/2、HTTP/1.1 都一样；
 - 删掉的用户、改了密码的用户**立即断开**；
-- 改了 `block`、`allow_client_to_client`，**在线的会话立即生效**，客户端收到新的路由（RFC 9484 §4.7.3）；
+- 改了 `block`、`allow_client_to_client`：多出来的目的地址**立即**以新的路由通告发给在线会话；
+  被收回的目的地址，相关隧道会被关闭（RFC 9484 要求隧道存续期间保持已分配的路由），
+  客户端自动重连后拿到新的路由；
 - `interface`、`ipv4`、`ipv6`、`mtu`、`manage_network` 改了要重启：`systemctl restart caddy-masque`。
 
 证书用的是自己的文件（`tls 证书 私钥`）时，文件换了而 Caddyfile 没变，要 `caddy reload --force`
@@ -113,7 +115,17 @@ caddy masque-passwd --name iphone
 - **HTTP/2**：Go 的 HTTP/2 默认不接受扩展 CONNECT，要 `GODEBUG=http2xconnect=1`。
   本模块在程序启动时自动设置（无论用本项目的 `cmd/caddy` 还是 xcaddy 编译）；
   如果环境变量里明确写了 `http2xconnect=0`，就尊重它，此时 HTTP/2 隧道不可用，日志里有警告。
+- **超时**：Caddy 2.11 默认的读写空闲超时（1 分钟）和 `read_timeout`、`write_timeout` 不作用于隧道，
+  隧道空闲多久都不断；对普通网页请求照常生效。
+- **不支持 HTTP/3 Datagram 的客户端**：用 DATAGRAM capsule 在流上传数据包（RFC 9297 §3.5）。
 - **退出**：Caddy 退出时主动结束所有隧道，不会因为隧道一直开着而卡住。
+- **重载失败**：新配置启动失败时，用户、可达范围、HTTP/3 都回到旧配置。
+
+已知的限制：
+
+- `Alt-Svc` 头只加在带 `masque` 指令的站点上；同一端口上的其他站点照样能用 HTTP/3，只是不会被告知。
+- VPN 接管的 HTTP/3 不接受 0-RTT（重放风险），也不套用 Caddy 的 `packet_conn_wrappers`（如 UDP 上的 proxy protocol）。
+- HTTP/2 隧道因协议错误被中止时，流的错误码是 INTERNAL_ERROR 而不是 PROTOCOL_ERROR（Go 的 HTTP/2 服务端不让处理器指定错误码）。
 
 ## 测试
 
@@ -123,12 +135,15 @@ sudo tests/e2e-netns.sh             # 端到端测试：网络命名空间里跑
 ```
 
 进程内测试在测试进程里启动真的 Caddy（TUN 设备换成假的），用 Go 写的小客户端
-走 HTTP/3、HTTP/2、HTTP/1.1 做 CONNECT-IP：收发数据包、伪装成网站的拒绝、重载、删用户、新屏蔽等。
+走 HTTP/3、HTTP/2、HTTP/1.1 做 CONNECT-IP：收发数据包、伪装成网站的拒绝、重载（含失败的重载）、删用户、新屏蔽、空闲超时等。
 
 端到端测试需要 masque-vpn 的客户端（默认找 `../masque-vpn/target/debug/masque-client`，
 或用 `CLIENT_BIN=` 指定），覆盖：三种传输方式、UDP 被封时回退到 TCP、限定范围的请求
 （含服务器解析域名）、证书和用户的重载、服务器崩溃和重启、客户端互访、SOCKS 模式、
 局域网网关模式、地址复用时清理连接跟踪等。
+
+另有和 [connect-ip-go](https://github.com/quic-go/connect-ip-go)（quic-go 团队的 CONNECT-IP 实现）的互通测试：
+它作为客户端，用自己的代码解析服务端发的所有 capsule，并按分配的地址和路由检查收到的每个包。
 
 GitHub Actions 对每次推送到 main 和每个 PR 跑单元测试；仓库设置了 `MASQUE_VPN_TOKEN`（能读 masque-vpn 的令牌）时也跑端到端测试。
 

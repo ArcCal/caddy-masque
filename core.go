@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,34 @@ type tunnelConfig struct {
 	ipv6   netip.Prefix
 	mtu    int
 	manage bool
+}
+
+// logLimit lets through at most max events a minute and counts the rest,
+// so a flood (made-up credentials, a failing device) cannot flood the log.
+type logLimit struct {
+	mu         sync.Mutex
+	max        int
+	window     time.Time
+	n          int
+	suppressed int
+}
+
+// allow reports whether to log an event, and how many were suppressed
+// since the last one logged.
+func (l *logLimit) allow() (bool, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if now := time.Now(); now.Sub(l.window) >= time.Minute {
+		l.window, l.n = now, 0
+	}
+	if l.n >= l.max {
+		l.suppressed++
+		return false, 0
+	}
+	l.n++
+	s := l.suppressed
+	l.suppressed = 0
+	return true, s
 }
 
 // device is the host's side of the tunnel: the TUN device (replaced in
@@ -79,10 +108,16 @@ type core struct {
 	nextID   atomic.Uint64
 	// Session handlers that have not returned.
 	running atomic.Int64
+	// Logging of failed logins and device errors.
+	authLog, deviceLog logLimit
 	// Deletes connection tracking entries (replaced in tests).
 	forget func([]netip.Prefix) (int, error)
 
 	startOnce func() error
+	// The started configurations using the core, in start order; the
+	// last one's users and allowed destinations apply.
+	ownersMu sync.Mutex
+	owners   []*App
 	// HTTP servers whose shutdown is watched (endOnExit).
 	watched sync.Map
 
@@ -117,15 +152,17 @@ func (h *sessionHandle) revoke(why string) {
 
 func newCore(cfg tunnelConfig, log *zap.Logger) (*core, error) {
 	c := &core{
-		cfg:      cfg,
-		log:      log,
-		auth:     auth.New(),
-		gw4:      cfg.ipv4.Addr(),
-		sessions: map[netip.Addr]*sessionHandle{},
-		pool:     pool.New(cfg.ipv4, cfg.ipv6),
-		recent:   map[string]recentLease{},
-		forget:   forgetConntrack,
-		done:     make(chan struct{}),
+		cfg:       cfg,
+		log:       log,
+		auth:      auth.New(),
+		gw4:       cfg.ipv4.Addr(),
+		sessions:  map[netip.Addr]*sessionHandle{},
+		pool:      pool.New(cfg.ipv4, cfg.ipv6),
+		recent:    map[string]recentLease{},
+		forget:    forgetConntrack,
+		authLog:   logLimit{max: 60},
+		deviceLog: logLimit{max: 1},
+		done:      make(chan struct{}),
 	}
 	if cfg.ipv6.IsValid() {
 		c.gw6 = cfg.ipv6.Addr()
@@ -193,7 +230,9 @@ func (c *core) readNetwork() {
 			if c.ctx.Err() != nil {
 				return
 			}
-			c.log.Warn("TUN read failed", zap.Error(err))
+			if ok, suppressed := c.deviceLog.allow(); ok {
+				c.log.Warn("TUN read failed", zap.Error(err), zap.Int("failures_not_logged", suppressed))
+			}
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -245,6 +284,31 @@ func (c *core) setUsers(users map[string]string) {
 			s.revoke("user removed or password changed")
 		}
 	}
+}
+
+// activate applies a configuration that started.
+func (c *core) activate(a *App) {
+	c.ownersMu.Lock()
+	defer c.ownersMu.Unlock()
+	c.owners = append(c.owners, a)
+	c.apply(a)
+}
+
+// deactivate drops a configuration; if it was the one applied (it failed
+// after starting), the previous one applies again.
+func (c *core) deactivate(a *App) {
+	c.ownersMu.Lock()
+	defer c.ownersMu.Unlock()
+	last := len(c.owners) > 0 && c.owners[len(c.owners)-1] == a
+	c.owners = slices.DeleteFunc(c.owners, func(o *App) bool { return o == a })
+	if last && len(c.owners) > 0 {
+		c.apply(c.owners[len(c.owners)-1])
+	}
+}
+
+func (c *core) apply(a *App) {
+	c.setAllowed(a.allowed)
+	c.setUsers(a.users)
 }
 
 // setAllowed installs the destinations clients may reach; running sessions
