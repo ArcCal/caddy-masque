@@ -16,6 +16,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -26,6 +27,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -190,6 +192,27 @@ func (e *caddyEnv) tlsConfig(alpn string) *tls.Config {
 	return &tls.Config{RootCAs: e.cert.pool, ServerName: "vpn.test", NextProtos: []string{alpn}}
 }
 
+// dialTCP connects to Caddy, with TLS when cfg is set. On Linux, a Caddy
+// reload opens a new SO_REUSEPORT socket and closes the old one, which
+// resets connections waiting in the old one's queue: like a real client,
+// try again.
+func (e *caddyEnv) dialTCP(ctx context.Context, cfg *tls.Config) (net.Conn, error) {
+	addr := fmt.Sprintf("127.0.0.1:%d", e.port)
+	for attempt := 0; ; attempt++ {
+		var conn net.Conn
+		var err error
+		if cfg != nil {
+			conn, err = (&tls.Dialer{Config: cfg}).DialContext(ctx, "tcp", addr)
+		} else {
+			conn, err = (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		}
+		if err == nil || attempt == 4 || !errors.Is(err, syscall.ECONNRESET) {
+			return conn, err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func (e *caddyEnv) url(path string) string { return fmt.Sprintf("https://vpn.test:%d%s", e.port, path) }
 
 const anyTarget = "/.well-known/masque/ip/*/*/"
@@ -291,7 +314,7 @@ func (e *caddyEnv) dialH2(t *testing.T, password, path string) *tunnelClient {
 	t.Helper()
 	tr := &http2.Transport{TLSClientConfig: e.tlsConfig("h2"),
 		DialTLSContext: func(ctx context.Context, network, _ string, cfg *tls.Config) (net.Conn, error) {
-			return (&tls.Dialer{Config: cfg}).DialContext(ctx, network, fmt.Sprintf("127.0.0.1:%d", e.port))
+			return e.dialTCP(ctx, cfg)
 		}}
 	pr, pw := io.Pipe()
 	req, _ := http.NewRequest(http.MethodConnect, e.url(path), pr)
@@ -317,7 +340,7 @@ func (e *caddyEnv) dialH2(t *testing.T, password, path string) *tunnelClient {
 
 func (e *caddyEnv) dialH1(t *testing.T, password, path string) *tunnelClient {
 	t.Helper()
-	conn, err := tls.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", e.port), e.tlsConfig("http/1.1"))
+	conn, err := e.dialTCP(context.Background(), e.tlsConfig("http/1.1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,7 +516,7 @@ func TestCaddyWebsiteOverEveryVersion(t *testing.T) {
 		return resp
 	}
 	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, network, fmt.Sprintf("127.0.0.1:%d", e.port))
+		return e.dialTCP(ctx, nil)
 	}
 	for _, h2 := range []bool{false, true} {
 		cfg := e.tlsConfig("http/1.1")
@@ -769,7 +792,7 @@ func TestCaddyCleanEndOfHTTP2Tunnels(t *testing.T) {
 	}
 	tr := &http2.Transport{TLSClientConfig: e.tlsConfig("h2"),
 		DialTLSContext: func(ctx context.Context, network, _ string, cfg *tls.Config) (net.Conn, error) {
-			return (&tls.Dialer{Config: cfg}).DialContext(ctx, network, fmt.Sprintf("127.0.0.1:%d", e.port))
+			return e.dialTCP(ctx, cfg)
 		}}
 	defer tr.CloseIdleConnections()
 	pr, pw := io.Pipe()
@@ -937,7 +960,7 @@ func TestCaddyMalformedHTTP1Requests(t *testing.T) {
 		t.Fatal(err)
 	}
 	send := func(request string) string {
-		conn, err := tls.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", e.port), e.tlsConfig("http/1.1"))
+		conn, err := e.dialTCP(context.Background(), e.tlsConfig("http/1.1"))
 		if err != nil {
 			t.Fatal(err)
 		}
