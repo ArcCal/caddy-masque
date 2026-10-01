@@ -5,8 +5,11 @@ go 1.26.0
 require (
 	github.com/caddyserver/caddy/v2 v2.11.6
 	github.com/quic-go/quic-go v0.63.0
+	github.com/spf13/cobra v1.10.2
+	github.com/vishvananda/netlink v1.3.1
 	go.uber.org/zap v1.28.0
 	golang.org/x/crypto v0.57.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
@@ -109,11 +112,11 @@ require (
 	github.com/smallstep/scep v0.0.0-20260331191114-261f960a40d1 // indirect
 	github.com/smallstep/truststore v0.13.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
-	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55 // indirect
 	github.com/tailscale/tscert v0.0.0-20251216020129-aea342f6d747 // indirect
 	github.com/urfave/cli v1.22.17 // indirect
+	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/yuin/goldmark v1.8.6 // indirect
 	github.com/yuin/goldmark-highlighting/v2 v2.0.0-20230729083705-37449abec8cc // indirect
@@ -157,7 +160,6 @@ require (
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/term v0.46.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
