@@ -612,16 +612,29 @@ reload_server
 # Running sessions get the new routes; nobody reconnects.
 check "with allow_client_to_client after a reload, it can" bash -c \
     "for i in \$(seq 10); do ip netns exec $NS_C2 ping -c1 -W1 $LAPTOP_ADDR >/dev/null 2>&1 && exit 0; sleep 0.5; done; exit 1"
-check "the server advertised the new routes" grep -q "routes changed with the configuration" "$WORK/server.log"
+check "the server advertised the new routes" grep -q "more routes with the new configuration" "$WORK/server.log"
 check_not "without reconnecting" wait_log "$WORK/client-c2c.log" "tunnel up" 1 2
 write_server_config laptop tablet -- 'block 192.0.2.0/24'
 reload_server
-check "a destination blocked by a reload is unreachable at once" bash -c \
-    "sleep 1; ! ip netns exec $NS_C curl --noproxy '*' -s --max-time 3 http://$TARGET:8080/"
+# Routes the tunnels were given stay while they are open (RFC 9484 §4): the
+# server closes them, and the clients reconnect to the new routes.
+check "routes withdrawn by a reload close the tunnels" \
+    wait_log "$WORK/server.log" "the new configuration withdraws routes of the tunnel" 5
+check "the client reconnects" wait_log "$WORK/client-c2c.log" "tunnel up" 20 2
+check "and the newly blocked destination is unreachable" bash -c \
+    "! ip netns exec $NS_C curl --noproxy '*' -s --max-time 3 http://$TARGET:8080/"
 kill -TERM "$TABLET_PID"; wait "$TABLET_PID" 2>/dev/null
 stop_client
 write_server_config laptop
 reload_server
+
+echo "== an idle HTTP/2 tunnel (Caddy's default idle timeouts are one minute)"
+start_client "$WORK/client-h2.toml" "$WORK/client-h2-idle.log"
+check "tunnel up over HTTP/2" wait_log "$WORK/client-h2-idle.log" "tunnel up.*HTTP/2" 15
+sleep 70
+check "after 70 s without traffic it still carries traffic" seen_as $SERVER 5
+check_not "without reconnecting" wait_log "$WORK/client-h2-idle.log" "tunnel up" 1 2
+stop_client
 
 echo "== client shutdown cleans up"
 check_not "tunnel interface removed" in_ns $NS_C ip link show masque0

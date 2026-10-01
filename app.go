@@ -10,6 +10,7 @@
 package masque
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -17,7 +18,9 @@ import (
 	"net/http"
 	"net/netip"
 	"slices"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -25,6 +28,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 
 	"github.com/ArcCal/caddy-masque/internal/auth"
 	"github.com/ArcCal/caddy-masque/internal/routes"
@@ -71,15 +75,17 @@ type App struct {
 	// HTTP/3.
 	HTTP3 *bool `json:"http3,omitempty"`
 
-	ctx       caddy.Context
-	log       *zap.Logger
-	cfg       tunnelConfig
-	users     map[string]string
-	allowed   routes.Set
-	core      *core
-	coreKey   string
-	listeners []string // keys in the listener pool
-	httpApp   *caddyhttp.App
+	ctx         caddy.Context
+	log         *zap.Logger
+	cfg         tunnelConfig
+	users       map[string]string
+	allowed     routes.Set
+	core        *core
+	coreKey     string
+	released    bool     // the core's pool reference
+	listeners   []string // keys in the listener pool
+	h3Listeners []*h3Listener
+	httpApp     *caddyhttp.App
 	// The UDP addresses whose HTTP/3 this app serves, and their ports.
 	h3Addrs []h3Addr
 	h3Ports map[int]bool
@@ -123,7 +129,7 @@ func (a *App) Provision(ctx caddy.Context) error {
 	a.core = val.(*core)
 	if a.core.cfg != a.cfg {
 		_, _ = cores.Delete(a.coreKey)
-		a.core = nil
+		a.released = true
 		return errors.New("masque: the tunnel settings (interface, ipv4, ipv6, mtu, manage_network) changed; restart Caddy to apply them")
 	}
 	return nil
@@ -276,13 +282,14 @@ func (a *App) takeOverHTTP3() error {
 	return nil
 }
 
-// Start implements caddy.App.
+// Start implements caddy.App. The shared state (users, allowed
+// destinations, HTTP/3 handlers) becomes this configuration's; Cleanup
+// gives it back to the previous one if this one fails to start.
 func (a *App) Start() error {
 	if err := a.core.startOnce(); err != nil {
 		return err
 	}
-	a.core.setAllowed(a.allowed)
-	a.core.setUsers(a.users)
+	a.core.activate(a)
 	for _, h := range a.h3Addrs {
 		srv := a.httpApp.Servers[h.server]
 		if err := a.serveHTTP3(h.network, h.hostport, srv, srv.TLSConnPolicies.TLSConfig(a.ctx)); err != nil {
@@ -304,16 +311,21 @@ func (a *App) Start() error {
 func (a *App) Stop() error { return nil }
 
 // Cleanup implements caddy.CleanerUpper: the configuration is unloaded, or
-// failed to load or start. The tunnel and the HTTP/3 listeners stay if the
-// next configuration uses them too.
+// failed to load or start. The tunnel and the HTTP/3 listeners stay if
+// another configuration uses them; if this one was in charge of them (it
+// failed after starting), the previous one is again.
 func (a *App) Cleanup() error {
+	for _, l := range a.h3Listeners {
+		l.deactivate(a)
+	}
 	for _, k := range a.listeners {
 		_, _ = listeners.Delete(k)
 	}
-	a.listeners = nil
-	if a.core != nil {
+	a.listeners, a.h3Listeners = nil, nil
+	if a.core != nil && !a.released {
+		a.core.deactivate(a)
 		_, _ = cores.Delete(a.coreKey)
-		a.core = nil
+		a.released = true
 	}
 	return nil
 }
@@ -324,13 +336,48 @@ var (
 	listeners = caddy.NewUsagePool()
 )
 
-// h3Listener is an HTTP/3 server on one UDP address; config reloads swap
-// its handler and TLS configuration, so connections and tunnels stay.
+// h3Listener is an HTTP/3 server on one UDP address, shared by the
+// configurations that use it, so connections and tunnels outlive reloads.
+// The newest configuration that started serves its requests.
 type h3Listener struct {
-	conn    net.PacketConn
-	server  *http3.Server
+	conn   net.PacketConn
+	server *http3.Server
+
+	mu     sync.Mutex
+	owners []h3Owner // in start order; the last one serves
+	// What the last owner serves with, read for every connection and
+	// request.
 	handler atomic.Pointer[http.Handler]
 	tls     atomic.Pointer[tls.Config]
+}
+
+type h3Owner struct {
+	app     *App
+	handler http.Handler
+	tls     *tls.Config
+}
+
+func (l *h3Listener) activate(o h3Owner) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.owners = append(l.owners, o)
+	l.apply()
+}
+
+func (l *h3Listener) deactivate(a *App) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	last := len(l.owners) > 0 && l.owners[len(l.owners)-1].app == a
+	l.owners = slices.DeleteFunc(l.owners, func(o h3Owner) bool { return o.app == a })
+	if last && len(l.owners) > 0 {
+		l.apply()
+	}
+}
+
+func (l *h3Listener) apply() {
+	o := l.owners[len(l.owners)-1]
+	l.handler.Store(&o.handler)
+	l.tls.Store(o.tls)
 }
 
 func (l *h3Listener) Destruct() error {
@@ -343,23 +390,52 @@ func (l *h3Listener) Destruct() error {
 // ID: so a full tunnel-MTU packet fits one datagram from the start.
 const quicOverhead = (1 + 20 + 4 + 16 + 1 + 2) + (2 + 1)
 
+// listenUDP binds with SO_REUSEPORT, as Caddy does: when HTTP/3 moves to
+// this app by a reload, Caddy's own socket on the port is still open.
+func listenUDP(network, hostport string) (net.PacketConn, error) {
+	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+		var serr error
+		if err := c.Control(func(fd uintptr) {
+			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+		}); err != nil {
+			return err
+		}
+		return serr
+	}}
+	return lc.ListenPacket(context.Background(), network, hostport)
+}
+
 func (a *App) serveHTTP3(network, hostport string, srv *caddyhttp.Server, tlsCfg *tls.Config) error {
 	key := "masque-h3/" + network + "/" + hostport
-	val, _, err := listeners.LoadOrNew(key, func() (caddy.Destructor, error) {
-		conn, err := net.ListenPacket(network, hostport)
+	owner := h3Owner{app: a, handler: srv, tls: tlsCfg}
+	val, loaded, err := listeners.LoadOrNew(key, func() (caddy.Destructor, error) {
+		conn, err := listenUDP(network, hostport)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP/3 on %s: %w", hostport, err)
 		}
 		l := &h3Listener{conn: conn}
-		base := &tls.Config{GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-			c := l.tls.Load()
-			if c.GetConfigForClient != nil {
-				if picked, err := c.GetConfigForClient(hello); picked != nil || err != nil {
-					return picked, err
+		// Ready before the first packet arrives.
+		l.activate(owner)
+		base := &tls.Config{
+			GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+				c := l.tls.Load()
+				if c.GetConfigForClient != nil {
+					if picked, err := c.GetConfigForClient(hello); picked != nil || err != nil {
+						return picked, err
+					}
 				}
-			}
-			return c, nil
-		}}
+				return c, nil
+			},
+			// Encrypted Client Hello is decrypted with the keys of the
+			// configuration the server starts with, before it picks one.
+			GetEncryptedClientHelloKeys: func(hello *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+				c := l.tls.Load()
+				if c.GetEncryptedClientHelloKeys != nil {
+					return c.GetEncryptedClientHelloKeys(hello)
+				}
+				return c.EncryptedClientHelloKeys, nil
+			},
+		}
 		l.server = &http3.Server{
 			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				(*l.handler.Load()).ServeHTTP(w, r)
@@ -384,9 +460,10 @@ func (a *App) serveHTTP3(network, hostport string, srv *caddyhttp.Server, tlsCfg
 	}
 	a.listeners = append(a.listeners, key)
 	l := val.(*h3Listener)
-	var h http.Handler = srv
-	l.handler.Store(&h)
-	l.tls.Store(tlsCfg)
+	a.h3Listeners = append(a.h3Listeners, l)
+	if loaded {
+		l.activate(owner)
+	}
 	return nil
 }
 

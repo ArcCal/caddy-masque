@@ -5,11 +5,14 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"sync"
 	"time"
 
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/quicvarint"
 
 	"github.com/ArcCal/caddy-masque/internal/proto"
 )
@@ -21,7 +24,11 @@ const h3MessageError = 0x10e
 
 // tunnel is a CONNECT-IP request stream, whatever the HTTP version:
 // capsules both ways, and HTTP Datagrams as QUIC DATAGRAM frames (HTTP/3)
-// or DATAGRAM capsules (HTTP/1.1 and HTTP/2, RFC 9297 §3.5).
+// or DATAGRAM capsules (RFC 9297 §3.5).
+//
+// A session ends it in three steps: stop unblocks reads (and, when
+// aborting, writes too), force unblocks writes that did not finish soon
+// after, and finish ends the stream once nothing uses it any more.
 type tunnel interface {
 	// readCapsule returns the next capsule from the client: io.EOF when the
 	// client finished the stream, a proto.MalformedError when it broke the
@@ -29,17 +36,16 @@ type tunnel interface {
 	readCapsule() (proto.Capsule, error)
 	writeCapsule(c proto.Capsule) error
 	// sendDatagram sends an HTTP Datagram payload. For one too large for the
-	// QUIC path it returns a *quic.DatagramTooLargeError.
+	// QUIC path it returns a *quic.DatagramTooLargeError whose size is the
+	// largest HTTP Datagram payload the path takes.
 	sendDatagram(payload []byte) error
 	// receiveDatagram returns the next QUIC datagram payload of the stream
-	// (HTTP/3 only).
+	// (HTTP/3 with datagrams only).
 	receiveDatagram(ctx context.Context) ([]byte, error)
 	hasQUICDatagrams() bool
-	// abort resets the stream after a protocol error, close ends it. Both
-	// unblock reads and writes in progress, and may be called while they
-	// run.
-	abort()
-	close()
+	stop(abort bool)
+	force()
+	finish(abort bool)
 }
 
 // capsuleReader reads capsules from a byte stream.
@@ -80,32 +86,37 @@ func (cr *capsuleReader) next() (proto.Capsule, error) {
 	}
 }
 
-// streamTunnel carries everything as capsules on a byte stream: an
-// upgraded HTTP/1.1 connection, or an HTTP/2 extended CONNECT stream.
-type streamTunnel struct {
-	reader *capsuleReader
-	mu     sync.Mutex
-	w      io.Writer
-	flush  func() error
-	closer func()
+// capsuleWriter writes capsules to a byte stream, one at a time.
+type capsuleWriter struct {
+	mu    sync.Mutex
+	w     io.Writer
+	flush func() error
 }
 
-func (t *streamTunnel) readCapsule() (proto.Capsule, error) { return t.reader.next() }
-
-func (t *streamTunnel) writeCapsule(c proto.Capsule) error {
+func (cw *capsuleWriter) writeCapsule(c proto.Capsule) error {
 	b := proto.Append(nil, c)
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if _, err := t.w.Write(b); err != nil {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	if _, err := cw.w.Write(b); err != nil {
 		return err
 	}
-	if t.flush != nil {
-		return t.flush()
+	if cw.flush != nil {
+		return cw.flush()
 	}
 	return nil
 }
 
-func (t *streamTunnel) sendDatagram(p []byte) error { return t.writeCapsule(proto.Datagram(p)) }
+// streamTunnel carries everything as capsules on a byte stream: an
+// upgraded HTTP/1.1 connection, or an HTTP/2 extended CONNECT stream.
+type streamTunnel struct {
+	reader *capsuleReader
+	capsuleWriter
+	stopFn  func(abort bool)
+	forceFn func()
+}
+
+func (t *streamTunnel) readCapsule() (proto.Capsule, error) { return t.reader.next() }
+func (t *streamTunnel) sendDatagram(p []byte) error         { return t.writeCapsule(proto.Datagram(p)) }
 
 func (t *streamTunnel) receiveDatagram(ctx context.Context) ([]byte, error) {
 	<-ctx.Done()
@@ -113,64 +124,112 @@ func (t *streamTunnel) receiveDatagram(ctx context.Context) ([]byte, error) {
 }
 
 func (t *streamTunnel) hasQUICDatagrams() bool { return false }
-func (t *streamTunnel) abort()                 { t.closer() }
-func (t *streamTunnel) close()                 { t.closer() }
+func (t *streamTunnel) stop(abort bool)        { t.stopFn(abort) }
+func (t *streamTunnel) force()                 { t.forceFn() }
 
-// h3Tunnel is an HTTP/3 request stream with QUIC datagrams.
+// finish: the handler returning ends an HTTP/2 stream (END_STREAM), and
+// stop already closed an HTTP/1.1 connection.
+func (t *streamTunnel) finish(bool) {}
+
+// h3Tunnel is an HTTP/3 request stream. HTTP Datagrams travel in QUIC
+// DATAGRAM frames when the client supports them (RFC 9297 §2.1.1), else in
+// DATAGRAM capsules on the stream.
 type h3Tunnel struct {
 	str    *http3.Stream
 	reader *capsuleReader
-	mu     sync.Mutex
+	capsuleWriter
+	quicDatagrams bool
+	// The Quarter Stream ID before every HTTP Datagram in a QUIC DATAGRAM
+	// frame (RFC 9297 §2.1).
+	quarterIDLen int
 }
 
-func newH3Tunnel(str *http3.Stream) *h3Tunnel {
-	return &h3Tunnel{str: str, reader: newCapsuleReader(str)}
+func newH3Tunnel(str *http3.Stream, quicDatagrams bool) *h3Tunnel {
+	return &h3Tunnel{str: str, reader: newCapsuleReader(str), capsuleWriter: capsuleWriter{w: str},
+		quicDatagrams: quicDatagrams, quarterIDLen: quicvarint.Len(uint64(str.StreamID() / 4))}
 }
 
 func (t *h3Tunnel) readCapsule() (proto.Capsule, error) { return t.reader.next() }
 
-func (t *h3Tunnel) writeCapsule(c proto.Capsule) error {
-	b := proto.Append(nil, c)
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	_, err := t.str.Write(b)
+func (t *h3Tunnel) sendDatagram(p []byte) error {
+	if !t.quicDatagrams {
+		return t.writeCapsule(proto.Datagram(p))
+	}
+	err := t.str.SendDatagram(p)
+	var tooBig *quic.DatagramTooLargeError
+	if errors.As(err, &tooBig) {
+		// quic-go reports the room in the QUIC DATAGRAM frame, which also
+		// holds the Quarter Stream ID.
+		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: tooBig.MaxDatagramPayloadSize - int64(t.quarterIDLen)}
+	}
 	return err
 }
-
-func (t *h3Tunnel) sendDatagram(p []byte) error { return t.str.SendDatagram(p) }
 
 func (t *h3Tunnel) receiveDatagram(ctx context.Context) ([]byte, error) {
 	return t.str.ReceiveDatagram(ctx)
 }
 
-func (t *h3Tunnel) hasQUICDatagrams() bool { return true }
+func (t *h3Tunnel) hasQUICDatagrams() bool { return t.quicDatagrams }
 
-func (t *h3Tunnel) abort() {
-	t.str.CancelRead(h3MessageError)
-	t.str.CancelWrite(h3MessageError)
+func (t *h3Tunnel) stop(abort bool) {
+	if abort {
+		t.str.CancelRead(h3MessageError)
+		t.str.CancelWrite(h3MessageError)
+		return
+	}
+	t.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
 }
 
-func (t *h3Tunnel) close() {
-	t.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
-	// A write blocked on flow control gives up; then the stream is finished
-	// (Close must not run concurrently with Write).
-	_ = t.str.SetWriteDeadline(time.Now())
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	_ = t.str.Close()
+func (t *h3Tunnel) force() { _ = t.str.SetWriteDeadline(time.Now()) }
+
+func (t *h3Tunnel) finish(abort bool) {
+	if !abort {
+		// Nothing writes any more: end the stream with a FIN.
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		_ = t.str.Close()
+	}
+}
+
+// innermost unwraps Caddy's response writer wrappers down to the HTTP
+// server's own.
+func innermost(w http.ResponseWriter) http.ResponseWriter {
+	for {
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return w
+		}
+		w = u.Unwrap()
+	}
+}
+
+// rawBody unwraps the request body readers Caddy adds, among them
+// IdleTimeoutReader, which sets a read deadline before every read: a
+// tunnel is idle for as long as its user likes.
+func rawBody(body io.ReadCloser) io.ReadCloser {
+	for {
+		if r, ok := body.(*caddyhttp.IdleTimeoutReader); ok {
+			body = r.ReadCloser
+			continue
+		}
+		// The byte counter for access logs (an unexported type) keeps the
+		// body in an exported field.
+		v := reflect.ValueOf(body)
+		if v.Kind() == reflect.Pointer && !v.IsNil() && v.Elem().Kind() == reflect.Struct {
+			if f := v.Elem().FieldByName("Source"); f.IsValid() && f.CanInterface() {
+				if inner, ok := f.Interface().(io.ReadCloser); ok && inner != nil {
+					body = inner
+					continue
+				}
+			}
+		}
+		return body
+	}
 }
 
 // unwrapStreamer finds the HTTP/3 stream behind Caddy's response writer
 // wrappers.
 func unwrapStreamer(w http.ResponseWriter) (http3.HTTPStreamer, bool) {
-	for {
-		if s, ok := w.(http3.HTTPStreamer); ok {
-			return s, true
-		}
-		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
-		if !ok {
-			return nil, false
-		}
-		w = u.Unwrap()
-	}
+	s, ok := innermost(w).(http3.HTTPStreamer)
+	return s, ok
 }

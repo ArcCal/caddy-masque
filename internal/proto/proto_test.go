@@ -47,11 +47,35 @@ func TestEmptyValue(t *testing.T) {
 }
 
 func TestOversizedKnownCapsuleRejectedBeforeBuffering(t *testing.T) {
+	for _, typ := range []uint64{TypeAddressAssign, TypeAddressRequest, TypeRouteAdvertisement} {
+		d := NewDecoder(10)
+		d.Push(quicvarint.Append(quicvarint.Append(nil, typ), 11))
+		var m MalformedError
+		if _, err := d.Next(); !errors.As(err, &m) {
+			t.Fatal(typ, err)
+		}
+	}
+}
+
+// RFC 9297 §3.5: a DATAGRAM capsule too large to be usable is discarded
+// without buffering it, and the stream goes on.
+func TestOversizedDatagramCapsuleIsDiscarded(t *testing.T) {
 	d := NewDecoder(10)
-	d.Push(quicvarint.Append(quicvarint.Append(nil, 0x00), 11))
-	var m MalformedError
-	if _, err := d.Next(); !errors.As(err, &m) {
+	d.Push(quicvarint.Append(quicvarint.Append(nil, TypeDatagram), 20))
+	if _, err := d.Next(); !errors.Is(err, ErrIncomplete) {
 		t.Fatal(err)
+	}
+	d.Push(make([]byte, 20))
+	if len(d.buf) != 0 {
+		t.Fatal("buffered the value")
+	}
+	c, err := d.Next()
+	if err != nil || c.Type != TypeDatagram || len(c.Value) != 0 {
+		t.Fatal(c, err)
+	}
+	d.Push(encoded(TypeDatagram, []byte("next")))
+	if c, err := d.Next(); err != nil || string(c.Value) != "next" {
+		t.Fatal(c, err)
 	}
 }
 
@@ -211,7 +235,7 @@ func TestTargets(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{"", "192.0.2.1/33", "192.0.2.1/24", "fe80::1%eth0", "-bad.example", "a..b",
-		"192.0.2.0/", "192.0.2.0/0024", "host/24", "under_score.example"} {
+		"192.0.2.0/", "192.0.2.0/0024", "host/24"} {
 		if _, err := ParseTarget(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
@@ -349,6 +373,26 @@ func TestExpandThenMatch(t *testing.T) {
 			if !ok || m["target"] != c[0] || m["ipproto"] != c[1] {
 				t.Errorf("%s %s: %v", s, path, m)
 			}
+		}
+	}
+}
+
+func TestTargetFormat(t *testing.T) {
+	for v, want := range map[string]string{
+		"*": "*", "192.0.2.1": "192.0.2.1", "192.0.2.0/24": "192.0.2.0/24", "2001:db8::/32": "2001:db8::/32",
+		"2001:db8::/032": "2001:db8::/32", "Example.COM": "example.com", "example.com.": "example.com",
+		"_sip._udp.example.com": "_sip._udp.example.com", "0.0.0.0/0": "0.0.0.0/0", "::/0": "::/0",
+	} {
+		tg, err := ParseTarget(v)
+		if err != nil || tg.Value() != want {
+			t.Errorf("%q: %q, %v", v, tg.Value(), err)
+		}
+	}
+	for _, v := range []string{"", "192.0.2.1/24", "192.0.2.0/024", "192.0.2.0/33", "2001:db8::1/32",
+		"2001:db8::/129", "2001:db8::/0128", "fe80::1%eth0", "a b", "-bad.com", "a..b", ".", "example.com..",
+		"192.0.2.0/", "/24"} {
+		if _, err := ParseTarget(v); err == nil {
+			t.Errorf("%q accepted", v)
 		}
 	}
 }

@@ -125,14 +125,19 @@ func (t *fakeTunnel) receiveDatagram(ctx context.Context) ([]byte, error) {
 }
 
 func (t *fakeTunnel) hasQUICDatagrams() bool { return t.quic }
-func (t *fakeTunnel) abort() {
-	t.aborted.Store(true)
+func (t *fakeTunnel) stop(abort bool) {
+	if abort {
+		t.aborted.Store(true)
+	}
 	t.doneOnce.Do(func() { close(t.done) })
 }
 
-func (t *fakeTunnel) close() {
-	t.closed.Store(true)
-	t.doneOnce.Do(func() { close(t.done) })
+func (t *fakeTunnel) force() {}
+
+func (t *fakeTunnel) finish(abort bool) {
+	if !abort {
+		t.closed.Store(true)
+	}
 }
 
 // next returns what the session sent the client next.
@@ -627,7 +632,12 @@ func TestTooLargeForTheQUICPath(t *testing.T) {
 	e := newTestEnv(t, &App{IPv4: "10.89.0.1/24"})
 	r := e.start(t, alice, true)
 	r.tun.maxDatagram = 1001
+
+	// With DF: dropped, and the sender learns the MTU (RFC 1191).
 	pkt := udp("1.1.1.1", r.addr(false), 1200)
+	pkt[6] |= 0x40
+	binary.BigEndian.PutUint16(pkt[10:], 0)
+	binary.BigEndian.PutUint16(pkt[10:], ip.Checksum(pkt[:20]))
 	e.dev.fromHost <- pkt
 	ptb := hostPacket(t, e.dev)
 	h, ok := ip.Parse(ptb)
@@ -639,6 +649,22 @@ func TestTooLargeForTheQUICPath(t *testing.T) {
 		t.Errorf("fragmentation needed with MTU 1000: % x", icmp[:8])
 	}
 	r.tun.quiet(t)
+
+	// Without DF: fragmented, as a router would.
+	e.dev.fromHost <- udp("1.1.1.1", r.addr(false), 1200)
+	var total int
+	for range 2 {
+		f := r.tun.nextPacket(t)
+		if len(f) > 1000 {
+			t.Errorf("fragment of %d bytes", len(f))
+		}
+		total += len(f) - 20
+	}
+	if total != 8+1200 {
+		t.Errorf("fragments carry %d bytes", total)
+	}
+	noHostPacket(t, e.dev)
+
 	// Small packets still pass.
 	e.dev.fromHost <- udp("1.1.1.1", r.addr(false), 100)
 	r.tun.nextPacket(t)
@@ -799,47 +825,71 @@ func TestScopeAllows(t *testing.T) {
 	}
 }
 
-func TestNewBlocksApplyToRunningSessions(t *testing.T) {
+func TestConfigurationChangesAndRunningSessions(t *testing.T) {
 	e := newTestEnv(t, dualStack())
 	r := e.start(t, alice, true)
 	scoped := e.startScoped(t, bob, true, newScope(*e.core.allowed.Load(),
-		[]netip.Prefix{netip.MustParsePrefix("1.1.0.0/16"), netip.MustParsePrefix("8.8.8.8/32")}, 0))
+		[]netip.Prefix{netip.MustParsePrefix("1.1.0.0/16"), netip.MustParsePrefix("10.89.0.0/24")}, 0))
 
 	// An unchanged configuration advertises nothing.
 	e.core.setAllowed(*e.core.allowed.Load())
 	r.tun.quiet(t)
+	scoped.tun.quiet(t)
 
-	app := dualStack()
-	app.BlockedDestinations = &[]string{"1.0.0.0/8"}
-	if err := app.parse(); err != nil {
+	// More destinations: a new advertisement, the session goes on.
+	more := dualStack()
+	more.AllowClientToClient = true
+	if err := more.parse(); err != nil {
 		t.Fatal(err)
 	}
-	e.core.setAllowed(app.allowed)
+	e.core.setAllowed(more.allowed)
 	for _, x := range []*running{r, scoped} {
 		adv, ok := x.tun.next(t).(proto.RouteAdvertisement)
-		if !ok {
-			t.Fatal("no new ROUTE_ADVERTISEMENT")
-		}
-		if err := proto.ValidateRoutes(adv); err != nil {
-			t.Fatal(err)
-		}
-		for _, rt := range adv {
-			if rt.Start.Compare(netip.MustParseAddr("1.1.1.1")) <= 0 && netip.MustParseAddr("1.1.1.1").Compare(rt.End) <= 0 {
-				t.Errorf("1.1.1.1 still advertised: %v", rt)
-			}
-		}
-		pkt := udp(x.addr(false), "1.1.1.1", 10)
-		x.tun.datagrams <- append([]byte{0}, pkt...)
-		noHostPacket(t, e.dev)
-		if reply := x.tun.nextPacket(t); reply[20] != 3 || reply[21] != 13 {
-			t.Error("the newly blocked destination is not refused")
+		if !ok || proto.ValidateRoutes(adv) != nil {
+			t.Fatal("no valid new ROUTE_ADVERTISEMENT")
 		}
 	}
-	// The scoped session keeps its scope: 8.8.8.8 only, IPv4 only.
-	adv := scoped.s.current.Load().routes.Routes(0)
-	if len(adv) != 1 || adv[0].Start != netip.MustParseAddr("8.8.8.8") || adv[0].End != adv[0].Start {
-		t.Errorf("scoped routes %v", adv)
-	}
-	scoped.tun.datagrams <- append([]byte{0}, udp(scoped.addr(false), "8.8.8.8", 10)...)
+	other := scoped.addr(false)
+	r.tun.datagrams <- append([]byte{0}, udp(r.addr(false), other, 10)...)
 	hostPacket(t, e.dev)
+	// The scoped session's routes stay within its scope.
+	if got := scoped.s.current.Load().routes; got.Contains(netip.MustParseAddr("8.8.8.8")) ||
+		!got.Contains(netip.MustParseAddr("10.89.0.200")) {
+		t.Errorf("scoped routes %v", got.Routes(0))
+	}
+
+	// Fewer destinations: assigned routes are kept while the stream is
+	// open (RFC 9484 §4), so the sessions end.
+	fewer := dualStack()
+	fewer.BlockedDestinations = &[]string{"1.0.0.0/8"}
+	if err := fewer.parse(); err != nil {
+		t.Fatal(err)
+	}
+	e.core.setAllowed(fewer.allowed)
+	for _, x := range []*running{r, scoped} {
+		if why := x.waitEnd(t); why != "the new configuration withdraws routes of the tunnel" {
+			t.Errorf("ended: %s", why)
+		}
+		if x.tun.aborted.Load() || !x.tun.closed.Load() {
+			t.Error("the stream is closed, not aborted")
+		}
+	}
+	// A new session gets the new routes.
+	n := e.start(t, alice, true)
+	if n.s.current.Load().routes.Contains(netip.MustParseAddr("1.1.1.1")) {
+		t.Error("a new session got a blocked destination")
+	}
+}
+
+func TestLogLimit(t *testing.T) {
+	l := logLimit{max: 2}
+	for i, want := range []bool{true, true, false, false} {
+		if ok, _ := l.allow(); ok != want {
+			t.Errorf("event %d: %v", i, ok)
+		}
+	}
+	l.window = l.window.Add(-time.Minute)
+	if ok, suppressed := l.allow(); !ok || suppressed != 2 {
+		t.Errorf("next minute: %v, %d suppressed", ok, suppressed)
+	}
 }

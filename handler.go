@@ -14,6 +14,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
 
 	"github.com/ArcCal/caddy-masque/internal/auth"
@@ -82,20 +83,27 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 type request struct {
 	transport string
 	http1     bool
+	// It meets the requirements of its HTTP version (RFC 9484 §4.2, §4.4).
+	wellFormed bool
 }
 
+// connectIPRequest recognizes a request for the connect-ip upgrade token.
 func connectIPRequest(r *http.Request) (request, bool) {
 	switch r.ProtoMajor {
 	case 3:
 		// quic-go puts :protocol into Proto for extended CONNECT.
-		return request{transport: "HTTP/3"}, r.Method == http.MethodConnect && r.Proto == connectIP
+		return request{transport: "HTTP/3", wellFormed: true}, r.Method == http.MethodConnect && r.Proto == connectIP
 	case 2:
-		return request{transport: "HTTP/2"}, r.Method == http.MethodConnect && r.Header.Get(":protocol") == connectIP
+		return request{transport: "HTTP/2", wellFormed: true}, r.Method == http.MethodConnect && r.Header.Get(":protocol") == connectIP
 	default:
-		// RFC 9484 §4.2: GET with "Connection: Upgrade" and "Upgrade: connect-ip".
+		// RFC 9484 §4.2: GET with "Connection: Upgrade" and "Upgrade:
+		// connect-ip". Any request to upgrade to connect-ip is one; the
+		// others are malformed.
 		upgrade := false
 		for _, v := range r.Header.Values("Upgrade") {
-			upgrade = upgrade || strings.EqualFold(strings.TrimSpace(v), connectIP)
+			for _, t := range strings.Split(v, ",") {
+				upgrade = upgrade || strings.EqualFold(strings.TrimSpace(t), connectIP)
+			}
 		}
 		wants := false
 		for _, v := range r.Header.Values("Connection") {
@@ -103,7 +111,7 @@ func connectIPRequest(r *http.Request) (request, bool) {
 				wants = wants || strings.EqualFold(strings.TrimSpace(t), "upgrade")
 			}
 		}
-		return request{transport: "HTTP/1.1", http1: true}, r.Method == http.MethodGet && upgrade && wants
+		return request{transport: "HTTP/1.1", http1: true, wellFormed: r.Method == http.MethodGet && wants}, upgrade
 	}
 }
 
@@ -162,7 +170,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				name = name[:64]
 			}
 			// zap quotes the client's text, so it cannot forge log lines.
-			h.log.Info("authentication failed", zap.String("remote", remote), zap.String("user", name), zap.String("transport", req.transport))
+			if ok, suppressed := c.authLog.allow(); ok {
+				h.log.Info("authentication failed", zap.String("remote", remote), zap.String("user", name),
+					zap.String("transport", req.transport), zap.Int("failures_not_logged", suppressed))
+			}
 		} else {
 			h.log.Debug("CONNECT-IP request without credentials", zap.String("remote", remote), zap.String("transport", req.transport))
 		}
@@ -177,7 +188,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// Protocol, so the Capsule-Protocol header is not required (RFC 9297
 	// §3.4 only recommends it); content header fields make the request
 	// malformed (§3.2).
-	if carriesContent(r) {
+	if !req.wellFormed || carriesContent(r) {
 		return rejectLogged(rejection{status: http.StatusBadRequest})
 	}
 	for _, name := range []string{"target", "ipproto"} {
@@ -293,8 +304,14 @@ func isTimeout(err error) bool {
 	return errors.As(err, &dnsErr) && dnsErr.IsTimeout
 }
 
+// How long to wait for the client's HTTP/3 SETTINGS, which normally
+// arrive before its first request.
+const settingsTimeout = 3 * time.Second
+
 // accept sends the successful response and returns the tunnel over the
-// request stream.
+// request stream. The tunnel bypasses Caddy's idle-timeout wrappers and
+// clears the server's read and write deadlines: a tunnel lasts as long as
+// its client keeps the stream open (RFC 9484 §4).
 func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (tunnel, error) {
 	if req.http1 {
 		// RFC 9484 §4.3.
@@ -302,46 +319,75 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 		if err != nil {
 			return nil, err
 		}
+		_ = conn.SetDeadline(time.Time{})
 		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\nCapsule-Protocol: ?1\r\n\r\n")
 		if err := brw.Flush(); err != nil {
 			conn.Close()
 			return nil, err
 		}
+		closeConn := func(bool) { conn.Close() }
 		return &streamTunnel{
-			reader: newCapsuleReader(io.MultiReader(bufferedOf(brw.Reader), conn)),
-			w:      conn,
-			closer: func() { conn.Close() },
+			reader:        newCapsuleReader(io.MultiReader(bufferedOf(brw.Reader), conn)),
+			capsuleWriter: capsuleWriter{w: conn},
+			stopFn:        closeConn,
+			forceFn:       func() {},
 		}, nil
 	}
 	// No Content-Type sniffing: the response has no content (RFC 9297 §3.2).
 	w.Header()["Content-Type"] = nil
 	w.Header().Set("Capsule-Protocol", "?1")
+	raw := innermost(w)
+	rc := http.NewResponseController(raw)
 	if r.ProtoMajor == 3 {
-		s, ok := unwrapStreamer(w)
+		s, ok := raw.(http3.HTTPStreamer)
 		if !ok {
 			return nil, errors.New("no HTTP/3 stream behind the response writer")
 		}
+		// HTTP Datagrams go in QUIC DATAGRAM frames only if the client
+		// announced support (RFC 9297 §2.1.1); else in DATAGRAM capsules.
+		quicDatagrams := false
+		if st, ok := raw.(http3.Settingser); ok {
+			timer := time.NewTimer(settingsTimeout)
+			select {
+			case <-st.ReceivedSettings():
+				quicDatagrams = st.Settings().EnableDatagrams
+			case <-timer.C:
+			case <-r.Context().Done():
+				timer.Stop()
+				return nil, r.Context().Err()
+			}
+			timer.Stop()
+		}
 		w.WriteHeader(http.StatusOK)
-		if err := http.NewResponseController(w).Flush(); err != nil {
+		if err := rc.Flush(); err != nil {
 			return nil, err
 		}
-		return newH3Tunnel(s.HTTPStream()), nil
+		str := s.HTTPStream()
+		_ = str.SetReadDeadline(time.Time{})
+		_ = str.SetWriteDeadline(time.Time{})
+		return newH3Tunnel(str, quicDatagrams), nil
 	}
 	w.WriteHeader(http.StatusOK)
-	rc := http.NewResponseController(w)
 	if err := rc.Flush(); err != nil {
 		return nil, err
 	}
-	body := r.Body
+	_ = rc.SetReadDeadline(time.Time{})
+	_ = rc.SetWriteDeadline(time.Time{})
+	body := rawBody(r.Body)
+	// A write deadline in the past resets the stream (and unblocks a write
+	// waiting for flow control); Go's HTTP/2 server has no other way to
+	// reset it from a handler.
+	reset := func() { _ = rc.SetWriteDeadline(time.Now()) }
 	return &streamTunnel{
-		reader: newCapsuleReader(body),
-		w:      w,
-		flush:  rc.Flush,
-		closer: func() {
-			// Unblocks a write waiting for flow control.
-			_ = rc.SetWriteDeadline(time.Now())
+		reader:        newCapsuleReader(body),
+		capsuleWriter: capsuleWriter{w: raw, flush: rc.Flush},
+		stopFn: func(abort bool) {
+			if abort {
+				reset()
+			}
 			_ = body.Close()
 		},
+		forceFn: reset,
 	}, nil
 }
 

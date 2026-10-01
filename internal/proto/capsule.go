@@ -58,8 +58,9 @@ type Decoder struct {
 	skipRemains uint64
 }
 
-// NewDecoder limits buffered values to maxValueLen. Oversized known types
-// are rejected; oversized unknown types are skipped as they arrive.
+// NewDecoder limits buffered values to maxValueLen. Oversized control
+// capsules are rejected; oversized DATAGRAM and unknown capsules are
+// skipped as they arrive.
 func NewDecoder(maxValueLen int) *Decoder {
 	return &Decoder{maxValueLen: maxValueLen}
 }
@@ -113,11 +114,12 @@ func (d *Decoder) Next() (RawCapsule, error) {
 	}
 	header := n1 + n2
 	if l > uint64(d.maxValueLen) {
-		if knownType(t) {
+		if knownType(t) && t != TypeDatagram {
 			return RawCapsule{}, MalformedError("capsule value exceeds size limit")
 		}
-		// RFC 9297: unknown types MUST be ignored, whatever their length;
-		// skip without buffering the value.
+		// RFC 9297: unknown types MUST be ignored, whatever their length,
+		// and a DATAGRAM capsule too large to be usable SHOULD be discarded
+		// without buffering its contents (§3.5); it comes out empty.
 		d.buf = d.buf[header:]
 		discard := min(l, uint64(len(d.buf)))
 		d.buf = d.buf[discard:]

@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"go.uber.org/zap"
@@ -71,6 +72,9 @@ func (s *session) icmpAllow() bool {
 	return s.icmp.Allow()
 }
 
+// How long an ending session waits for writes in progress.
+const drainTimeout = 2 * time.Second
+
 // errAbort ends the session with an aborted stream.
 type errAbort struct{ why string }
 
@@ -116,26 +120,42 @@ func (s *session) run(ctx context.Context) string {
 		case <-ctx.Done():
 			err = ctx.Err()
 		case <-s.lease.handle.rescope:
-			// The allowed destinations changed: the latest advertisement
-			// replaces the earlier ones (§4.7.3).
-			next := s.narrow()
-			if !next.routes.Equal(s.current.Load().routes) {
+			// The allowed destinations changed. The proxy maintains the
+			// routes it assigned while the stream is open (§4): more
+			// routes are advertised, the latest advertisement replacing
+			// the earlier ones (§4.7.3); fewer end the tunnel, and the
+			// client gets the new ones when it reconnects.
+			cur, next := s.current.Load(), s.narrow()
+			switch {
+			case next.routes.Equal(cur.routes):
+			case cur.routes.Union(next.routes).Equal(next.routes):
 				s.current.Store(next)
 				err = s.advertise()
-				s.log.Info("routes changed with the configuration", zap.Int("routes", len(next.routes.Routes(next.protocol))))
+				s.log.Info("more routes with the new configuration", zap.Int("routes", len(next.routes.Routes(next.protocol))))
+			default:
+				err = errors.New("the new configuration withdraws routes of the tunnel")
 			}
 		}
 	}
 	// Unblock the goroutines and wait for them: nothing may use the
-	// stream after the handler returns.
+	// stream after the handler returns. A write still blocked (a client
+	// that stopped reading) is cut short after a while.
 	cancel()
 	var abort errAbort
-	if errors.As(err, &abort) {
-		s.tun.abort()
-	} else {
-		s.tun.close()
+	aborted := errors.As(err, &abort)
+	s.tun.stop(aborted)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(drainTimeout):
+		s.tun.force()
+		<-done
 	}
-	wg.Wait()
+	s.tun.finish(aborted)
 	if errors.Is(err, io.EOF) {
 		return "client closed the tunnel"
 	}
@@ -251,7 +271,6 @@ func (s *session) sendToClient(payload []byte) error {
 	case err == nil:
 		s.stats.toClient.Add(1)
 	case errors.As(err, &tooBig):
-		s.stats.dropped.Add(1)
 		pkt := payload[1:]
 		v6 := len(pkt) > 0 && pkt[0]>>4 == 6
 		// RFC 9484 §7.1: an IPv6 tunnel must carry 1280-byte packets; if
@@ -259,8 +278,18 @@ func (s *session) sendToClient(payload []byte) error {
 		if v6 && s.lease.hasIPv6() && tooBig.MaxDatagramPayloadSize < 1+ip.IPv6MinMTU {
 			return errAbort{"the path cannot carry 1280-byte IPv6 packets in QUIC datagrams (RFC 9484 §7.1)"}
 		}
-		// §10.1: drop and report, never fall back to reliable delivery.
 		mtu := int(tooBig.MaxDatagramPayloadSize) - 1
+		// An IPv4 packet without DF is fragmented, as a router would.
+		if frags := ip.Fragment(pkt, mtu); frags != nil {
+			for _, f := range frags {
+				if err := s.sendToClient(append([]byte{0}, f...)); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		// §10.1: drop and report, never fall back to reliable delivery.
+		s.stats.dropped.Add(1)
 		if e := ip.PacketTooBig(pkt, s.core.gateway(v6), mtu); e != nil && s.icmpAllow() {
 			s.core.toNetwork(e)
 		}

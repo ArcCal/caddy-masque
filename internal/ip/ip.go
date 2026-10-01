@@ -6,6 +6,7 @@ package ip
 import (
 	"encoding/binary"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/ArcCal/caddy-masque/internal/proto"
@@ -333,4 +334,85 @@ func pseudoHeader(src, dst netip.Addr, upperLen int, next byte) []byte {
 	binary.BigEndian.PutUint32(ph[32:36], uint32(upperLen))
 	ph[39] = next
 	return ph
+}
+
+// Fragment splits an IPv4 packet into fragments of at most mtu bytes, as
+// a router does (RFC 791 §3.2, RFC 1812 §5.2.6). nil when the packet may not
+// be fragmented (DF set, or not IPv4) or mtu leaves no room for data.
+// Options without the copied flag go in the first fragment only.
+func Fragment(p []byte, mtu int) [][]byte {
+	h, ok := Parse(p)
+	if !ok || !h.IsIPv4() {
+		return nil
+	}
+	p = p[:h.TotalLen]
+	flags := binary.BigEndian.Uint16(p[6:8])
+	if flags&0x4000 != 0 { // DF
+		return nil
+	}
+	headerLen := int(p[0]&0x0f) * 4
+	if len(p) <= mtu {
+		return [][]byte{p}
+	}
+	firstHeader := p[:headerLen]
+	laterHeader := laterFragmentHeader(firstHeader)
+	data := p[headerLen:]
+	baseOffset := int(flags&0x1fff) * 8
+	moreAfter := flags&0x2000 != 0 // MF of the packet itself
+	var out [][]byte
+	for pos := 0; pos < len(data); {
+		hdr := laterHeader
+		if pos == 0 {
+			hdr = firstHeader
+		}
+		room := (mtu - len(hdr)) &^ 7
+		if room <= 0 {
+			return nil
+		}
+		n := min(room, len(data)-pos)
+		f := make([]byte, len(hdr)+n)
+		copy(f, hdr)
+		copy(f[len(hdr):], data[pos:pos+n])
+		f[0] = 0x40 | byte(len(hdr)/4)
+		binary.BigEndian.PutUint16(f[2:4], uint16(len(f)))
+		ff := uint16((baseOffset + pos) / 8)
+		if pos+n < len(data) || moreAfter {
+			ff |= 0x2000
+		}
+		binary.BigEndian.PutUint16(f[6:8], ff)
+		f[10], f[11] = 0, 0
+		binary.BigEndian.PutUint16(f[10:12], Checksum(f[:len(hdr)]))
+		out = append(out, f)
+		pos += n
+	}
+	return out
+}
+
+// laterFragmentHeader is the header of fragments after the first: only
+// the options with the copied flag, padded to a multiple of four bytes.
+func laterFragmentHeader(h []byte) []byte {
+	out := slices.Clone(h[:20])
+	opts := h[20:]
+	for i := 0; i < len(opts); {
+		t := opts[i]
+		if t == 0 { // end of options
+			break
+		}
+		if t == 1 { // no-operation
+			i++
+			continue
+		}
+		if i+1 >= len(opts) || opts[i+1] < 2 || i+int(opts[i+1]) > len(opts) {
+			break // malformed: copy nothing more
+		}
+		n := int(opts[i+1])
+		if t&0x80 != 0 {
+			out = append(out, opts[i:i+n]...)
+		}
+		i += n
+	}
+	for len(out)%4 != 0 {
+		out = append(out, 0)
+	}
+	return out
 }

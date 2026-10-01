@@ -246,12 +246,20 @@ func TestConnectIPRequests(t *testing.T) {
 		{req("HTTP/2.0", 2, http.MethodConnect, http.Header{":protocol": {"connect-udp"}}), false},
 		{req("HTTP/2.0", 2, http.MethodConnect, nil), false},
 		{req("HTTP/1.1", 1, http.MethodGet, http.Header{"Connection": {"keep-alive, Upgrade"}, "Upgrade": {"Connect-IP"}}), true},
-		{req("HTTP/1.1", 1, http.MethodGet, http.Header{"Upgrade": {"connect-ip"}}), false},
 		{req("HTTP/1.1", 1, http.MethodGet, http.Header{"Connection": {"upgrade"}, "Upgrade": {"websocket"}}), false},
-		{req("HTTP/1.1", 1, http.MethodPost, http.Header{"Connection": {"upgrade"}, "Upgrade": {"connect-ip"}}), false},
+		{req("HTTP/1.1", 1, http.MethodGet, nil), false},
 	} {
-		if _, got := connectIPRequest(c.r); got != c.want {
-			t.Errorf("%s %s %v: %v", c.r.Proto, c.r.Method, c.r.Header, got)
+		if got, ok := connectIPRequest(c.r); ok != c.want || ok && !got.wellFormed {
+			t.Errorf("%s %s %v: %v %+v", c.r.Proto, c.r.Method, c.r.Header, ok, got)
+		}
+	}
+	// Requests for connect-ip that are malformed (§4.2).
+	for _, r := range []*http.Request{
+		req("HTTP/1.1", 1, http.MethodGet, http.Header{"Upgrade": {"connect-ip"}}),
+		req("HTTP/1.1", 1, http.MethodPost, http.Header{"Connection": {"upgrade"}, "Upgrade": {"connect-ip"}}),
+	} {
+		if got, ok := connectIPRequest(r); !ok || got.wellFormed {
+			t.Errorf("%s %v: %v %+v", r.Method, r.Header, ok, got)
 		}
 	}
 }
