@@ -707,7 +707,7 @@ func TestCaddyEndsBlockedTunnels(t *testing.T) {
 		// Until the session's queue toward the client stays full: its
 		// writer is blocked. QUIC datagrams are not flow controlled, so
 		// HTTP/3 does not get there.
-		var queue chan []byte
+		var queue chan queued
 		cores.Range(func(_ any, v any) bool {
 			c := v.(*core)
 			c.sessMu.RLock()

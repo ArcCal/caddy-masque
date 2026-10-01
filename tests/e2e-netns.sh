@@ -15,6 +15,7 @@
 # Usage: sudo tests/e2e-netns.sh
 #   CADDY       the Caddy binary with this module (default: built here)
 #   CLIENT_BIN  masque-vpn's masque-client (default: ../masque-vpn/target/debug)
+#   NETSIM      the slow link of tests/netsim (default: built here with go)
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -26,6 +27,13 @@ if [ -z "$CADDY" ]; then
 fi
 CLIENT_BIN=${CLIENT_BIN:-$ROOT/../masque-vpn/target/debug/masque-client}
 [ -x "$CLIENT_BIN" ] || { echo "no masque-client at $CLIENT_BIN (set CLIENT_BIN)"; exit 1; }
+# The slow link for the poor-network checks (tests/netsim); without Go
+# those checks are skipped.
+NETSIM=${NETSIM:-}
+if [ -z "$NETSIM" ] && command -v go >/dev/null 2>&1; then
+    NETSIM=$WORK/netsim
+    (cd "$ROOT" && go build -o "$NETSIM" ./tests/netsim) || NETSIM=""
+fi
 NS_I=mq-inet NS_S=mq-srv NS_C=mq-cli NS_C2=mq-cli2 NS_L=mq-lan NS_L2=mq-lan2
 TARGET=192.0.2.80 TARGET6=2001:db8:80::80
 SERVER=198.51.100.2 SERVER6=2001:db8:5::2
@@ -62,6 +70,7 @@ wait_log() {
 
 cleanup() {
     [ -n "$CLIENT_PID" ] && kill "$CLIENT_PID" 2>/dev/null
+    [ -n "${NETSIM_PID:-}" ] && kill "$NETSIM_PID" 2>/dev/null
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     sleep 0.5
     for ns in $NS_L $NS_L2 $NS_C $NS_C2 $NS_S $NS_I; do
@@ -132,6 +141,12 @@ echo "nameserver 192.168.77.1" >"/etc/netns/$NS_L/resolv.conf"
 in_ns $NS_S ip route add default via 198.51.100.1
 in_ns $NS_C ip route add default via 203.0.113.1
 in_ns $NS_C2 ip route add default via 203.0.114.1
+# Without offloads, so that nftables counts and drops single packets, as a
+# real path does, instead of 64 KB bundles of them.
+for pair in "$NS_I i-srv" "$NS_I i-cli" "$NS_I br-cli" "$NS_I i-lan2" "$NS_I i-cli2" "$NS_S s-wan" "$NS_C c-wan" "$NS_C c-lan" \
+    "$NS_C2 c2-wan" "$NS_L l-eth" "$NS_L2 l2-eth"; do
+    in_ns "${pair%% *}" ethtool -K "${pair#* }" tso off gso off gro off tx-udp-segmentation off >/dev/null 2>&1 || true
+done
 in_ns $NS_I ip addr add $TARGET/32 dev lo
 in_ns $NS_I sysctl -qw net.ipv4.ip_forward=1
 if [ $HAVE_V6 = 1 ]; then
@@ -145,22 +160,64 @@ if [ $HAVE_V6 = 1 ]; then
     in_ns $NS_C ip -6 route add default via 2001:db8:c::1
 fi
 
+# Test data that both sides can generate: 1 MB blocks of fixed random bytes,
+# each rotated differently, so a download's checksum is known in advance.
+cat >"$WORK/datagen.py" <<'EOF'
+import hashlib, random, sys
+BASE = random.Random(20261001).randbytes(1 << 20)
+def chunks(n):
+    k = 0
+    while n > 0:
+        r = (k * 7919) % len(BASE)
+        b = BASE[r:] + BASE[:r]
+        yield b[:n] if n < len(b) else b
+        n -= len(b)
+        k += 1
+if __name__ == "__main__":
+    h = hashlib.sha256()
+    for c in chunks(int(sys.argv[1])):
+        h.update(c)
+    print(h.hexdigest())
+EOF
 cat >"$WORK/whoami.py" <<'EOF'
-import http.server, socket, sys
+import hashlib, http.server, os, socket, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import datagen
 class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     def do_GET(self):
-        # /bytes/N sends N zero bytes; anything else, the client's address.
-        if self.path.startswith("/bytes/"):
-            n = int(self.path[7:])
+        # /bytes/N sends N zero bytes, /data/N the checksummed test data;
+        # anything else, the client's address.
+        if self.path.startswith("/bytes/") or self.path.startswith("/data/"):
+            n = int(self.path.split("/")[2])
             self.send_response(200)
             self.send_header("Content-Length", str(n))
             self.end_headers()
+            if self.path.startswith("/data/"):
+                for c in datagen.chunks(n):
+                    self.wfile.write(c)
+                return
             chunk = bytes(65536)
             while n > 0:
                 self.wfile.write(chunk[:min(n, len(chunk))])
                 n -= len(chunk)
             return
         body = (self.client_address[0] + "\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_POST(self):
+        # /upload answers with the SHA-256 of the body.
+        n = int(self.headers.get("Content-Length", "0"))
+        h = hashlib.sha256()
+        while n > 0:
+            d = self.rfile.read(min(n, 1 << 20))
+            if not d:
+                break
+            h.update(d)
+            n -= len(d)
+        body = h.hexdigest().encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -353,6 +410,47 @@ stop_client() {
     CLIENT_PID=""
 }
 
+# Transfers through the tunnel with their content checked; SPEED is set in
+# Mbit/s.
+SPEED=""
+expected_sum() { python3 "$WORK/datagen.py" "$1"; }
+tunnel_curl() { in_ns $NS_C curl --noproxy "*" -s "$@"; }
+download_ok() { # <bytes> [timeout]
+    local n=$1 t=${2:-120} stats
+    stats=$(tunnel_curl --max-time "$t" -o "$WORK/dl.bin" -w '%{speed_download}' "http://$TARGET:8080/data/$n") || return 1
+    SPEED=$(python3 -c "print(round($stats * 8 / 1e6, 1))")
+    [ "$(sha256sum "$WORK/dl.bin" | cut -d' ' -f1)" = "$(expected_sum "$n")" ]
+}
+upload_ok() { # <bytes> [timeout]
+    local n=$1 t=${2:-120} got
+    head -c "$n" /dev/urandom >"$WORK/up.bin"
+    got=$(tunnel_curl --max-time "$t" -X POST --data-binary "@$WORK/up.bin" -w ' %{speed_upload}' "http://$TARGET:8080/upload") || return 1
+    SPEED=$(python3 -c "print(round(${got##* } * 8 / 1e6, 1))")
+    [ "${got%% *}" = "$(sha256sum "$WORK/up.bin" | cut -d' ' -f1)" ]
+}
+check_transfer() { # <description> download_ok|upload_ok <bytes> [timeout]
+    local d=$1 fn=$2
+    shift 2
+    if "$fn" "$@" >/dev/null 2>&1; then ok "$d: $SPEED Mbit/s"; else bad "$d"; fi
+}
+# udp_capacity <label>: what a 20 Mbit/s UDP stream through the tunnel gets
+# through, with the tunnel's own loss (no TCP inside to adapt).
+udp_capacity() {
+    if in_ns $NS_C iperf3 -c $TARGET -u -b 20M -t 5 -J >"$WORK/iperf-udp.json" 2>&1; then
+        local r
+        r=$(python3 -c "import json;d=json.load(open('$WORK/iperf-udp.json'))['end']['sum'];print('%.1f Mbit/s delivered, %.1f%% lost' % (d['bits_per_second']/1e6*(1-d['lost_percent']/100), d['lost_percent']))")
+        ok "UDP through the tunnel, 20 Mbit/s offered ($1): $r"
+    else
+        bad "UDP through the tunnel ($1)"
+    fi
+}
+# seen_as, retried for up to $2 seconds.
+seen_as_within() {
+    local i
+    for ((i = 0; i < $2; i++)); do seen_as "$1" 3 && return 0; sleep 1; done
+    return 1
+}
+
 echo "== the masque-passwd command"
 check "prints a user line with an Argon2id hash" test "${LAPTOP_HASH:0:10}" = '$argon2id$'
 check "and a 24-character password" test "${#LAPTOP_PW}" = 24
@@ -414,6 +512,11 @@ if in_ns $NS_C iperf3 -c $TARGET -t 5 -J >"$WORK/iperf.json" 2>&1; then
 else
     bad "iperf3 through the tunnel"
 fi
+
+echo "== large transfers over HTTP/3, checksummed"
+check_transfer "download 300 MB" download_ok 300000000 180
+check_transfer "upload 100 MB" upload_ok 100000000 180
+check_not "without reconnecting" wait_log "$WORK/client.log" "tunnel up" 1 2
 
 
 echo "== the website outsiders see"
@@ -545,6 +648,8 @@ for t in h2:HTTP/2 h1:HTTP/1.1; do
     else
         bad "iperf3 over $proto"
     fi
+    check_transfer "download 100 MB over $proto, checksummed" download_ok 100000000 120
+    check_transfer "upload 50 MB over $proto" upload_ok 50000000 120
     check "the tunnel survives a config reload" reload_server
     check "and still carries traffic" seen_as $SERVER 5
     check_not "without reconnecting" wait_log "$WORK/client-$name.log" "tunnel up" 1 2
@@ -636,6 +741,125 @@ check "after 70 s without traffic it still carries traffic" seen_as $SERVER 5
 check_not "without reconnecting" wait_log "$WORK/client-h2-idle.log" "tunnel up" 1 2
 stop_client
 
+if [ -n "$NETSIM" ]; then
+    echo "== a slow, lossy path: 120 ms RTT with jitter, 1% loss, HTTP/3"
+    # Policy routing in the router sends the traffic between the client
+    # and the server through netsim's TUN device, which delays every
+    # packet and drops some; what comes back out of the device is routed
+    # normally. tbf limits the rate.
+    printf 'delay=60ms\njitter=5ms\nloss=10\n' >"$WORK/netsim.params"
+    ip netns exec $NS_I "$NETSIM" -tun dly0 -params "$WORK/netsim.params" >"$WORK/netsim.log" 2>&1 &
+    NETSIM_PID=$!
+    check "netsim's link comes up" wait_log "$WORK/netsim.log" "dly0 up" 5
+    in_ns $NS_I sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.dly0.rp_filter=0 \
+        net.ipv4.conf.br-cli.rp_filter=0 net.ipv4.conf.i-srv.rp_filter=0
+    in_ns $NS_I ip rule add priority 100 iif dly0 lookup main
+    in_ns $NS_I ip rule add priority 101 from $CLIENT to $SERVER lookup 100
+    in_ns $NS_I ip rule add priority 101 from $SERVER to $CLIENT lookup 100
+    in_ns $NS_I ip route add default dev dly0 table 100
+    set_path() { # <delay> <jitter> <loss per mille>
+        printf 'delay=%s\njitter=%s\nloss=%s\n' "$1" "$2" "$3" >"$WORK/netsim.params"
+        sleep 0.4
+    }
+    set_rate() { # <rate>|off, toward the client and toward the server
+        local dev
+        for dev in br-cli i-srv; do
+            if [ "$1" = off ]; then
+                in_ns $NS_I tc qdisc del dev $dev root 2>/dev/null
+            else
+                in_ns $NS_I tc qdisc replace dev $dev root tbf rate "$1" burst 32kb latency 200ms
+            fi
+        done
+    }
+    outage_on() { # the server's uplink drops everything
+        in_ns $NS_S nft -f - <<'EOF'
+table inet mq-outage {
+    chain input { type filter hook input priority -10; policy accept; iifname "s-wan" drop; }
+    chain output { type filter hook output priority -10; policy accept; oifname "s-wan" drop; }
+}
+EOF
+    }
+    outage_off() { in_ns $NS_S nft delete table inet mq-outage; }
+    tunnel_rtt() { in_ns $NS_C ping -c3 -i0.3 -W3 $TARGET 2>/dev/null | sed -n 's|.*= [0-9.]*/\([0-9]*\)[0-9.]*/.*|\1|p'; }
+    start_client "$WORK/client.toml" "$WORK/client-slow.log"
+    check "tunnel up over HTTP/3 through the slow path" wait_log "$WORK/client-slow.log" 'tunnel up.*HTTP/3' 40
+    rtt=$(tunnel_rtt)
+    check "ping through the tunnel (${rtt:-?} ms RTT; the path adds 120)" test -n "$rtt" -a "${rtt:-0}" -ge 100 -a "${rtt:-9999}" -lt 1000
+    # Random loss cuts the throughput of any tunnel: QUIC's congestion
+    # control sees every lost datagram (RFC 9221), and the TCP connections
+    # inside see the losses too. The checks are about correctness.
+    check_transfer "download 5 MB" download_ok 5000000 180
+    check_transfer "upload 2 MB" upload_ok 2000000 180
+    udp_capacity "HTTP/3, 1% loss"
+    set_path 60ms 5ms 50
+    check_transfer "download 2 MB with 5% loss" download_ok 2000000 180
+    set_path 60ms 5ms 5
+    set_rate 4mbit
+    check_transfer "download 3 MB at 4 Mbit/s" download_ok 3000000 90
+    tunnel_curl --max-time 60 -o /dev/null "http://$TARGET:8080/data/6000000" &
+    BG_PID=$!
+    sleep 1
+    rtt=$(tunnel_rtt)
+    wait $BG_PID 2>/dev/null
+    check "ping stays usable during a download at 4 Mbit/s (${rtt:-?} ms)" test -n "$rtt" -a "${rtt:-9999}" -lt 1500
+    set_rate off
+    check_not "no reconnect so far" wait_log "$WORK/client-slow.log" "tunnel up" 1 2
+
+    echo "== a 20-second outage (QUIC keeps the connection)"
+    outage_on
+    check_not "no traffic during the outage" seen_as $SERVER 3
+    sleep 15
+    outage_off
+    check "traffic resumes after the outage" seen_as_within $SERVER 40
+    check_not "without reconnecting" wait_log "$WORK/client-slow.log" "tunnel up" 1 2
+
+    echo "== a 70-second outage (longer than the idle timeouts)"
+    outage_on
+    sleep 70
+    outage_off
+    check "the client reconnects" wait_log "$WORK/client-slow.log" "tunnel up" 90 2
+    check "and traffic flows again" seen_as_within $SERVER 30
+    check "the server ended the dead session" grep -q '"session ended"' "$WORK/server.log"
+    stop_client
+
+    echo "== the slow, lossy path over HTTP/2"
+    set_path 60ms 5ms 10
+    start_client "$WORK/client-h2.toml" "$WORK/client-h2-slow.log"
+    check "tunnel up over HTTP/2 through the slow path" wait_log "$WORK/client-h2-slow.log" 'tunnel up.*HTTP/2' 40
+    check_transfer "download 5 MB" download_ok 5000000 180
+    check_transfer "upload 2 MB" upload_ok 2000000 180
+    udp_capacity "HTTP/2, 1% loss"
+    outage_on
+    sleep 20
+    outage_off
+    check "traffic resumes after a 20-second outage" seen_as_within $SERVER 60
+    if wait_log "$WORK/client-h2-slow.log" "tunnel up" 1 2; then echo "        (the client reconnected)"; else echo "        (the TCP connection survived)"; fi
+    stop_client
+    in_ns $NS_I ip rule del priority 100 iif dly0 lookup main
+    in_ns $NS_I ip rule del priority 101 from $CLIENT to $SERVER lookup 100
+    in_ns $NS_I ip rule del priority 101 from $SERVER to $CLIENT lookup 100
+    kill "$NETSIM_PID" 2>/dev/null
+    wait "$NETSIM_PID" 2>/dev/null
+else
+    skip "the poor-network checks need Go to build tests/netsim"
+fi
+
+echo "== a path with MTU 1300 (as on some mobile networks)"
+# Both sides pad QUIC Initial packets to about 1400 bytes (the RFC 9484 §7.1
+# technique that guarantees 1280-byte IPv6 packets fit), so HTTP/3 cannot
+# cross a narrower path and the client falls back to TCP.
+in_ns $NS_I ip link set i-srv mtu 1300
+in_ns $NS_S ip link set s-wan mtu 1300
+start_client "$WORK/client.toml" "$WORK/client-mtu.log"
+check "the tunnel comes up" wait_log "$WORK/client-mtu.log" "tunnel up" 40
+echo "        ($(grep -o 'tunnel up.*' "$WORK/client-mtu.log" | head -1))"
+check "ping with 1300-byte payload through the tunnel" in_ns $NS_C ping -c2 -s1300 -W3 $TARGET
+check_transfer "download 20 MB across the narrow path" download_ok 20000000 120
+check_transfer "upload 10 MB" upload_ok 10000000 120
+stop_client
+in_ns $NS_I ip link set i-srv mtu 1500
+in_ns $NS_S ip link set s-wan mtu 1500
+
 echo "== client shutdown cleans up"
 check_not "tunnel interface removed" in_ns $NS_C ip link show masque0
 check_not "policy routing rules removed" bash -c "ip netns exec $NS_C ip rule | grep -q 51889"
@@ -695,11 +919,11 @@ check "UDP ASSOCIATE to an address" bash -c \
     "ip netns exec $NS_C python3 $WORK/socks_udp.py 127.0.0.1 1080 $TARGET 7 hello-udp | grep -qx hello-udp"
 check "UDP ASSOCIATE to a name" bash -c \
     "ip netns exec $NS_C python3 $WORK/socks_udp.py 127.0.0.1 1080 target.test 7 by-name | grep -qx by-name"
-stats=$(SOCKS_TIMEOUT=60 socks_curl -o /dev/null -w '%{size_download} %{time_total} %{speed_download}' \
-    "http://$TARGET:8080/bytes/100000000")
+stats=$(SOCKS_TIMEOUT=60 socks_curl -o "$WORK/dl.bin" -w '%{size_download} %{time_total} %{speed_download}' \
+    "http://$TARGET:8080/data/100000000")
 code=$?
-if [ $code = 0 ]; then
-    ok "download through the proxy: $(python3 -c "print(round(${stats##* } * 8 / 1e6))") Mbit/s"
+if [ $code = 0 ] && [ "$(sha256sum "$WORK/dl.bin" | cut -d' ' -f1)" = "$(expected_sum 100000000)" ]; then
+    ok "download 100 MB through the proxy, checksummed: $(python3 -c "print(round(${stats##* } * 8 / 1e6))") Mbit/s"
 else
     bad "download through the proxy (curl exit $code; bytes, seconds, bytes/s: $stats)"
 fi
@@ -761,9 +985,9 @@ in_ns $NS_C ip route add $TARGET/32 via 203.0.113.1 dev c-wan
 check "a main-table upstream route cannot leak gateway DNS" dns_says 192.168.77.1 source.test A "answers=1 $SERVER"
 in_ns $NS_C ip route del $TARGET/32 via 203.0.113.1 dev c-wan
 check "the gateway machine itself also uses the VPN" seen_as $SERVER
-if stats=$(LAN_TIMEOUT=60 lan_curl -o /dev/null -w '%{size_download} %{speed_download}' "http://$TARGET:8080/bytes/100000000") &&
-    [ "${stats%% *}" = 100000000 ]; then
-    ok "LAN device download through the gateway: $(python3 -c "print(round(${stats##* } * 8 / 1e6))") Mbit/s"
+if stats=$(LAN_TIMEOUT=60 lan_curl -o "$WORK/dl.bin" -w '%{size_download} %{speed_download}' "http://$TARGET:8080/data/100000000") &&
+    [ "$(sha256sum "$WORK/dl.bin" | cut -d' ' -f1)" = "$(expected_sum 100000000)" ]; then
+    ok "LAN device download 100 MB through the gateway, checksummed: $(python3 -c "print(round(${stats##* } * 8 / 1e6))") Mbit/s"
 else
     bad "LAN device download through the gateway ($stats)"
 fi

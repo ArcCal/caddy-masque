@@ -23,6 +23,18 @@ import (
 // Packets queued per session toward its client before new ones are dropped.
 const queueLen = 1024
 
+// A packet that waited longer than this in the queue is dropped instead of
+// sent: when the path is the bottleneck, the queue stays short and the
+// connections inside the tunnel slow down (as on a link with a sane buffer)
+// instead of seeing seconds of delay.
+const maxQueueDelay = 200 * time.Millisecond
+
+// queued is a packet toward the client, with the time it was queued.
+type queued struct {
+	pkt []byte
+	at  time.Time
+}
+
 // A user who reconnects within this time gets the previous addresses back
 // if they are still free, so connections through the tunnel survive a brief
 // outage; longer gaps get fresh addresses (RFC 9484 §11).
@@ -135,7 +147,7 @@ type recentLease struct {
 type sessionHandle struct {
 	id       uint64
 	user     auth.User
-	toClient chan []byte
+	toClient chan queued
 	revoked  chan struct{}
 	why      string // set before revoked closes
 	// Signalled when the allowed destinations change.
@@ -249,7 +261,7 @@ func (c *core) readNetwork() {
 		pkt := make([]byte, 1+h.TotalLen) // context ID 0, then the packet
 		copy(pkt[1:], buf[:h.TotalLen])
 		select {
-		case s.toClient <- pkt:
+		case s.toClient <- queued{pkt: pkt, at: time.Now()}:
 		default: // queue full: dropped, as a network would
 		}
 	}
@@ -435,7 +447,7 @@ func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease 
 		}
 		c.log.Debug("cleared connection tracking for reused addresses", zap.Any("addresses", used), zap.Int("deleted", n))
 	}
-	h := &sessionHandle{id: c.nextID.Add(1), user: user, toClient: make(chan []byte, queueLen), revoked: make(chan struct{}),
+	h := &sessionHandle{id: c.nextID.Add(1), user: user, toClient: make(chan queued, queueLen), revoked: make(chan struct{}),
 		rescope: make(chan struct{}, 1)}
 	c.sessMu.Lock()
 	if !c.auth.IsCurrent(user) {

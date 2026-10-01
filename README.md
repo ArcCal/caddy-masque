@@ -140,10 +140,25 @@ sudo tests/e2e-netns.sh             # 端到端测试：网络命名空间里跑
 端到端测试需要 masque-vpn 的客户端（默认找 `../masque-vpn/target/debug/masque-client`，
 或用 `CLIENT_BIN=` 指定），覆盖：三种传输方式、UDP 被封时回退到 TCP、限定范围的请求
 （含服务器解析域名）、证书和用户的重载、服务器崩溃和重启、客户端互访、SOCKS 模式、
-局域网网关模式、地址复用时清理连接跟踪等。
+局域网网关模式、地址复用时清理连接跟踪、带校验的大文件传输（HTTP/3 下载 300 MB、上传 100 MB，
+HTTP/2 和 HTTP/1.1 各 100 MB / 50 MB）、差网络（见下）、MTU 1300 的窄路径等。
 
-另有和 [connect-ip-go](https://github.com/quic-go/connect-ip-go)（quic-go 团队的 CONNECT-IP 实现）的互通测试：
-它作为客户端，用自己的代码解析服务端发的所有 capsule，并按分配的地址和路由检查收到的每个包。
+### 差网络下的表现
+
+内核没有 netem 时，测试用 `tests/netsim` 在路由器里造一条慢链路（TUN 设备上的用户态 netem：
+按包加延迟和抖动、随机丢包，保持包序），再用 tbf 限速：120 ms RTT、1% 和 5% 丢包、4 Mbit/s 带宽、
+20 秒和 70 秒断网。结果：
+
+- 隧道在这些条件下都能正常收发、校验通过；20 秒断网后 QUIC 连接自己恢复、不重连；
+  70 秒断网超过空闲超时，客户端自动重连，服务端清理掉死会话。
+- **随机丢包下 HTTP/3 隧道的吞吐量远低于 HTTP/2 隧道。** 120 ms RTT、1% 丢包时，HTTP/3 隧道下载 1.7 Mbit/s、
+  隧道内 UDP 约 7 Mbit/s；HTTP/2 隧道下载 13 Mbit/s、隧道内 UDP 约 19 Mbit/s。对照实验（同一条链路，不经过隧道）：
+  Linux TCP 约 70 Mbit/s，quic-go 的流和 datagram 都只有 2 Mbit/s 左右；无丢包时两者都是几百 Mbit/s。
+  这是 quic-go 拥塞控制对随机丢包的反应方式决定的，不是本模块能改的；Rust 服务端（quinn）类似。
+  **在丢包明显的网络上，客户端配置 `transport = "h2"` 会快得多。**
+- 带宽受限时，服务端队列里等待超过 200 ms 的包会被丢掉，不会积压出几秒的延迟。
+- 路径 MTU 只有 1300 时，HTTP/3 建不起来（两端都把 QUIC Initial 包填充到约 1400 字节，
+  这是 RFC 9484 §7.1 保证 IPv6 1280 字节包能通过的办法），客户端回退到 HTTP/2，大文件传输正常。
 
 GitHub Actions 对每次推送到 main 和每个 PR 跑单元测试；仓库设置了 `MASQUE_VPN_TOKEN`（能读 masque-vpn 的令牌）时也跑端到端测试。
 
