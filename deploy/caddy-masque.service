@@ -1,0 +1,30 @@
+[Unit]
+Description=Caddy with the MASQUE CONNECT-IP VPN
+Documentation=https://github.com/ArcCal/caddy-masque
+After=network-online.target
+Wants=network-online.target
+# Keep retrying, for example while the network is still coming up at boot.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+# Runs as root: the masque app creates the TUN device, sets sysctls and
+# installs nftables rules.
+ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
+# Applies a changed Caddyfile (users, blocked destinations, sites) without
+# dropping tunnels; --force also re-reads certificate files that changed.
+ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+# Caddy's certificates and state in /var/lib/caddy, its autosaved
+# configuration in /var/lib/caddy-config.
+Environment=XDG_DATA_HOME=/var/lib XDG_CONFIG_HOME=/var/lib/caddy-config
+TimeoutStopSec=10s
+LimitNOFILE=1048576
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

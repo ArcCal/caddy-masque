@@ -1,0 +1,23 @@
+# Caddy with the MASQUE CONNECT-IP VPN. Caddy gets and renews the
+# certificate for the site by itself (TCP 80 and 443 must be reachable).
+# After changes: systemctl reload caddy-masque (tunnels stay up).
+{
+	masque {
+		# The server's own tunnel address; the rest of the prefix is the
+		# client address pool.
+		ipv4 10.89.0.1/24
+		# IPv6 in the tunnel, when this server has IPv6 Internet access:
+		# ipv6 fd89:6d61:7371::1/64
+
+		# One line per device, from: caddy masque-passwd --name NAME
+		user macbook $argon2id$v=19$m=19456,t=2,p=1$...$...
+	}
+}
+
+vpn.example.com {
+	# CONNECT-IP requests with valid credentials become tunnels; every
+	# other request, and every probe, gets the website below.
+	masque
+	root * /var/www/site
+	file_server
+}

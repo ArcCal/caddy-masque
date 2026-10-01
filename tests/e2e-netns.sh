@@ -31,7 +31,6 @@ TARGET=192.0.2.80 TARGET6=2001:db8:80::80
 SERVER=198.51.100.2 SERVER6=2001:db8:5::2
 CLIENT=203.0.113.2 CLIENT6=2001:db8:c::2
 PASS=0 FAIL=0 SKIP=0
-TABLE=51889
 SERVER_PID="" CLIENT_PID=""
 HAVE_V6=0
 [ -d /proc/sys/net/ipv6 ] && HAVE_V6=1
@@ -333,6 +332,7 @@ start_server() { # waits for the next "masque ready"
     SERVER_PID=$!
     wait_log "$WORK/server.log" '"masque ready"' 15 "$want"
 }
+# shellcheck disable=SC2120 # called with --force through check
 reload_server() { # extra arguments go to caddy reload
     in_ns $NS_S "${CADDY_ENV[@]}" "$CADDY" reload --config "$WORK/Caddyfile" --adapter caddyfile "$@" >>"$WORK/reload.log" 2>&1
 }
