@@ -214,6 +214,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		log.Debug("could not start the tunnel", zap.Error(err))
 		return nil
 	}
+	c.running.Add(1)
+	defer c.running.Add(-1)
 	s := &session{core: c, lease: l, scope: sc, tun: tun, log: log, icmp: ip.NewRateLimit()}
 	log.Info("session started", zap.Any("addresses", l.addrs))
 	// The request's context ends with the stream; a hijacked HTTP/1.1
@@ -335,7 +337,11 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 		reader: newCapsuleReader(body),
 		w:      w,
 		flush:  rc.Flush,
-		closer: func() { body.Close() },
+		closer: func() {
+			// Unblocks a write waiting for flow control.
+			_ = rc.SetWriteDeadline(time.Now())
+			_ = body.Close()
+		},
 	}, nil
 }
 

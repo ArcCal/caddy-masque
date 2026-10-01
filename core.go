@@ -45,6 +45,18 @@ type device interface {
 	Close() error
 }
 
+// The host network, replaced in tests.
+var (
+	openDevice = func(cfg hostnet.Config) (device, error) {
+		n, err := hostnet.Open(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return n, nil
+	}
+	forgetConntrack = hostnet.Forget
+)
+
 // core is the state shared by every configuration Caddy loads: the TUN
 // device, the address pool and the sessions. It lives in a usage pool, so a
 // config reload keeps the tunnel and its sessions.
@@ -65,6 +77,8 @@ type core struct {
 	pool     *pool.Pool
 	recent   map[string]recentLease // by user name, under poolMu
 	nextID   atomic.Uint64
+	// Session handlers that have not returned.
+	running atomic.Int64
 	// Deletes connection tracking entries (replaced in tests).
 	forget func([]netip.Prefix) (int, error)
 
@@ -110,7 +124,7 @@ func newCore(cfg tunnelConfig, log *zap.Logger) (*core, error) {
 		sessions: map[netip.Addr]*sessionHandle{},
 		pool:     pool.New(cfg.ipv4, cfg.ipv6),
 		recent:   map[string]recentLease{},
-		forget:   hostnet.Forget,
+		forget:   forgetConntrack,
 		done:     make(chan struct{}),
 	}
 	if cfg.ipv6.IsValid() {
@@ -127,7 +141,7 @@ func newCore(cfg tunnelConfig, log *zap.Logger) (*core, error) {
 
 // start opens the host network and starts reading from it.
 func (c *core) start() error {
-	n, err := hostnet.Open(hostnet.Config{Interface: c.cfg.iface, IPv4: c.cfg.ipv4, IPv6: c.cfg.ipv6, MTU: c.cfg.mtu,
+	n, err := openDevice(hostnet.Config{Interface: c.cfg.iface, IPv4: c.cfg.ipv4, IPv6: c.cfg.ipv6, MTU: c.cfg.mtu,
 		Manage: c.cfg.manage, Log: func(s string) { c.log.Info(s) }})
 	if err != nil {
 		return err

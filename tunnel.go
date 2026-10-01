@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -34,7 +35,9 @@ type tunnel interface {
 	// (HTTP/3 only).
 	receiveDatagram(ctx context.Context) ([]byte, error)
 	hasQUICDatagrams() bool
-	// abort resets the stream after a protocol error.
+	// abort resets the stream after a protocol error, close ends it. Both
+	// unblock reads and writes in progress, and may be called while they
+	// run.
 	abort()
 	close()
 }
@@ -149,6 +152,11 @@ func (t *h3Tunnel) abort() {
 
 func (t *h3Tunnel) close() {
 	t.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
+	// A write blocked on flow control gives up; then the stream is finished
+	// (Close must not run concurrently with Write).
+	_ = t.str.SetWriteDeadline(time.Now())
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	_ = t.str.Close()
 }
 
