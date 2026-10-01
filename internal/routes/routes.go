@@ -176,6 +176,9 @@ func (s Set) Families(v4, v6 bool) Set {
 	return s
 }
 
+// Equal reports whether both sets hold the same addresses.
+func (s Set) Equal(o Set) bool { return slices.Equal(s.v4, o.v4) && slices.Equal(s.v6, o.v6) }
+
 func (s Set) HasIPv4() bool { return len(s.v4) > 0 }
 func (s Set) HasIPv6() bool { return len(s.v6) > 0 }
 func (s Set) IsEmpty() bool { return !s.HasIPv4() && !s.HasIPv6() }

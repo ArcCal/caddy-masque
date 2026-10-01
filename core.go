@@ -37,13 +37,21 @@ type tunnelConfig struct {
 	manage bool
 }
 
+// device is the host's side of the tunnel: the TUN device (replaced in
+// tests).
+type device interface {
+	Read([]byte) (int, error)
+	Write([]byte) (int, error)
+	Close() error
+}
+
 // core is the state shared by every configuration Caddy loads: the TUN
 // device, the address pool and the sessions. It lives in a usage pool, so a
 // config reload keeps the tunnel and its sessions.
 type core struct {
 	cfg  tunnelConfig
 	log  *zap.Logger
-	net  *hostnet.Network
+	net  device
 	auth *auth.Authenticator
 	// Destinations any client may reach; scoped requests narrow it.
 	allowed atomic.Pointer[routes.Set]
@@ -81,7 +89,9 @@ type sessionHandle struct {
 	toClient chan []byte
 	revoked  chan struct{}
 	why      string // set before revoked closes
-	once     sync.Once
+	// Signalled when the allowed destinations change.
+	rescope chan struct{}
+	once    sync.Once
 }
 
 func (h *sessionHandle) revoke(why string) {
@@ -122,7 +132,6 @@ func (c *core) start() error {
 	if err != nil {
 		return err
 	}
-	c.net = n
 	// An earlier run's NAT state outlives it; its replies must not reach
 	// whoever gets those addresses now.
 	prefixes := []netip.Prefix{c.cfg.ipv4.Masked()}
@@ -137,8 +146,14 @@ func (c *core) start() error {
 	if deleted > 0 {
 		c.log.Info("deleted connection tracking entries of the tunnel addresses (left by an earlier run)", zap.Int("count", deleted))
 	}
-	go c.readNetwork()
+	c.attach(n)
 	return nil
+}
+
+// attach starts handing packets from the device to the sessions.
+func (c *core) attach(d device) {
+	c.net = d
+	go c.readNetwork()
 }
 
 // Destruct implements caddy.Destructor: the last configuration using the
@@ -214,6 +229,23 @@ func (c *core) setUsers(users map[string]string) {
 			c.log.Info("ending session: user removed or password changed", zap.String("user", s.user.Name), zap.Stringer("address", addr))
 			delete(c.sessions, addr)
 			s.revoke("user removed or password changed")
+		}
+	}
+}
+
+// setAllowed installs the destinations clients may reach; running sessions
+// narrow them to their scope and advertise the new routes.
+func (c *core) setAllowed(allowed routes.Set) {
+	old := c.allowed.Swap(&allowed)
+	if old == nil || old.Equal(allowed) {
+		return
+	}
+	c.sessMu.RLock()
+	defer c.sessMu.RUnlock()
+	for _, s := range c.sessions {
+		select {
+		case s.rescope <- struct{}{}:
+		default: // already pending
 		}
 	}
 }
@@ -325,7 +357,8 @@ func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease 
 		}
 		c.log.Debug("cleared connection tracking for reused addresses", zap.Any("addresses", used), zap.Int("deleted", n))
 	}
-	h := &sessionHandle{id: c.nextID.Add(1), user: user, toClient: make(chan []byte, queueLen), revoked: make(chan struct{})}
+	h := &sessionHandle{id: c.nextID.Add(1), user: user, toClient: make(chan []byte, queueLen), revoked: make(chan struct{}),
+		rescope: make(chan struct{}, 1)}
 	c.sessMu.Lock()
 	if !c.auth.IsCurrent(user) {
 		c.sessMu.Unlock()

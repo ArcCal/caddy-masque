@@ -28,6 +28,7 @@ import (
 
 	"github.com/ArcCal/caddy-masque/internal/auth"
 	"github.com/ArcCal/caddy-masque/internal/routes"
+	"github.com/ArcCal/caddy-masque/internal/xconnect"
 )
 
 func init() {
@@ -98,6 +99,9 @@ func (a *App) Provision(ctx caddy.Context) error {
 	a.log = ctx.Logger()
 	if err := a.parse(); err != nil {
 		return err
+	}
+	if !xconnect.Enabled() {
+		a.log.Warn("GODEBUG turns extended CONNECT off: CONNECT-IP over HTTP/2 is refused; remove http2xconnect=0 from it")
 	}
 	if a.HTTP3 == nil || *a.HTTP3 {
 		httpAny, err := ctx.App("http")
@@ -188,10 +192,17 @@ func (a *App) parse() error {
 	// whatever the configuration says.
 	allowed.Remove(netip.MustParsePrefix("169.254.0.0/16"))
 	allowed.Remove(netip.MustParsePrefix("fe80::/10"))
-	if !a.AllowClientToClient {
-		allowed.Remove(a.cfg.ipv4.Masked())
-		if a.cfg.ipv6.IsValid() {
-			allowed.Remove(a.cfg.ipv6.Masked())
+	// The client pool: reachable only when clients may reach each other,
+	// whatever the blocked list says about the space it is in.
+	pools := []netip.Prefix{a.cfg.ipv4.Masked()}
+	if a.cfg.ipv6.IsValid() {
+		pools = append(pools, a.cfg.ipv6.Masked())
+	}
+	for _, p := range pools {
+		if a.AllowClientToClient {
+			allowed.Insert(p)
+		} else {
+			allowed.Remove(p)
 		}
 	}
 	allowed.Insert(netip.PrefixFrom(a.cfg.ipv4.Addr(), 32))
@@ -270,7 +281,7 @@ func (a *App) Start() error {
 	if err := a.core.startOnce(); err != nil {
 		return err
 	}
-	a.core.allowed.Store(&a.allowed)
+	a.core.setAllowed(a.allowed)
 	a.core.setUsers(a.users)
 	for _, h := range a.h3Addrs {
 		srv := a.httpApp.Servers[h.server]
@@ -354,6 +365,7 @@ func (a *App) serveHTTP3(network, hostport string, srv *caddyhttp.Server, tlsCfg
 				(*l.handler.Load()).ServeHTTP(w, r)
 			}),
 			TLSConfig:       http3.ConfigureTLSConfig(base),
+			MaxHeaderBytes:  srv.MaxHeaderBytes,
 			EnableDatagrams: true,
 			// Connections without requests or tunnels are closed, as web
 			// servers close idle keep-alive connections.
