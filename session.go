@@ -62,14 +62,14 @@ func (s scope) advertised() []proto.AddressRange {
 	out := s.routes.Routes(s.protocol)
 	if s.gateway6.IsValid() {
 		out = append(out, proto.AddressRange{Start: s.gateway6, End: s.gateway6, Protocol: ip.ProtoICMPv6})
-		slices.SortStableFunc(out, func(a, b proto.AddressRange) int {
+		// The gateway is outside the routes, so it overlaps none of them; with
+		// a scope of protocol 58 its range shares the protocol, and the
+		// address decides the order. netip orders IPv4 before IPv6.
+		slices.SortFunc(out, func(a, b proto.AddressRange) int {
 			if a.Start.Is4() != b.Start.Is4() {
-				if a.Start.Is4() {
-					return -1
-				}
-				return 1
+				return a.Start.Compare(b.Start)
 			}
-			return cmp.Compare(a.Protocol, b.Protocol)
+			return cmp.Or(cmp.Compare(a.Protocol, b.Protocol), a.Start.Compare(b.Start))
 		})
 	}
 	return out
@@ -382,8 +382,15 @@ func (s *session) narrow() *scope {
 }
 
 func (s *session) advertise() error {
-	sc := s.current.Load()
-	return s.tun.writeCapsule(proto.RouteAdvertisement(sc.advertised()))
+	routes := s.current.Load().advertised()
+	// The encoder panics on routes RFC 9484 §4.7.3 forbids, and this runs
+	// in a goroutine of its own, where a panic ends the whole process. A
+	// bug here ends this tunnel only.
+	if err := proto.ValidateRoutes(routes); err != nil {
+		s.log.Error("not sending invalid routes", zap.Error(err), zap.Any("routes", routes))
+		return errAbort{"internal error: invalid route advertisement"}
+	}
+	return s.tun.writeCapsule(proto.RouteAdvertisement(routes))
 }
 
 func (s *session) readCapsules() error {
