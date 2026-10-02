@@ -155,6 +155,74 @@ Forms the server cannot match unambiguously (two expressions next to each other,
 after `{?...}` that does not start with `&`) are an error when the configuration is loaded, rather than failing to match
 at request time.
 
+### Example: wildcard certificate through Cloudflare DNS, TLS 1.3 only, security headers
+
+A fuller Caddyfile for a domain whose DNS is at Cloudflare: one wildcard certificate covers the domain and all its
+subdomains, TLS is limited to version 1.3, and the website sends the usual security headers.
+
+```caddyfile
+{
+	# Let's Encrypt account email: expiry warnings and notices go here.
+	email admin@example.com
+
+	masque {
+		ipv4 10.89.0.1/24
+		# Only if the server has working IPv6; otherwise delete this line.
+		ipv6 fd89:6d61:7371::1/64
+		# One line per device; hashes from: caddy masque-passwd --name NAME
+		user macbook $argon2id$v=19$m=19456,t=2,p=1$...
+	}
+}
+
+example.com, *.example.com {
+	tls {
+		protocols tls1.3
+		curves x25519mlkem768 x25519
+		dns cloudflare {file./etc/caddy/cloudflare-token}
+	}
+
+	# VPN requests (CONNECT-IP with a valid user); everything else falls through to the site.
+	masque
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	root * /var/www/html
+	file_server
+}
+```
+
+- **Build with the DNS plugin.** `dns cloudflare` needs the [caddy-dns/cloudflare](https://github.com/caddy-dns/cloudflare)
+  plugin, which `./cmd/caddy` and the one-step install leave out:
+  `xcaddy build --with github.com/ArcCal/caddy-masque --with github.com/caddy-dns/cloudflare`, then install the result
+  as `/usr/local/bin/caddy`. Running `install-server.sh` again replaces it with a build without the plugin, and Caddy
+  then fails to load this Caddyfile.
+- **The API token** is a Cloudflare token with the "Edit zone DNS" permission for the domain. Put it alone in
+  `/etc/caddy/cloudflare-token` (`chmod 600`); `{file.PATH}` reads it when the configuration loads. Do not pass it in an
+  environment variable: the service starts Caddy with `--environ`, which writes the whole environment to the log.
+- **Cloudflare's proxy must be off** for the VPN host name (DNS only, the grey cloud): Cloudflare does not pass CONNECT-IP
+  or UDP 443 through. The DNS challenge needs neither port 80 nor 443 to be reachable.
+- **Site addresses**: the certificate and the routes cover `example.com` and every `*.example.com`. The host name in the
+  client's `uri_template` must be one of them (for example `vpn.example.com`); a request for any other name gets Caddy's
+  empty default response, which the client rejects.
+- **TLS**: QUIC and masque-vpn's client use TLS 1.3 only anyway. X25519MLKEM768 is the post-quantum key exchange recent
+  browsers use; X25519 stays for everything else, masque-vpn's client included. There is no `alpn` line: the HTTP/3
+  listener always offers `h3` whatever it says, but limiting TCP to `h2` would lock out clients that fall back to
+  HTTP/1.1 (`transport = "http/1.1"`).
+- **Headers**: `-Server` removes the `Server: Caddy` header, so the cover site gives less away. `X-XSS-Protection` is
+  left out because browsers no longer use it. `preload` in `Strict-Transport-Security` does nothing until the domain is
+  submitted to [hstspreload.org](https://hstspreload.org/); after that, every subdomain must serve HTTPS, which is hard to
+  undo. Tunnel responses go through the same `header` handler; masque-vpn's client accepts them.
+
+Tested with Caddy v2.11.6 built with this module and caddy-dns/cloudflare: `caddy validate` accepts the file, and with
+Caddy's internal CA in place of Cloudflare, the website sends the headers above, TLS 1.2 is refused, and masque-vpn's
+`masque-client` brings tunnels up over HTTP/3, HTTP/2 and HTTP/1.1.
+
 ## Managing users
 
 ```sh
