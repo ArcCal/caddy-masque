@@ -22,9 +22,16 @@ git clone https://github.com/ArcCal/caddy-masque && cd caddy-masque
 sudo bash deploy/install-server.sh vpn.example.com
 ```
 
-脚本会装 Go、编译、写好 `/etc/caddy/Caddyfile`（带一个伪装首页和一个随机密码的用户）、
+脚本会装 Go（当前这一版的最新补丁版本，带着标准库的安全修复）、编译、写好 `/etc/caddy/Caddyfile`（带一个伪装首页和一个随机密码的用户）、
 启动 `caddy-masque` 服务。最后打印客户端要填的域名、用户名、密码。
 云服务商的防火墙要放行 TCP 80、TCP 443、UDP 443。
+脚本还会检查 `/dev/net/tun` 是否存在（OpenVZ、LXC 类 VPS 要在服务商面板里开启 TUN/TAP），
+发现 ufw 在运行时放行端口并允许从 `masque0` 转发；Docker 把 FORWARD 默认策略设成 DROP 时给出警告和放行命令。
+
+服务以 root 运行（要写 `/proc/sys`），但 `deploy/caddy-masque.service` 把权限收到只剩
+CAP_NET_ADMIN、CAP_NET_BIND_SERVICE、CAP_DAC_READ_SEARCH，文件系统除 `/var/lib/caddy*` 和 `/var/log/caddy` 外只读，
+并限制了系统调用和地址族。站点要写其他目录（如自己的日志文件）时：`systemctl edit caddy-masque`，加
+`[Service]` 和 `ReadWritePaths=/那个目录`。
 
 已经装了 masque-vpn 的服务端？先 `systemctl disable --now masque-server`，它们都要用 443 端口。
 原来的用户可以照搬：`server.toml` 里每个 `[[user]]` 写成 Caddyfile 里的一行 `user 名字 哈希`。
@@ -71,8 +78,10 @@ vpn.example.com {
 | `user 名字 哈希` | 一个用户，哈希由 `caddy masque-passwd` 生成。每台设备一个 | — |
 | `interface 名字` | TUN 设备名 | `masque0` |
 | `mtu 字节` | 隧道 MTU（576–1500；开 IPv6 时至少 1280） | `1350` |
-| `block 前缀...` | 不许客户端访问的目的地址，可写多行。写了就替换默认列表；`block none` 表示不屏蔽 | 私有地址、本机、组播等（含云服务商内网和 169.254.169.254） |
+| `block 前缀...` | 不许客户端访问的目的地址，可写多行。写了就替换默认列表；`block none` 表示不屏蔽 | 私有地址、本机、组播、基准测试和过渡机制（NAT64、6to4、Teredo）地址等（含云服务商内网和 169.254.169.254） |
 | `allow_client_to_client` | 允许客户端之间互相访问 | 不允许 |
+| `allow_host_access` | 允许客户端访问服务器本机的服务（隧道地址和服务器的公网地址上监听的端口） | 只许 ping |
+| `max_sessions 数量` | 同一个用户同时最多几条隧道；`unlimited` 不限 | 8 |
 | `manage_network off` | 不改转发和 NAT（sysctl、nftables），自己管 | 自动管理 |
 | `http3 off` | 不接管 HTTP/3（见下文），VPN 只走 HTTP/2 和 HTTP/1.1 | 接管 |
 | `mtu_probe off` | 不做 IPv6 MTU 探测（见下文）。只在确知客户端都直连、中间没有 HTTP 代理时关 | 探测 |
@@ -84,6 +93,36 @@ ICMPv6 Echo 请求，确认隧道装得下 IPv6 的最小 MTU；10 秒内收不�
 HTTP/3 隧道会被拆掉**，这时放行 ICMPv6 Echo，或在确知没有中间代理时用 `mtu_probe off`。
 
 链路本地地址（169.254.0.0/16、fe80::/10）无论怎么配置都不转发（RFC 9484 §7.2）。
+
+### 保护服务器本机
+
+客户端发给服务器本机的包（目的是隧道地址 `ipv4` 或服务器的公网地址）不经过转发，
+不受 `block` 管。所以 nftables 规则里有一条 `input` 链：从隧道设备进来的包只放行 ICMP 和已建立连接的回包，
+其余丢弃。否则，监听在所有地址上的服务（SSH、数据库、管理界面……）对每个持有账号的客户端都是开放的，
+主机防火墙里只针对公网网卡的规则也管不到它们。确实要让客户端访问本机的某个服务时，写 `allow_host_access`
+（然后在主机防火墙里按 `masque0` 接口自己限制）。`manage_network off` 时不装规则，这件事要自己做。
+Caddy 的管理接口默认只听 `localhost:2019`，客户端够不着；不要把它改成监听所有地址。
+
+### 防暴力猜密码和占满地址池
+
+- 同一个客户端地址（IPv6 按 /64）一分钟内带错误凭据的请求超过 10 次，之后一分钟内它带凭据的请求不再校验，
+  直接当普通网页请求处理（和没带凭据的一样）。共用出口地址的用户在这一分钟里会互相影响。
+  自动生成的密码有 144 位，不可能被猜到；`masque-passwd --stdin` 自己定的密码至少 12 个字符，请用长而随机的。
+- 每个用户同时最多 `max_sessions` 条隧道（默认 8），超出的请求得到 429。否则一个账号就能占满整个地址池，
+  把其他用户挤掉。一台设备断线重连时，服务器还没发现旧连接已断，旧的也占一条，所以别设成 1。
+
+### 监控
+
+Caddy 的 `metrics` 指令和管理接口（`curl localhost:2019/metrics`）带有这些指标：
+`caddy_masque_sessions_active{user}`、`caddy_masque_sessions_started_total`、`caddy_masque_auth_failures_total`、
+`caddy_masque_auth_throttled_total`、`caddy_masque_packets_total{direction}`、`caddy_masque_bytes_total{direction}`、
+`caddy_masque_packets_dropped_total`。计数在重载配置时不清零。
+
+### 主机网络配置的自动修复
+
+服务每 30 秒检查一次转发和 NAT：主机防火墙重载（如 `nft flush ruleset`、firewalld 重载）删掉 nftables 表，
+或别的程序关掉了 `ip_forward` 时，服务把它们装回去并在日志里警告。服务正常退出时，把它改过的转发开关还原成原来的值
+（原来就是开着的则不动），删掉 nftables 表。
 
 ### 指令 `masque [路径模板]`
 
@@ -113,7 +152,8 @@ caddy masque-passwd --name iphone
 - 改了 `block`、`allow_client_to_client`：多出来的目的地址**立即**以新的路由通告发给在线会话；
   被收回的目的地址，相关隧道会被关闭（RFC 9484 要求隧道存续期间保持已分配的路由），
   客户端自动重连后拿到新的路由；
-- `interface`、`ipv4`、`ipv6`、`mtu`、`manage_network` 改了要重启：`systemctl restart caddy-masque`。
+- `max_sessions` 重载后对新建隧道立即生效；
+- `interface`、`ipv4`、`ipv6`、`mtu`、`manage_network`、`allow_host_access` 改了要重启：`systemctl restart caddy-masque`。
 
 证书用的是自己的文件（`tls 证书 私钥`）时，文件换了而 Caddyfile 没变，要 `caddy reload --force`
 才会重新读（服务文件里的 reload 已经带了 `--force`）。Caddy 自动申请的证书不用管。
@@ -182,7 +222,8 @@ HTTP/2 和 HTTP/1.1 各 100 MB / 50 MB）、差网络（见下）、MTU 1300 的
 - 路径 MTU 只有 1300 时，HTTP/3 建不起来（两端都把 QUIC Initial 包填充到约 1400 字节，
   这是 RFC 9484 §7.2 保证 IPv6 1280 字节包能通过的办法），客户端回退到 HTTP/2，大文件传输正常。
 
-GitHub Actions 对每次推送到 main 和每个 PR 跑单元测试；仓库设置了 `MASQUE_VPN_TOKEN`（能读 masque-vpn 的令牌）时也跑端到端测试。
+GitHub Actions 对每次推送到 main 和每个 PR 跑单元测试，另有 `govulncheck`（每周一次，也在每次推送和 PR 上跑）检查依赖和标准库的已知漏洞，
+Dependabot 每周发依赖和 Actions 的更新 PR，发布的压缩包带有 build provenance 证明（`gh attestation verify 文件 --repo ArcCal/caddy-masque`）；仓库设置了 `MASQUE_VPN_TOKEN`（能读 masque-vpn 的令牌）时也跑端到端测试。
 
 ## 许可证
 

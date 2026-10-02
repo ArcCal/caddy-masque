@@ -21,7 +21,10 @@ SRC=$(cd "$(dirname "$0")/.." && pwd)
 CONFIG=/etc/caddy/Caddyfile
 SITE=/var/www/site
 CREDENTIALS=/root/masque-credentials.txt
-GO_VERSION=$(sed -n 's/^go \([0-9.]*\)$/\1/p' "$SRC/go.mod")
+# The Go release line go.mod asks for; the newest patch release of it is
+# installed (it carries the standard library's security fixes).
+GO_MOD_VERSION=$(sed -n 's/^go \([0-9.]*\)$/\1/p' "$SRC/go.mod")
+GO_LINE=${GO_MOD_VERSION%.*}
 
 say() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 die() { printf '\n\033[1;31m错误：%s\033[0m\n' "$*" >&2; exit 1; }
@@ -34,6 +37,14 @@ case "$ID" in
     debian | ubuntu) ;;
     *) die "只支持 Debian 和 Ubuntu，这台是 $PRETTY_NAME" ;;
 esac
+
+say "检查系统"
+# The tunnel is a TUN device. Containers of the OpenVZ and LXC kind often lack
+# it until the hosting provider's panel turns it on.
+[ -c /dev/net/tun ] || modprobe tun 2>/dev/null || true
+[ -c /dev/net/tun ] || die "没有 /dev/net/tun（TUN 设备）。OpenVZ、LXC 这类 VPS 要先在服务商的面板里开启 TUN/TAP，然后重启"
+[ -d /proc/sys/net/ipv4 ] && [ -w /proc/sys/net/ipv4/ip_forward ] ||
+    die "不能修改 /proc/sys/net（这是受限的容器吗？）。隧道需要开启转发，必须在能改内核网络参数的系统里运行"
 
 say "安装系统软件"
 export DEBIAN_FRONTEND=noninteractive
@@ -51,9 +62,15 @@ if [ -n "$PUBLIC_IP" ] && [ "$RESOLVED" != "$PUBLIC_IP" ]; then
     die "$DOMAIN 解析到 $RESOLVED，不是本机的 $PUBLIC_IP。改好 A 记录后再运行（用了 Cloudflare 的话，代理状态要设成仅 DNS，灰色云朵）"
 fi
 
-say "安装 Go $GO_VERSION（已安装就跳过）"
+say "安装 Go $GO_LINE 的最新补丁版本（已安装就跳过）"
 export PATH=/usr/local/go/bin:$PATH
-if ! go version 2>/dev/null | grep -q "go$GO_VERSION"; then
+# The official release list: the newest stable release of the line, and the
+# SHA-256 of its archive.
+GO_RELEASES=$(curl -fsSL --max-time 60 'https://go.dev/dl/?mode=json&include=all') || die "取不到 Go 的官方发布列表"
+GO_VERSION=$(jq -r --arg l "go$GO_LINE." 'first(.[] | select(.stable and (.version | startswith($l))) | .version) // empty' <<<"$GO_RELEASES")
+[ -n "$GO_VERSION" ] || die "Go 的官方发布列表里没有 $GO_LINE 的正式版"
+GO_VERSION=${GO_VERSION#go}
+if ! go version 2>/dev/null | grep -q "go$GO_VERSION "; then
     case "$(uname -m)" in
         x86_64) GOARCH=amd64 ;;
         aarch64) GOARCH=arm64 ;;
@@ -63,10 +80,7 @@ if ! go version 2>/dev/null | grep -q "go$GO_VERSION"; then
     # A directory of our own: nobody else can put a file in its place.
     GO_TMP=$(mktemp -d)
     curl -fsSL "https://go.dev/dl/$GO_FILE" -o "$GO_TMP/$GO_FILE" || die "下载 Go 失败"
-    # The SHA-256 from the official release list.
-    GO_SHA256=$(curl -fsSL --max-time 60 'https://go.dev/dl/?mode=json&include=all' |
-        jq -r --arg f "$GO_FILE" 'first(.[].files[] | select(.filename == $f) | .sha256) // empty') ||
-        die "取不到 Go 的官方校验值"
+    GO_SHA256=$(jq -r --arg f "$GO_FILE" 'first(.[].files[] | select(.filename == $f) | .sha256) // empty' <<<"$GO_RELEASES")
     [ -n "$GO_SHA256" ] || die "Go 的官方发布列表里没有 $GO_FILE"
     echo "$GO_SHA256  $GO_TMP/$GO_FILE" | sha256sum -c --quiet - || die "Go 安装包的 SHA-256 不对，没有安装"
     rm -rf /usr/local/go
@@ -89,7 +103,14 @@ cleanup_swap() {
     rm -f "$SWAP"
     SWAP=""
 }
-trap cleanup_swap EXIT
+# The build goes to a directory of our own (mode 700): in a shared /tmp, another
+# user could replace the file between the build and its installation as root.
+BUILD_DIR=$(mktemp -d)
+cleanup() {
+    cleanup_swap
+    rm -rf "$BUILD_DIR"
+}
+trap cleanup EXIT
 mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 swap_kb=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
 if [ $((mem_kb + swap_kb)) -lt 2500000 ]; then
@@ -99,10 +120,9 @@ if [ $((mem_kb + swap_kb)) -lt 2500000 ]; then
     mkswap -q "$SWAP"
     swapon "$SWAP"
 fi
-(cd "$SRC" && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/caddy-masque.bin ./cmd/caddy)
+(cd "$SRC" && GOTOOLCHAIN=local CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$BUILD_DIR/caddy" ./cmd/caddy)
 cleanup_swap
-install -m 755 /tmp/caddy-masque.bin /usr/local/bin/caddy
-rm -f /tmp/caddy-masque.bin
+install -m 755 "$BUILD_DIR/caddy" /usr/local/bin/caddy
 caddy version
 
 say "端口"
@@ -190,6 +210,23 @@ fi
 caddy validate --config "$CONFIG" >/dev/null 2>&1 ||
     { caddy validate --config "$CONFIG" || true; die "$CONFIG 有错误，见上面的输出"; }
 
+say "防火墙"
+# A host firewall that drops forwarded packets makes the tunnel connect and
+# carry nothing; open it for the tunnel's interface (the name in the default
+# configuration).
+if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow 80/tcp >/dev/null
+    ufw allow 443/tcp >/dev/null
+    ufw allow 443/udp >/dev/null
+    ufw route allow in on masque0 >/dev/null
+    echo "ufw 正在运行：已放行 TCP 80、TCP 443、UDP 443，并允许从 masque0 转发"
+elif command -v iptables >/dev/null && iptables -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then
+    echo "警告：iptables 的 FORWARD 默认策略是 DROP（多半是 Docker 设的），隧道的流量会被丢掉。"
+    echo "      放行它：iptables -I DOCKER-USER -i masque0 -j ACCEPT（Docker 之外的写法：iptables -I FORWARD -i masque0 -j ACCEPT），并让这条规则开机生效"
+else
+    echo "没有发现会拦截转发的防火墙"
+fi
+
 say "启动服务"
 install -m 644 "$SRC/deploy/caddy-masque.service" /etc/systemd/system/caddy-masque.service
 systemctl daemon-reload
@@ -215,6 +252,13 @@ if [ -n "$ok" ]; then
 else
     echo "警告：本机访问 https://$DOMAIN/ 没有得到网页（多半是证书还没申请下来），看日志：journalctl -u caddy-masque -n 50 -o cat"
 fi
+# The service keeps the forwarding and NAT rules in place (and puts them back
+# if a firewall reload removes them); they must be there now.
+if nft list table inet caddy-masque >/dev/null 2>&1 && [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ]; then
+    echo "转发和 NAT 规则已就位"
+else
+    echo "警告：转发或 NAT 规则不在（nft list table inet caddy-masque），隧道不会通。看日志：journalctl -u caddy-masque -n 50 -o cat"
+fi
 ss -lunH 'sport = :443' | grep -q . && echo "UDP 443（HTTP/3）在监听"
 ss -ltnH 'sport = :443' | grep -q . && echo "TCP 443（HTTP/2、HTTP/1.1）在监听"
 
@@ -234,6 +278,7 @@ UDP 443 没开也能用，但只能走较慢的 TCP。
 常用命令：
   systemctl status caddy-masque              状态
   journalctl -u caddy-masque -f -o cat       实时日志
+  curl -s localhost:2019/metrics | grep caddy_masque   在线隧道、流量、认证失败（Prometheus 格式）
   caddy masque-passwd --name 新用户名        再建一个用户（每台设备一个），
                                              把输出的 user 行加进 $CONFIG，
                                              然后 systemctl reload caddy-masque
