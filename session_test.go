@@ -1148,6 +1148,68 @@ func TestScopedIPv6KeepsICMPv6ToTheGateway(t *testing.T) {
 	}
 }
 
+// The gateway's ICMPv6 route is ordered by address too: with a scope of
+// protocol 58 it shares the protocol with the scope's ranges, and a route
+// out of order is one the encoder refuses to send (a panic).
+func TestGatewayRouteIsOrderedByAddress(t *testing.T) {
+	e := newTestEnv(t, dualStack())
+	allowed := *e.core.allowed.Load()
+	gw := netip.MustParseAddr("fd89::1")
+	for _, targets := range [][]string{
+		{"2001:db8::/64"},                              // below the gateway
+		{"fec0::/64"},                                  // above it
+		{"2001:db8::/64", "fec0::/64"},                 // on both sides
+		{"192.0.2.0/24", "2001:db8::/64", "fec0::/64"}, // and IPv4 first
+	} {
+		var prefixes []netip.Prefix
+		for _, p := range targets {
+			prefixes = append(prefixes, netip.MustParsePrefix(p))
+		}
+		for _, protocol := range []uint8{0, ip.ProtoTCP, ip.ProtoICMPv6, 132} {
+			sc := newScope(allowed, prefixes, protocol)
+			sc.gateway6 = gw
+			adv := sc.advertised()
+			if err := proto.ValidateRoutes(adv); err != nil {
+				t.Errorf("%v, protocol %d: %v: %v", targets, protocol, err, adv)
+				continue
+			}
+			if !slices.Contains(adv, proto.AddressRange{Start: gw, End: gw, Protocol: ip.ProtoICMPv6}) {
+				t.Errorf("%v, protocol %d: no gateway route: %v", targets, protocol, adv)
+			}
+			if len(adv) != len(targets)+1 {
+				t.Errorf("%v, protocol %d: %d routes: %v", targets, protocol, len(adv), adv)
+			}
+			_ = proto.Append(nil, proto.RouteAdvertisement(adv))
+		}
+	}
+	// A session with such a scope opens: the advertisement goes out.
+	sc := newScope(allowed, []netip.Prefix{netip.MustParsePrefix("fec0::/64")}, ip.ProtoICMPv6)
+	r := e.startScoped(t, alice, true, sc)
+	if len(r.lease.addrs) != 1 || !r.lease.addrs[0].Is6() {
+		t.Fatalf("an IPv6 scope gets one IPv6 address: %v", r.lease.addrs)
+	}
+}
+
+// Routes that break RFC 9484 §4.7.3 are a bug, but one that ends only the
+// tunnel concerned: the encoder would panic, in a goroutine where that ends
+// the whole process.
+func TestInvalidRoutesEndOnlyTheirSession(t *testing.T) {
+	e := newTestEnv(t, dualStack())
+	r := e.start(t, alice, true)
+	// The gateway's ICMPv6 range inside a protocol-58 route: they overlap.
+	bad := newScope(*e.core.allowed.Load(), []netip.Prefix{netip.MustParsePrefix("fd89::/64")}, ip.ProtoICMPv6)
+	bad.gateway6 = netip.MustParseAddr("fd89::1")
+	if proto.ValidateRoutes(bad.advertised()) == nil {
+		t.Fatal("the test scope should give invalid routes")
+	}
+	r.s.current.Store(&bad)
+	var abort errAbort
+	if err := r.s.advertise(); !errors.As(err, &abort) {
+		t.Fatalf("advertise: %v, want the session aborted", err)
+	}
+	r.tun.quiet(t)
+}
+
 func TestConfigurationChangesAndRunningSessions(t *testing.T) {
 	e := newTestEnv(t, dualStack())
 	r := e.start(t, alice, true)
