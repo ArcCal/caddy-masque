@@ -570,6 +570,49 @@ func TestScopedProtocol(t *testing.T) {
 	}
 }
 
+// fragment6 is an IPv6 fragment: a Fragment header with the offset (in
+// 8-byte units), more flag, identification and next header, then data.
+func fragment6(src, dst string, id uint32, offset uint16, more bool, next byte, data []byte) []byte {
+	frag := make([]byte, 8)
+	frag[0] = next
+	v := offset << 3
+	if more {
+		v |= 1
+	}
+	binary.BigEndian.PutUint16(frag[2:], v)
+	binary.BigEndian.PutUint32(frag[4:], id)
+	return packet(src, dst, 44, append(frag, data...))
+}
+
+// With Destination Options after the Fragment header, a later fragment
+// names those, not the upper layer; a session scoped to a protocol takes
+// the first fragment's (RFC 9484 §4.8).
+func TestScopedProtocolIPv6Fragments(t *testing.T) {
+	const dst = "2001:db8::80"
+	first := func(src string, id uint32) []byte {
+		dstOpts := []byte{ip.ProtoTCP, 0, 1, 4, 0, 0, 0, 0}
+		return fragment6(src, dst, id, 0, true, 60, append(dstOpts, make([]byte, 24)...))
+	}
+	later := func(src string, id uint32) []byte { return fragment6(src, dst, id, 4, false, 60, make([]byte, 16)) }
+	for _, protocol := range []uint8{ip.ProtoTCP, ip.ProtoUDP} {
+		e := newTestEnv(t, dualStack())
+		sc := newScope(*e.core.allowed.Load(), []netip.Prefix{netip.MustParsePrefix("2001:db8::/64")}, protocol)
+		r := e.startScoped(t, alice, true, sc)
+		src := r.addr(true)
+		for _, pkt := range [][]byte{first(src, 7), later(src, 7)} {
+			r.tun.datagrams <- append([]byte{0}, pkt...)
+			if protocol == ip.ProtoTCP {
+				hostPacket(t, e.dev)
+			} else {
+				noHostPacket(t, e.dev)
+			}
+		}
+		// A later fragment without its first: the protocol is unknown.
+		r.tun.datagrams <- append([]byte{0}, later(src, 8)...)
+		noHostPacket(t, e.dev)
+	}
+}
+
 func TestNetworkPacketsReachTheirClient(t *testing.T) {
 	for _, quicDatagrams := range []bool{true, false} {
 		e := newTestEnv(t, dualStack())

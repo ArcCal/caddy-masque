@@ -39,6 +39,13 @@ type Header struct {
 	TotalLen int
 	// False for non-initial fragments.
 	FirstFragment bool
+	// An IPv6 packet with a Fragment header, and its identification.
+	Fragment   bool
+	FragmentID uint32
+	// A later IPv6 fragment whose upper-layer protocol is not in it: the
+	// Fragment header names another extension header, which only the first
+	// fragment carries. Protocol is that extension header's number.
+	ProtocolUnknown bool
 }
 
 // IsIPv4 reports the family.
@@ -93,6 +100,7 @@ func parseV6(p []byte) (Header, bool) {
 	next := p[6]
 	off := 40
 	first := true
+	fragment, fragID := false, uint32(0)
 	// Walk the extension headers to the upper layer. ESP encrypts the rest,
 	// so it counts as the upper layer.
 	for proto.IsIPv6ExtensionHeader(next) && next != protoESP {
@@ -111,6 +119,7 @@ func parseV6(p []byte) (Header, bool) {
 			if binary.BigEndian.Uint16(hdr[2:4])>>3 != 0 {
 				first = false
 			}
+			fragment, fragID = true, binary.BigEndian.Uint32(hdr[4:8])
 			off += 8
 		case protoAH:
 			off += (int(hdr[1]) + 2) * 4
@@ -129,12 +138,15 @@ func parseV6(p []byte) (Header, bool) {
 		payload = off
 	}
 	return Header{
-		Src:           netip.AddrFrom16([16]byte(p[8:24])),
-		Dst:           netip.AddrFrom16([16]byte(p[24:40])),
-		Protocol:      next,
-		PayloadOffset: payload,
-		TotalLen:      total,
-		FirstFragment: first,
+		Src:             netip.AddrFrom16([16]byte(p[8:24])),
+		Dst:             netip.AddrFrom16([16]byte(p[24:40])),
+		Protocol:        next,
+		PayloadOffset:   payload,
+		TotalLen:        total,
+		FirstFragment:   first,
+		Fragment:        fragment,
+		FragmentID:      fragID,
+		ProtocolUnknown: !first && proto.IsIPv6ExtensionHeader(next) && next != protoESP,
 	}, true
 }
 

@@ -119,7 +119,21 @@ func TestIPv6Fragments(t *testing.T) {
 	}
 	later := ext{44, []byte{0, 0, 0x05, 0x00, 0, 0, 0, 7}}
 	h, _ = Parse(ipv6Packet("2001:db8::1", "2001:db8::2", []ext{later}, 17, make([]byte, 16)))
-	if h.Protocol != 17 || h.FirstFragment || h.PayloadOffset != -1 {
+	if h.Protocol != 17 || h.FirstFragment || h.PayloadOffset != -1 || !h.Fragment || h.FragmentID != 7 || h.ProtocolUnknown {
+		t.Fatal(h)
+	}
+	// Destination Options after the Fragment header: only the first
+	// fragment shows the upper layer.
+	dstOpts := ext{60, []byte{0, 0, 1, 4, 0, 0, 0, 0}}
+	h, _ = Parse(ipv6Packet("2001:db8::1", "2001:db8::2", []ext{first, dstOpts}, 6, make([]byte, 20)))
+	if h.Protocol != 6 || !h.FirstFragment || !h.Fragment || h.ProtocolUnknown {
+		t.Fatal(h)
+	}
+	h, _ = Parse(ipv6Packet("2001:db8::1", "2001:db8::2", []ext{later}, 60, make([]byte, 16)))
+	if h.Protocol != 60 || h.FirstFragment || !h.ProtocolUnknown {
+		t.Fatal(h)
+	}
+	if h, _ := Parse(ipv6Packet("2001:db8::1", "2001:db8::2", nil, 6, make([]byte, 20))); h.Fragment {
 		t.Fatal(h)
 	}
 }
