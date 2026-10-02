@@ -18,6 +18,8 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/yosida95/uritemplate/v3"
+
+	"github.com/ArcCal/caddy-masque/internal/ip"
 )
 
 func (e *caddyEnv) dialConnectIPGo(t *testing.T, password, path string) (*connectip.Conn, *http.Response, error) {
@@ -37,6 +39,24 @@ func (e *caddyEnv) dialConnectIPGo(t *testing.T, password, path string) (*connec
 	}
 	req.Header().Set("Authorization", authorization(password))
 	return connectip.NewClientConn(cc).Dial(req)
+}
+
+// readPacket reads the next packet from connect-ip-go, answering the MTU
+// probe (RFC 9484 §7.2) as the client's IPv6 stack would.
+func readPacket(conn *connectip.Conn, buf []byte) (int, error) {
+	for {
+		n, err := conn.ReadPacket(buf)
+		if err != nil || n != ip.IPv6MinMTU {
+			return n, err
+		}
+		reply := ip.EchoReply(buf[:n])
+		if reply == nil {
+			return n, nil
+		}
+		if _, err := conn.WritePacket(reply); err != nil {
+			return 0, err
+		}
+	}
 }
 
 func TestInteropConnectIPGo(t *testing.T) {
@@ -113,7 +133,7 @@ func TestInteropConnectIPGo(t *testing.T) {
 		back := udp(c.remote, c.local, 1200)
 		e.dev.fromHost <- back
 		buf := make([]byte, 2000)
-		n, err := conn.ReadPacket(buf)
+		n, err := readPacket(conn, buf)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -128,7 +148,7 @@ func TestInteropConnectIPGo(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 2000)
-	n, err := conn.ReadPacket(buf)
+	n, err := readPacket(conn, buf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +193,7 @@ func TestInteropConnectIPGoScoped(t *testing.T) {
 	for _, back := range [][]byte{udp("192.0.2.9", v4, 10), echoRequest("192.0.2.9", v4)} {
 		e.dev.fromHost <- back
 		buf := make([]byte, 2000)
-		n, err := conn.ReadPacket(buf)
+		n, err := readPacket(conn, buf)
 		if err != nil || !slices.Equal(buf[:n], back) {
 			t.Errorf("received % x, %v", buf[:n], err)
 		}

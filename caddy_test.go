@@ -39,6 +39,7 @@ import (
 
 	"github.com/ArcCal/caddy-masque/internal/auth"
 	"github.com/ArcCal/caddy-masque/internal/hostnet"
+	"github.com/ArcCal/caddy-masque/internal/ip"
 	"github.com/ArcCal/caddy-masque/internal/proto"
 )
 
@@ -229,13 +230,15 @@ const anyTarget = "/.well-known/masque/ip/*/*/"
 
 // tunnelClient is the client's side of a CONNECT-IP stream.
 type tunnelClient struct {
-	status  int
-	header  http.Header
-	body    string // of a refusal
-	capsule func() (proto.Capsule, error)
-	send    func(pkt []byte) error // an IP packet, with context ID 0
-	recv    func() ([]byte, error) // an IP packet
-	close   func()
+	status int
+	header http.Header
+	body   string // of a refusal
+	// HTTP/3 refusals: the error code of the server's STOP_SENDING.
+	stopSending quic.StreamErrorCode
+	capsule     func() (proto.Capsule, error)
+	send        func(pkt []byte) error // an IP packet, with context ID 0
+	recv        func() ([]byte, error) // an IP packet
+	close       func()
 }
 
 func authorization(password string) string { return auth.BasicAuthorization("alice", password) }
@@ -277,20 +280,50 @@ func (e *caddyEnv) dialH3(t *testing.T, password, path string) *tunnelClient {
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Capsule-Protocol") == "" {
 		b, _ := io.ReadAll(resp.Body)
 		c.body = string(b)
+		// Write until the server's STOP_SENDING arrives.
+		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			var se *quic.StreamError
+			if _, err := str.Write([]byte{0}); errors.As(err, &se) {
+				c.stopSending = se.ErrorCode
+				break
+			}
+		}
 		c.close()
 		return c
 	}
 	reader := newCapsuleReader(str)
 	c.capsule = reader.next
 	c.send = func(pkt []byte) error { return str.SendDatagram(append([]byte{0}, pkt...)) }
-	c.recv = func() ([]byte, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		d, err := str.ReceiveDatagram(ctx)
-		if err != nil {
-			return nil, err
+	// Datagrams are read as they come, as a client's stack does: the MTU
+	// probe (RFC 9484 §7.2) is answered, the rest queued for recv.
+	packets := make(chan []byte, 1024)
+	go func() {
+		defer close(packets)
+		for {
+			d, err := str.ReceiveDatagram(context.Background())
+			if err != nil {
+				return
+			}
+			if reply := ip.EchoReply(d[1:]); reply != nil && len(d) == 1+ip.IPv6MinMTU {
+				_ = str.SendDatagram(append([]byte{0}, reply...))
+				continue
+			}
+			select {
+			case packets <- d[1:]:
+			default: // dropped, as by a full socket buffer
+			}
 		}
-		return d[1:], nil
+	}()
+	c.recv = func() ([]byte, error) {
+		select {
+		case p, ok := <-packets:
+			if !ok {
+				return nil, errors.New("the stream is closed")
+			}
+			return p, nil
+		case <-time.After(2 * time.Second):
+			return nil, errors.New("no packet")
+		}
 	}
 	return c
 }
@@ -486,18 +519,25 @@ func TestCaddyRefusalsLookLikeTheSite(t *testing.T) {
 			}
 		}
 		// Authenticated, but blocked or malformed: status codes for users.
+		// Only a malformed request is a stream error too: H3_MESSAGE_ERROR
+		// in HTTP/3 (RFC 9114 §4.1.2), else H3_NO_ERROR.
+		const noError, messageError = 0x100, h3MessageError
 		for _, c := range []struct {
 			path   string
 			status int
+			stop   quic.StreamErrorCode
 		}{
-			{"/.well-known/masque/ip/192.168.0.0%2F16/*/", http.StatusForbidden},
-			{"/.well-known/masque/ip/*/0/", http.StatusBadRequest},
-			{"/.well-known/masque/ip/not%20a%20name/*/", http.StatusBadRequest},
-			{"/.well-known/masque/ip/name.invalid/*/", http.StatusBadGateway},
+			{"/.well-known/masque/ip/192.168.0.0%2F16/*/", http.StatusForbidden, noError},
+			{"/.well-known/masque/ip/*/0/", http.StatusBadRequest, noError}, // refused by policy (RFC 9484 §4.8)
+			{"/.well-known/masque/ip/not%20a%20name/*/", http.StatusBadRequest, messageError},
+			{"/.well-known/masque/ip/name.invalid/*/", http.StatusBadGateway, noError},
 		} {
 			got := tr.dial(e, t, testPassword, c.path)
 			if got.status != c.status {
 				t.Errorf("%s %s: %d, want %d", tr.name, c.path, got.status, c.status)
+			}
+			if tr.name == "HTTP/3" && got.stopSending != c.stop {
+				t.Errorf("HTTP/3 %s: STOP_SENDING %#x, want %#x", c.path, got.stopSending, c.stop)
 			}
 			if c.status == http.StatusBadGateway && !strings.Contains(got.header.Get("Proxy-Status"), "error=dns_") {
 				t.Errorf("%s: Proxy-Status %q", tr.name, got.header.Get("Proxy-Status"))
@@ -510,6 +550,51 @@ func TestCaddyRefusalsLookLikeTheSite(t *testing.T) {
 // authenticated request malformed (RFC 9484 §4.1), in the path as in the
 // query. (A path that is not percent-encoding at all, such as %ZZ, the HTTP
 // servers refuse before any handler.)
+// IP proxying runs over TLS or QUIC only (RFC 9484 §4): a CONNECT-IP
+// request with valid credentials over plain HTTP/1.1 or HTTP/2 gets the
+// site.
+func TestCaddyRefusesTunnelsWithoutTLS(t *testing.T) {
+	e := newCaddyEnv(t)
+	e.server = map[string]any{"tls_connection_policies": nil, "protocols": []string{"h1", "h2c"}}
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := e.dialTCP(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: vpn.test:%d\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\n"+
+		"Capsule-Protocol: ?1\r\nAuthorization: %s\r\n\r\n", anyTarget, e.port, authorization(testPassword))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "cover page" {
+		t.Errorf("HTTP/1.1 without TLS: %d %q", resp.StatusCode, body)
+	}
+
+	// HTTP/2 over cleartext TCP (h2c, prior knowledge).
+	tr := &http2.Transport{AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+			return e.dialTCP(ctx, nil)
+		}}
+	defer tr.CloseIdleConnections()
+	req, _ := http.NewRequest(http.MethodConnect, fmt.Sprintf("http://vpn.test:%d%s", e.port, anyTarget), http.NoBody)
+	req.Header = http.Header{":protocol": {"connect-ip"}, "Capsule-Protocol": {"?1"}, "Authorization": {authorization(testPassword)}}
+	resp, err = tr.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK || string(body) != "cover page" {
+		t.Errorf("h2c: HTTP/%d %d %q", resp.ProtoMajor, resp.StatusCode, body)
+	}
+	waitNoSessions(t)
+}
+
 func TestCaddyBadlyEncodedVariablesAreMalformed(t *testing.T) {
 	e := newCaddyEnv(t)
 	if err := e.load(masqueConfig("alice")); err != nil {
@@ -519,8 +604,12 @@ func TestCaddyBadlyEncodedVariablesAreMalformed(t *testing.T) {
 		t.Helper()
 		for _, tr := range transports {
 			for _, path := range paths {
-				if got := tr.dial(e, t, testPassword, path); got.status != http.StatusBadRequest {
+				got := tr.dial(e, t, testPassword, path)
+				if got.status != http.StatusBadRequest {
 					t.Errorf("%s %s: %d, want 400", tr.name, path, got.status)
+				}
+				if tr.name == "HTTP/3" && got.stopSending != h3MessageError {
+					t.Errorf("HTTP/3 %s: STOP_SENDING %#x, want H3_MESSAGE_ERROR", path, got.stopSending)
 				}
 				// Without the password, the site as for any other request.
 				if got := tr.dial(e, t, "wrong password!!", path); got.status != http.StatusOK || got.body != "cover page" {
@@ -1083,5 +1172,32 @@ func TestCaddyMalformedHTTP1Requests(t *testing.T) {
 	got := send(fmt.Sprintf("POST %s HTTP/1.1\r\nHost: vpn.test\r\nUpgrade: connect-ip\r\nContent-Length: 0\r\n\r\n", anyTarget))
 	if got != "200 cover page" {
 		t.Errorf("anonymous: %q", got)
+	}
+}
+
+// mtu_probe off reaches the running core, and a reload without it turns
+// the probe back on.
+func TestCaddyMTUProbeSetting(t *testing.T) {
+	e := newCaddyEnv(t)
+	probeOff := func() (off bool) {
+		cores.Range(func(_ any, v any) bool {
+			off = v.(*core).noMTUProbe.Load()
+			return true
+		})
+		return off
+	}
+	cfg := masqueConfig("alice")
+	cfg["mtu_probe"] = false
+	if err := e.load(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !probeOff() {
+		t.Error("mtu_probe false: the probe is on")
+	}
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	if probeOff() {
+		t.Error("by default: the probe is off")
 	}
 }

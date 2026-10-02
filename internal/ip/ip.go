@@ -39,6 +39,13 @@ type Header struct {
 	TotalLen int
 	// False for non-initial fragments.
 	FirstFragment bool
+	// An IPv6 packet with a Fragment header, and its identification.
+	Fragment   bool
+	FragmentID uint32
+	// A later IPv6 fragment whose upper-layer protocol is not in it: the
+	// Fragment header names another extension header, which only the first
+	// fragment carries. Protocol is that extension header's number.
+	ProtocolUnknown bool
 }
 
 // IsIPv4 reports the family.
@@ -93,6 +100,7 @@ func parseV6(p []byte) (Header, bool) {
 	next := p[6]
 	off := 40
 	first := true
+	fragment, fragID := false, uint32(0)
 	// Walk the extension headers to the upper layer. ESP encrypts the rest,
 	// so it counts as the upper layer.
 	for proto.IsIPv6ExtensionHeader(next) && next != protoESP {
@@ -111,6 +119,7 @@ func parseV6(p []byte) (Header, bool) {
 			if binary.BigEndian.Uint16(hdr[2:4])>>3 != 0 {
 				first = false
 			}
+			fragment, fragID = true, binary.BigEndian.Uint32(hdr[4:8])
 			off += 8
 		case protoAH:
 			off += (int(hdr[1]) + 2) * 4
@@ -129,12 +138,15 @@ func parseV6(p []byte) (Header, bool) {
 		payload = off
 	}
 	return Header{
-		Src:           netip.AddrFrom16([16]byte(p[8:24])),
-		Dst:           netip.AddrFrom16([16]byte(p[24:40])),
-		Protocol:      next,
-		PayloadOffset: payload,
-		TotalLen:      total,
-		FirstFragment: first,
+		Src:             netip.AddrFrom16([16]byte(p[8:24])),
+		Dst:             netip.AddrFrom16([16]byte(p[24:40])),
+		Protocol:        next,
+		PayloadOffset:   payload,
+		TotalLen:        total,
+		FirstFragment:   first,
+		Fragment:        fragment,
+		FragmentID:      fragID,
+		ProtocolUnknown: !first && proto.IsIPv6ExtensionHeader(next) && next != protoESP,
 	}, true
 }
 
@@ -323,6 +335,57 @@ func icmpv6Error(original []byte, h Header, from netip.Addr, typ, code byte, res
 	out = append(out, quoted...)
 	binary.BigEndian.PutUint16(out[42:44], Checksum(pseudoHeader(from, h.Src, icmpLen, ProtoICMPv6), out[40:]))
 	return out
+}
+
+// ICMPv6 Echo Request and Echo Reply types (RFC 4443 §4).
+const (
+	EchoRequestV6 = 128
+	EchoReplyV6   = 129
+)
+
+// EchoV6 is an ICMPv6 Echo message (RFC 4443 §4) from src to dst with the
+// identifier, sequence number and n bytes of data.
+func EchoV6(typ byte, src, dst netip.Addr, id, seq uint16, n int) []byte {
+	icmpLen := 8 + n
+	out := make([]byte, 40+icmpLen)
+	out[0] = 0x60
+	binary.BigEndian.PutUint16(out[4:6], uint16(icmpLen))
+	out[6], out[7] = ProtoICMPv6, 64
+	copy(out[8:24], src.AsSlice())
+	copy(out[24:40], dst.AsSlice())
+	out[40] = typ
+	binary.BigEndian.PutUint16(out[44:46], id)
+	binary.BigEndian.PutUint16(out[46:48], seq)
+	binary.BigEndian.PutUint16(out[42:44], Checksum(pseudoHeader(src, dst, icmpLen, ProtoICMPv6), out[40:]))
+	return out
+}
+
+// Echo returns the type and identifier of an ICMPv6 Echo message, p
+// parsed as h.
+func Echo(p []byte, h Header) (typ byte, id uint16, ok bool) {
+	if h.IsIPv4() || h.Protocol != ProtoICMPv6 || h.PayloadOffset < 0 || h.PayloadOffset+8 > h.TotalLen {
+		return 0, 0, false
+	}
+	icmp := p[h.PayloadOffset:]
+	if icmp[0] != EchoRequestV6 && icmp[0] != EchoReplyV6 || icmp[1] != 0 {
+		return 0, 0, false
+	}
+	return icmp[0], binary.BigEndian.Uint16(icmp[4:6]), true
+}
+
+// EchoReply answers an ICMPv6 Echo Request as an IPv6 node does (RFC 4443
+// §4.2), or returns nil.
+func EchoReply(request []byte) []byte {
+	h, ok := Parse(request)
+	if typ, _, ok2 := Echo(request, h); !ok || !ok2 || typ != EchoRequestV6 {
+		return nil
+	}
+	icmp := request[h.PayloadOffset:h.TotalLen]
+	reply := EchoV6(EchoReplyV6, h.Dst, h.Src, binary.BigEndian.Uint16(icmp[4:6]), binary.BigEndian.Uint16(icmp[6:8]), len(icmp)-8)
+	copy(reply[48:], icmp[8:])
+	binary.BigEndian.PutUint16(reply[42:44], 0)
+	binary.BigEndian.PutUint16(reply[42:44], Checksum(pseudoHeader(h.Dst, h.Src, len(icmp), ProtoICMPv6), reply[40:]))
+	return reply
 }
 
 // pseudoHeader is the IPv6 pseudo-header for upper-layer checksums (RFC

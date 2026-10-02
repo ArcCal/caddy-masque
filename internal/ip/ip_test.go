@@ -119,7 +119,21 @@ func TestIPv6Fragments(t *testing.T) {
 	}
 	later := ext{44, []byte{0, 0, 0x05, 0x00, 0, 0, 0, 7}}
 	h, _ = Parse(ipv6Packet("2001:db8::1", "2001:db8::2", []ext{later}, 17, make([]byte, 16)))
-	if h.Protocol != 17 || h.FirstFragment || h.PayloadOffset != -1 {
+	if h.Protocol != 17 || h.FirstFragment || h.PayloadOffset != -1 || !h.Fragment || h.FragmentID != 7 || h.ProtocolUnknown {
+		t.Fatal(h)
+	}
+	// Destination Options after the Fragment header: only the first
+	// fragment shows the upper layer.
+	dstOpts := ext{60, []byte{0, 0, 1, 4, 0, 0, 0, 0}}
+	h, _ = Parse(ipv6Packet("2001:db8::1", "2001:db8::2", []ext{first, dstOpts}, 6, make([]byte, 20)))
+	if h.Protocol != 6 || !h.FirstFragment || !h.Fragment || h.ProtocolUnknown {
+		t.Fatal(h)
+	}
+	h, _ = Parse(ipv6Packet("2001:db8::1", "2001:db8::2", []ext{later}, 60, make([]byte, 16)))
+	if h.Protocol != 60 || h.FirstFragment || !h.ProtocolUnknown {
+		t.Fatal(h)
+	}
+	if h, _ := Parse(ipv6Packet("2001:db8::1", "2001:db8::2", nil, 6, make([]byte, 20))); h.Fragment {
 		t.Fatal(h)
 	}
 }
@@ -202,5 +216,32 @@ func TestNoErrorsAboutErrorsOrMulticast(t *testing.T) {
 	bcast := ipv4Packet([4]byte{10, 89, 0, 2}, [4]byte{255, 255, 255, 255}, 17, make([]byte, 8))
 	if PacketTooBig(bcast, gw4, 1300) != nil {
 		t.Error("broadcast")
+	}
+}
+
+func TestICMPv6Echo(t *testing.T) {
+	src, dst := addr("fd89::1"), addr("fd89::2")
+	req := EchoV6(EchoRequestV6, src, dst, 0x1234, 7, IPv6MinMTU-48)
+	h, ok := Parse(req)
+	if !ok || len(req) != IPv6MinMTU || h.Src != src || h.Dst != dst || h.Protocol != ProtoICMPv6 {
+		t.Fatalf("request: %+v, %d bytes", h, len(req))
+	}
+	valid := func(p []byte, h Header) bool {
+		return Checksum(pseudoHeader(h.Src, h.Dst, h.TotalLen-40, ProtoICMPv6), p[40:h.TotalLen]) == 0
+	}
+	if typ, id, ok := Echo(req, h); !ok || typ != EchoRequestV6 || id != 0x1234 || !valid(req, h) {
+		t.Errorf("request: %d %#x %v", typ, id, ok)
+	}
+	req[100] = 0xab // data is echoed back
+	binary.BigEndian.PutUint16(req[42:44], 0)
+	binary.BigEndian.PutUint16(req[42:44], Checksum(pseudoHeader(src, dst, len(req)-40, ProtoICMPv6), req[40:]))
+	reply := EchoReply(req)
+	rh, ok := Parse(reply)
+	if typ, id, ok2 := Echo(reply, rh); !ok || !ok2 || typ != EchoReplyV6 || id != 0x1234 || rh.Src != dst || rh.Dst != src ||
+		reply[47] != 7 || reply[100] != 0xab || !valid(reply, rh) {
+		t.Errorf("reply: %+v % x", rh, reply[40:48])
+	}
+	if EchoReply(reply) != nil {
+		t.Error("a reply was answered")
 	}
 }

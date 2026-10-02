@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -59,12 +60,14 @@ type fakeTunnel struct {
 	datagrams chan []byte // QUIC datagrams from the client
 	quic      bool
 	// The largest datagram payload the QUIC path takes (0: any).
-	maxDatagram int
-	out         chan any // capsules and datagrams (sentDatagram) to the client
-	aborted     atomic.Bool
-	closed      atomic.Bool
-	done        chan struct{} // closed by abort and close
-	doneOnce    sync.Once
+	maxDatagram atomic.Int64
+	// The client's IPv6 stack answers the MTU probe unless this is set.
+	ignoreProbes atomic.Bool
+	out          chan any // capsules and datagrams (sentDatagram) to the client
+	aborted      atomic.Bool
+	closed       atomic.Bool
+	done         chan struct{} // closed by abort and close
+	doneOnce     sync.Once
 	// Writes fail from this one on (1: the first; 0: none).
 	failFrom int
 	writes   atomic.Int32
@@ -126,8 +129,19 @@ func (t *fakeTunnel) sendDatagram(p []byte) error {
 	if !t.quic {
 		return t.writeCapsule(proto.Datagram(p))
 	}
-	if t.maxDatagram > 0 && len(p) > t.maxDatagram {
-		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: int64(t.maxDatagram)}
+	if max := t.maxDatagram.Load(); max > 0 && int64(len(p)) > max {
+		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: max}
+	}
+	// The MTU probe, a 1280-byte ICMPv6 echo request, is answered as the
+	// client's IPv6 stack would.
+	if len(p) == 1+ip.IPv6MinMTU && !t.ignoreProbes.Load() {
+		if reply := ip.EchoReply(p[1:]); reply != nil {
+			select {
+			case t.datagrams <- append([]byte{0}, reply...):
+			default: // lost
+			}
+			return nil
+		}
 	}
 	t.out <- sentDatagram(slices.Clone(p))
 	return nil
@@ -321,12 +335,18 @@ func (e *testEnv) start(tb testing.TB, user auth.User, quicDatagrams bool) *runn
 
 func (e *testEnv) startScoped(tb testing.TB, user auth.User, quicDatagrams bool, sc scope) *running {
 	tb.Helper()
+	return e.startOn(tb, user, newFakeTunnel(quicDatagrams), sc)
+}
+
+// startOn runs a session on a tunnel set up beforehand.
+func (e *testEnv) startOn(tb testing.TB, user auth.User, tun *fakeTunnel, sc scope) *running {
+	tb.Helper()
 	l := e.core.acquire(context.Background(), user, sc.routes.HasIPv4(), sc.routes.HasIPv6())
 	if l == nil {
 		tb.Fatal("no lease")
 	}
-	r := &running{tun: newFakeTunnel(quicDatagrams), lease: l, ended: make(chan string, 1)}
-	r.s = &session{core: e.core, lease: l, scope: sc, tun: r.tun, log: zaptest.NewLogger(tb), icmp: ip.NewRateLimit()}
+	r := &running{tun: tun, lease: l, ended: make(chan string, 1)}
+	r.s = newSession(e.core, l, sc, r.tun, zaptest.NewLogger(tb))
 	go func() {
 		why := r.s.run(context.Background())
 		l.release()
@@ -373,7 +393,7 @@ func TestSessionOpensWithAddressesAndRoutes(t *testing.T) {
 	e := newTestEnv(t, dualStack())
 	l := e.core.acquire(context.Background(), alice, true, true)
 	tun := newFakeTunnel(true)
-	s := &session{core: e.core, lease: l, scope: newScope(*e.core.allowed.Load(), anyDestination, 0), tun: tun, log: zaptest.NewLogger(t), icmp: ip.NewRateLimit()}
+	s := newSession(e.core, l, newScope(*e.core.allowed.Load(), anyDestination, 0), tun, zaptest.NewLogger(t))
 	done := make(chan string)
 	go func() { done <- s.run(context.Background()) }()
 
@@ -550,6 +570,49 @@ func TestScopedProtocol(t *testing.T) {
 	}
 }
 
+// fragment6 is an IPv6 fragment: a Fragment header with the offset (in
+// 8-byte units), more flag, identification and next header, then data.
+func fragment6(src, dst string, id uint32, offset uint16, more bool, next byte, data []byte) []byte {
+	frag := make([]byte, 8)
+	frag[0] = next
+	v := offset << 3
+	if more {
+		v |= 1
+	}
+	binary.BigEndian.PutUint16(frag[2:], v)
+	binary.BigEndian.PutUint32(frag[4:], id)
+	return packet(src, dst, 44, append(frag, data...))
+}
+
+// With Destination Options after the Fragment header, a later fragment
+// names those, not the upper layer; a session scoped to a protocol takes
+// the first fragment's (RFC 9484 §4.8).
+func TestScopedProtocolIPv6Fragments(t *testing.T) {
+	const dst = "2001:db8::80"
+	first := func(src string, id uint32) []byte {
+		dstOpts := []byte{ip.ProtoTCP, 0, 1, 4, 0, 0, 0, 0}
+		return fragment6(src, dst, id, 0, true, 60, append(dstOpts, make([]byte, 24)...))
+	}
+	later := func(src string, id uint32) []byte { return fragment6(src, dst, id, 4, false, 60, make([]byte, 16)) }
+	for _, protocol := range []uint8{ip.ProtoTCP, ip.ProtoUDP} {
+		e := newTestEnv(t, dualStack())
+		sc := newScope(*e.core.allowed.Load(), []netip.Prefix{netip.MustParsePrefix("2001:db8::/64")}, protocol)
+		r := e.startScoped(t, alice, true, sc)
+		src := r.addr(true)
+		for _, pkt := range [][]byte{first(src, 7), later(src, 7)} {
+			r.tun.datagrams <- append([]byte{0}, pkt...)
+			if protocol == ip.ProtoTCP {
+				hostPacket(t, e.dev)
+			} else {
+				noHostPacket(t, e.dev)
+			}
+		}
+		// A later fragment without its first: the protocol is unknown.
+		r.tun.datagrams <- append([]byte{0}, later(src, 8)...)
+		noHostPacket(t, e.dev)
+	}
+}
+
 func TestNetworkPacketsReachTheirClient(t *testing.T) {
 	for _, quicDatagrams := range []bool{true, false} {
 		e := newTestEnv(t, dualStack())
@@ -654,8 +717,7 @@ func (e *testEnv) runSession(tb testing.TB, tun *fakeTunnel) <-chan string {
 	if l == nil {
 		tb.Fatal("no lease")
 	}
-	s := &session{core: e.core, lease: l, scope: newScope(*e.core.allowed.Load(), anyDestination, 0), tun: tun,
-		log: zaptest.NewLogger(tb), icmp: ip.NewRateLimit()}
+	s := newSession(e.core, l, newScope(*e.core.allowed.Load(), anyDestination, 0), tun, zaptest.NewLogger(tb))
 	ended := make(chan string, 1)
 	go func() {
 		why := s.run(context.Background())
@@ -741,7 +803,7 @@ func TestBlockedWritesDoNotKeepRemovedUsers(t *testing.T) {
 func TestTooLargeForTheQUICPath(t *testing.T) {
 	e := newTestEnv(t, &App{IPv4: "10.89.0.1/24"})
 	r := e.start(t, alice, true)
-	r.tun.maxDatagram = 1001
+	r.tun.maxDatagram.Store(1001)
 
 	// With DF: dropped, and the sender learns the MTU (RFC 1191).
 	pkt := udp("1.1.1.1", r.addr(false), 1200)
@@ -780,21 +842,104 @@ func TestTooLargeForTheQUICPath(t *testing.T) {
 	r.tun.nextPacket(t)
 }
 
+// A tunnel with IPv6 whose QUIC datagrams turn out unable to carry
+// 1280-byte packets is aborted (RFC 9484 §7.2), whichever packet showed it:
+// an IPv6 one, or an IPv4 one too large for the path.
 func TestIPv6NeedsRoomFor1280BytePackets(t *testing.T) {
+	for _, v6 := range []bool{true, false} {
+		e := newTestEnv(t, dualStack())
+		r := e.start(t, alice, true)
+		r.tun.maxDatagram.Store(1280) // one byte short: the context ID
+		src := map[bool]string{true: "2606:4700::1111", false: "1.1.1.1"}[v6]
+		e.dev.fromHost <- udp(src, r.addr(v6), 1280)
+		r.waitEnd(t)
+		if !r.tun.aborted.Load() {
+			t.Errorf("IPv6 %v: the stream was not aborted", v6)
+		}
+	}
+}
+
+// shortProbe makes the MTU probe quick for a test.
+func shortProbe(t *testing.T) {
+	interval, timeout := probeInterval, probeTimeout
+	probeInterval, probeTimeout = 50*time.Millisecond, 300*time.Millisecond
+	t.Cleanup(func() { probeInterval, probeTimeout = interval, timeout })
+}
+
+// A tunnel with IPv6 over QUIC datagrams is probed with 1280-byte ICMPv6
+// echo requests from the gateway (RFC 9484 §7.2); the reply ends the probe
+// and goes no further.
+func TestMTUProbe(t *testing.T) {
+	shortProbe(t)
 	e := newTestEnv(t, dualStack())
-	r := e.start(t, alice, true)
-	r.tun.maxDatagram = 1280 // one byte short: the context ID
-	e.dev.fromHost <- udp("2606:4700::1111", r.addr(true), 1280-48)
-	r.waitEnd(t)
-	if !r.tun.aborted.Load() {
-		t.Error("the stream was not aborted (RFC 9484 §7.1)")
+	tun := newFakeTunnel(true)
+	tun.ignoreProbes.Store(true)
+	r := e.startOn(t, alice, tun, newScope(*e.core.allowed.Load(), anyDestination, 0))
+	probe := r.tun.nextPacket(t)
+	h, ok := ip.Parse(probe)
+	typ, id, isEcho := ip.Echo(probe, h)
+	if !ok || !isEcho || typ != ip.EchoRequestV6 || id != r.s.probeID || len(probe) != ip.IPv6MinMTU ||
+		h.Src.String() != "fd89::1" || h.Dst.String() != r.addr(true) {
+		t.Fatalf("probe: %+v, %d bytes, echo %v type %d id %#x", h, len(probe), isEcho, typ, id)
+	}
+	r.tun.datagrams <- append([]byte{0}, ip.EchoReply(probe)...)
+	noHostPacket(t, e.dev)
+	// Answered: the tunnel stays past the probe's timeout, and nothing but
+	// probes sent before the reply arrived went to the client.
+	time.Sleep(probeTimeout)
+	select {
+	case why := <-r.ended:
+		r.ended <- why
+		t.Fatalf("ended: %s", why)
+	default:
+	}
+	for len(r.tun.out) > 0 {
+		if v, ok := (<-r.tun.out).(sentDatagram); !ok || len(v) != 1+ip.IPv6MinMTU {
+			t.Fatalf("unexpected %T sent", v)
+		}
+	}
+}
+
+// Without a reply, the tunnel is torn down.
+func TestMTUProbeWithoutReply(t *testing.T) {
+	shortProbe(t)
+	e := newTestEnv(t, dualStack())
+	tun := newFakeTunnel(true)
+	tun.ignoreProbes.Store(true)
+	r := e.startOn(t, alice, tun, newScope(*e.core.allowed.Load(), anyDestination, 0))
+	why := r.waitEnd(t)
+	if !strings.Contains(why, "ICMPv6 echo") || !r.tun.aborted.Load() {
+		t.Errorf("ended: %s (aborted %v)", why, r.tun.aborted.Load())
+	}
+}
+
+// No probe where the tunnel cannot lack room for 1280-byte IPv6 packets
+// (IPv4 only, or datagrams in capsules on the stream), nor when the
+// configuration turns it off.
+func TestNoMTUProbe(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		app  *App
+		quic bool
+		off  bool
+	}{
+		{"IPv4 only", &App{IPv4: "10.89.0.1/24"}, true, false},
+		{"capsules", dualStack(), false, false},
+		{"mtu_probe off", dualStack(), true, true},
+	} {
+		e := newTestEnv(t, c.app)
+		e.core.noMTUProbe.Store(c.off)
+		tun := newFakeTunnel(c.quic)
+		tun.ignoreProbes.Store(true)
+		r := e.startOn(t, alice, tun, newScope(*e.core.allowed.Load(), anyDestination, 0))
+		r.tun.quiet(t)
 	}
 }
 
 func TestIPv6PacketTooBig(t *testing.T) {
 	e := newTestEnv(t, dualStack())
 	r := e.start(t, alice, true)
-	r.tun.maxDatagram = 1301
+	r.tun.maxDatagram.Store(1301)
 	e.dev.fromHost <- udp("2606:4700::1111", r.addr(true), 1400)
 	ptb := hostPacket(t, e.dev)
 	h, _ := ip.Parse(ptb)

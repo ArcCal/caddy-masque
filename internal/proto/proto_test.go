@@ -387,15 +387,70 @@ func TestMatch(t *testing.T) {
 	}
 }
 
+// Every template the proxy accepts matches the requests a client makes by
+// expanding it (RFC 6570), and gives back exactly the variables.
 func TestExpandThenMatch(t *testing.T) {
-	for _, s := range []string{defaultTemplate, "https://p.example/ip{?target,ipproto}", "https://p.example/ip?t={target}&i={ipproto}"} {
-		x := tpl(t, s)
-		for _, c := range [][2]string{{"*", "*"}, {"2001:db8::/32", "58"}, {"vpn.example.net", "6"}} {
+	for _, s := range []string{
+		"/.well-known/masque/ip/{target}/{ipproto}/",
+		"/ip{?target,ipproto}",
+		"/ip{?target}{&ipproto}",
+		"/ip?t={target}&i={ipproto}",
+		"/ip?t={target}.suffix&i={ipproto}",
+		"/ip?fixed=%41{&target,ipproto}",
+		"/ip?scope={target,ipproto}",
+		"/ip?v=1&scope=x{target,ipproto}y&z",
+		"/ip/{target}?p={ipproto}",
+		"/ip/{target}.x/{ipproto}/?v=1",
+		"/x%2dy/{target},{ipproto}",
+	} {
+		x, err := ParsePathTemplate(s)
+		if err != nil {
+			t.Errorf("%s: %v", s, err)
+			continue
+		}
+		for _, c := range [][2]string{{"*", "*"}, {"2001:db8::/32", "58"}, {"vpn.example.net", "6"}, {"192.0.2.0/24", "17"}} {
 			path := x.Expand(map[string]string{"target": c[0], "ipproto": c[1]})
 			m, ok := x.Match(path)
-			if !ok || m["target"] != c[0] || m["ipproto"] != c[1] {
-				t.Errorf("%s %s: %v", s, path, m)
+			if !ok || len(m) != 2 || m["target"] != c[0] || m["ipproto"] != c[1] {
+				t.Errorf("%s %s: %v %v", s, path, m, ok)
 			}
+		}
+	}
+	// Literals compare after percent-encoding normalization (RFC 3986
+	// §6.2.2): %41 is A.
+	x, _ := ParsePathTemplate("/ip?fixed=%41{&target,ipproto}")
+	for _, path := range []string{"/ip?fixed=A&target=*&ipproto=*", "/ip?ipproto=*&fixed=%41&target=*"} {
+		if m, ok := x.Match(path); !ok || len(m) != 2 {
+			t.Errorf("%s: %v %v", path, m, ok)
+		}
+	}
+	for _, path := range []string{"/ip?fixed=B&target=*&ipproto=*", "/ip?target=*&ipproto=*"} {
+		if m, ok := x.Match(path); ok {
+			t.Errorf("%s matched: %v", path, m)
+		}
+	}
+	// A literal suffix of the value is not part of the variable.
+	x, _ = ParsePathTemplate("/ip?t={target}.suffix&i={ipproto}")
+	if m, ok := x.Match("/ip?t=192.0.2.1&i=17"); ok {
+		t.Errorf("without the suffix: %v", m)
+	}
+}
+
+// A template the proxy could not match requests against unambiguously is
+// refused when it is configured, not left to fail every request.
+func TestTemplatesThatCannotBeMatched(t *testing.T) {
+	for _, s := range []string{
+		"/ip/{target}{ipproto}",
+		"/ip?t={target}{ipproto}",
+		"/ip?{target}=1&i={ipproto}",
+		"/ip?a{target}&i={ipproto}",
+		"/ip{?target}x{&ipproto}",
+		"/ip{?target}{ipproto}",
+		"/ip?a=1{?target,ipproto}",
+		"/ip{?target}{?ipproto}",
+	} {
+		if _, err := ParsePathTemplate(s); err == nil {
+			t.Errorf("%s accepted", s)
 		}
 	}
 }
