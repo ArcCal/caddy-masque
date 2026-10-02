@@ -85,19 +85,7 @@ func (e errAbort) Error() string { return "aborted: " + e.why }
 func (s *session) run(ctx context.Context) string {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	// Tell the client its addresses and where it may send (§4.7).
-	assigned := proto.AddressAssign{}
-	for _, a := range s.lease.addrs {
-		assigned = append(assigned, proto.AssignedAddress{Prefix: proto.Host(a)})
-	}
-	if err := s.tun.writeCapsule(assigned); err != nil {
-		return err.Error()
-	}
-	s.current.Store(s.narrow())
-	if err := s.advertise(); err != nil {
-		return err.Error()
-	}
-	ended := make(chan error, 3)
+	ended := make(chan error, 4)
 	var wg sync.WaitGroup
 	spawn := func(f func() error) {
 		wg.Add(1)
@@ -106,15 +94,26 @@ func (s *session) run(ctx context.Context) string {
 			ended <- f()
 		}()
 	}
-	spawn(s.readCapsules)
-	if s.tun.hasQUICDatagrams() {
-		spawn(func() error { return s.readDatagrams(ctx) })
-	}
-	spawn(func() error { return s.sendToClientLoop(ctx) })
+	// The capsules the session sends of its own accord have a goroutine
+	// of their own: a client that stops reading blocks writes to the
+	// stream, and this loop must still see the session end.
+	s.current.Store(s.narrow())
+	opened := make(chan struct{})
+	readvertise := make(chan struct{}, 1)
+	spawn(func() error { return s.announce(ctx, opened, readvertise) })
+	opening := (<-chan struct{})(opened)
 	var err error
 	for err == nil {
 		select {
 		case err = <-ended:
+		case <-opening:
+			// The client has its addresses and routes: the tunnel opens.
+			opening = nil
+			spawn(s.readCapsules)
+			if s.tun.hasQUICDatagrams() {
+				spawn(func() error { return s.readDatagrams(ctx) })
+			}
+			spawn(func() error { return s.sendToClientLoop(ctx) })
 		case <-s.lease.handle.revoked:
 			err = errors.New(s.lease.handle.why)
 		case <-ctx.Done():
@@ -130,7 +129,10 @@ func (s *session) run(ctx context.Context) string {
 			case next.routes.Equal(cur.routes):
 			case cur.routes.Union(next.routes).Equal(next.routes):
 				s.current.Store(next)
-				err = s.advertise()
+				select {
+				case readvertise <- struct{}{}:
+				default: // already pending; it sends the latest routes
+				}
 				s.log.Info("more routes with the new configuration", zap.Int("routes", len(next.routes.Routes(next.protocol))))
 			default:
 				err = errors.New("the new configuration withdraws routes of the tunnel")
@@ -160,6 +162,32 @@ func (s *session) run(ctx context.Context) string {
 		return "client closed the tunnel"
 	}
 	return err.Error()
+}
+
+// announce tells the client its addresses and where it may send (§4.7),
+// closes opened, and advertises the routes again when asked to.
+func (s *session) announce(ctx context.Context, opened chan<- struct{}, readvertise <-chan struct{}) error {
+	assigned := proto.AddressAssign{}
+	for _, a := range s.lease.addrs {
+		assigned = append(assigned, proto.AssignedAddress{Prefix: proto.Host(a)})
+	}
+	if err := s.tun.writeCapsule(assigned); err != nil {
+		return err
+	}
+	if err := s.advertise(); err != nil {
+		return err
+	}
+	close(opened)
+	for {
+		select {
+		case <-readvertise:
+			if err := s.advertise(); err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // narrow is the session's scope within what the server allows now, for the

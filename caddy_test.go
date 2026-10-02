@@ -696,6 +696,36 @@ func TestCaddyHandlerNeedsTheApp(t *testing.T) {
 // A client that stops reading fills the stream's flow control window, and
 // the session's writes block. Removing the user must still end the session
 // and let the handler return.
+// blockWriter sends packets to a client that does not read until the
+// session's queue toward it stays full: its writer is blocked. QUIC
+// datagrams are not flow controlled, so HTTP/3 does not get there.
+func blockWriter(t *testing.T, e *caddyEnv, v4 netip.Addr) bool {
+	t.Helper()
+	var queue chan queued
+	cores.Range(func(_ any, v any) bool {
+		c := v.(*core)
+		c.sessMu.RLock()
+		if h := c.sessions[v4]; h != nil {
+			queue = h.toClient
+		}
+		c.sessMu.RUnlock()
+		return true
+	})
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		for range 200 {
+			e.dev.fromHost <- udp("1.1.1.1", v4.String(), 1200)
+		}
+		// Full, and not drained for a while.
+		if len(queue) == cap(queue) {
+			time.Sleep(300 * time.Millisecond)
+			if len(queue) == cap(queue) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func TestCaddyEndsBlockedTunnels(t *testing.T) {
 	e := newCaddyEnv(t)
 	if err := e.load(masqueConfig("alice")); err != nil {
@@ -704,34 +734,48 @@ func TestCaddyEndsBlockedTunnels(t *testing.T) {
 	for _, tr := range transports {
 		c := tr.dial(e, t, testPassword, anyTarget)
 		v4, _ := opening(t, c)
-		// Until the session's queue toward the client stays full: its
-		// writer is blocked. QUIC datagrams are not flow controlled, so
-		// HTTP/3 does not get there.
-		var queue chan queued
-		cores.Range(func(_ any, v any) bool {
-			c := v.(*core)
-			c.sessMu.RLock()
-			if h := c.sessions[v4]; h != nil {
-				queue = h.toClient
-			}
-			c.sessMu.RUnlock()
-			return true
-		})
-		blocked := false
-		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline) && !blocked; {
-			for range 200 {
-				e.dev.fromHost <- udp("1.1.1.1", v4.String(), 1200)
-			}
-			// Full, and not drained for a while.
-			if len(queue) == cap(queue) {
-				time.Sleep(300 * time.Millisecond)
-				blocked = len(queue) == cap(queue)
-			}
-		}
-		if tr.name != "HTTP/3" && !blocked {
+		if !blockWriter(t, e, v4) && tr.name != "HTTP/3" {
 			t.Fatalf("%s: the writer never blocked", tr.name)
 		}
 		if err := e.load(masqueConfig("bob")); err != nil {
+			t.Fatal(err)
+		}
+		waitNoSessions(t)
+		c.close()
+		if err := e.load(masqueConfig("alice")); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A new route advertisement to a client that stopped reading blocks too;
+// removing the user still ends the tunnel.
+func TestCaddyEndsTunnelsBlockedOnNewRoutes(t *testing.T) {
+	e := newCaddyEnv(t)
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	withMoreRoutes := func(users ...string) map[string]any {
+		cfg := masqueConfig(users...)
+		cfg["blocked_destinations"] = []string{}
+		return cfg
+	}
+	for _, tr := range transports {
+		if tr.name == "HTTP/3" {
+			continue // its packets do not fill the stream
+		}
+		c := tr.dial(e, t, testPassword, anyTarget)
+		v4, _ := opening(t, c)
+		if !blockWriter(t, e, v4) {
+			t.Fatalf("%s: the writer never blocked", tr.name)
+		}
+		if err := e.load(withMoreRoutes("alice")); err != nil {
+			t.Fatal(err)
+		}
+		// Time for the session to take up the new routes before the
+		// removal, which it would otherwise see first half the time.
+		time.Sleep(300 * time.Millisecond)
+		if err := e.load(withMoreRoutes("bob")); err != nil {
 			t.Fatal(err)
 		}
 		waitNoSessions(t)
