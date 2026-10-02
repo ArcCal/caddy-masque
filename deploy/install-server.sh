@@ -27,76 +27,76 @@ GO_MOD_VERSION=$(sed -n 's/^go \([0-9.]*\)$/\1/p' "$SRC/go.mod")
 GO_LINE=${GO_MOD_VERSION%.*}
 
 say() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
-die() { printf '\n\033[1;31m错误：%s\033[0m\n' "$*" >&2; exit 1; }
+die() { printf '\n\033[1;31mError: %s\033[0m\n' "$*" >&2; exit 1; }
 
-[ -n "$DOMAIN" ] || die "用法：bash deploy/install-server.sh 你的域名 [用户名]"
-[ "$(id -u)" = 0 ] || die "请用 root 运行（先执行 sudo -i）"
-if [ ! -f "$SRC/go.mod" ] || ! grep -q caddy-masque "$SRC/go.mod"; then die "请在 caddy-masque 源码目录里运行"; fi
+[ -n "$DOMAIN" ] || die "usage: bash deploy/install-server.sh YOUR_DOMAIN [USER_NAME]"
+[ "$(id -u)" = 0 ] || die "run this as root (sudo -i first)"
+if [ ! -f "$SRC/go.mod" ] || ! grep -q caddy-masque "$SRC/go.mod"; then die "run this in the caddy-masque source directory"; fi
 . /etc/os-release
 case "$ID" in
     debian | ubuntu) ;;
-    *) die "只支持 Debian 和 Ubuntu，这台是 $PRETTY_NAME" ;;
+    *) die "only Debian and Ubuntu are supported; this is $PRETTY_NAME" ;;
 esac
 
-say "检查系统"
+say "Checking the system"
 # The tunnel is a TUN device. Containers of the OpenVZ and LXC kind often lack
 # it until the hosting provider's panel turns it on.
 [ -c /dev/net/tun ] || modprobe tun 2>/dev/null || true
-[ -c /dev/net/tun ] || die "没有 /dev/net/tun（TUN 设备）。OpenVZ、LXC 这类 VPS 要先在服务商的面板里开启 TUN/TAP，然后重启"
+[ -c /dev/net/tun ] || die "there is no /dev/net/tun (TUN device). On OpenVZ- and LXC-type VPSes, turn on TUN/TAP in the provider's panel first, then reboot"
 [ -d /proc/sys/net/ipv4 ] && [ -w /proc/sys/net/ipv4/ip_forward ] ||
-    die "不能修改 /proc/sys/net（这是受限的容器吗？）。隧道需要开启转发，必须在能改内核网络参数的系统里运行"
+    die "cannot change /proc/sys/net (is this a restricted container?). The tunnel needs forwarding turned on, so this must run on a system that can change kernel network settings"
 
-say "安装系统软件"
+say "Installing system packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y -q curl ca-certificates nftables iproute2 dnsutils jq
 
-say "检查域名 $DOMAIN 是否指向这台服务器"
+say "Checking that $DOMAIN points at this server"
 PUBLIC_IP=$(curl -4 -fsS --max-time 10 https://api.ipify.org || curl -4 -fsS --max-time 10 https://ip.sb || true)
 RESOLVED=$(dig +short A "$DOMAIN" @1.1.1.1 | tail -1)
-echo "本机公网 IPv4：${PUBLIC_IP:-未知}；$DOMAIN 解析到：${RESOLVED:-（没有 A 记录）}"
+echo "This server's public IPv4: ${PUBLIC_IP:-unknown}; $DOMAIN resolves to: ${RESOLVED:-(no A record)}"
 if [ -z "$RESOLVED" ]; then
-    die "$DOMAIN 还没有 A 记录。先在域名服务商那里加一条 A 记录指向 ${PUBLIC_IP:-本机公网 IP}，几分钟后再运行"
+    die "$DOMAIN has no A record yet. Add an A record pointing at ${PUBLIC_IP:-the public IP of this server} at your DNS provider, then run this again in a few minutes"
 fi
 if [ -n "$PUBLIC_IP" ] && [ "$RESOLVED" != "$PUBLIC_IP" ]; then
-    die "$DOMAIN 解析到 $RESOLVED，不是本机的 $PUBLIC_IP。改好 A 记录后再运行（用了 Cloudflare 的话，代理状态要设成仅 DNS，灰色云朵）"
+    die "$DOMAIN resolves to $RESOLVED, not to this server's $PUBLIC_IP. Fix the A record, then run this again (with Cloudflare, set the proxy status to DNS only, the grey cloud)"
 fi
 
-say "安装 Go $GO_LINE 的最新补丁版本（已安装就跳过）"
+say "Installing the newest patch release of Go $GO_LINE (skipped if already installed)"
 export PATH=/usr/local/go/bin:$PATH
 # The official release list: the newest stable release of the line, and the
 # SHA-256 of its archive.
-GO_RELEASES=$(curl -fsSL --max-time 60 'https://go.dev/dl/?mode=json&include=all') || die "取不到 Go 的官方发布列表"
+GO_RELEASES=$(curl -fsSL --max-time 60 'https://go.dev/dl/?mode=json&include=all') || die "cannot get the official list of Go releases"
 GO_VERSION=$(jq -r --arg l "go$GO_LINE." 'first(.[] | select(.stable and (.version | startswith($l))) | .version) // empty' <<<"$GO_RELEASES")
-[ -n "$GO_VERSION" ] || die "Go 的官方发布列表里没有 $GO_LINE 的正式版"
+[ -n "$GO_VERSION" ] || die "the official list of Go releases has no stable release of $GO_LINE"
 GO_VERSION=${GO_VERSION#go}
 if ! go version 2>/dev/null | grep -q "go$GO_VERSION "; then
     case "$(uname -m)" in
         x86_64) GOARCH=amd64 ;;
         aarch64) GOARCH=arm64 ;;
-        *) die "不支持的 CPU：$(uname -m)" ;;
+        *) die "unsupported CPU: $(uname -m)" ;;
     esac
     GO_FILE="go$GO_VERSION.linux-$GOARCH.tar.gz"
     # A directory of our own: nobody else can put a file in its place.
     GO_TMP=$(mktemp -d)
-    curl -fsSL "https://go.dev/dl/$GO_FILE" -o "$GO_TMP/$GO_FILE" || die "下载 Go 失败"
+    curl -fsSL "https://go.dev/dl/$GO_FILE" -o "$GO_TMP/$GO_FILE" || die "downloading Go failed"
     GO_SHA256=$(jq -r --arg f "$GO_FILE" 'first(.[].files[] | select(.filename == $f) | .sha256) // empty' <<<"$GO_RELEASES")
-    [ -n "$GO_SHA256" ] || die "Go 的官方发布列表里没有 $GO_FILE"
-    echo "$GO_SHA256  $GO_TMP/$GO_FILE" | sha256sum -c --quiet - || die "Go 安装包的 SHA-256 不对，没有安装"
+    [ -n "$GO_SHA256" ] || die "the official list of Go releases has no $GO_FILE"
+    echo "$GO_SHA256  $GO_TMP/$GO_FILE" | sha256sum -c --quiet - || die "the Go archive's SHA-256 is wrong; not installed"
     rm -rf /usr/local/go
     tar -C /usr/local -xzf "$GO_TMP/$GO_FILE"
     rm -rf "$GO_TMP"
 fi
 go version
 
-say "编译（第一次要几分钟）"
+say "Building (a few minutes the first time)"
 # Building Caddy needs about 2 GB of memory; small servers get a temporary
 # swap file of their own, removed afterwards.
 SWAP=""
 cleanup_swap() {
     [ -n "$SWAP" ] || return 0
     if swapon --show=NAME --noheadings | grep -qxF "$SWAP" && ! swapoff "$SWAP"; then
-        printf '注意：临时交换文件 %s 停用失败，没有删除；重启后可以手动删掉它\n' "$SWAP"
+        printf 'Note: turning off the temporary swap file %s failed, so it was not removed; you can remove it by hand after a reboot\n' "$SWAP"
         SWAP=""
         return 0
     fi
@@ -114,7 +114,7 @@ trap cleanup EXIT
 mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 swap_kb=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
 if [ $((mem_kb + swap_kb)) -lt 2500000 ]; then
-    echo "内存较小，编译期间临时加 2 GB 交换空间"
+    echo "Little memory: adding 2 GB of temporary swap space for the build"
     SWAP=$(mktemp /caddy-build-XXXXXX.swap) # a new file, mode 600
     fallocate -l 2G "$SWAP" 2>/dev/null || dd if=/dev/zero of="$SWAP" bs=1M count=2048 status=none
     mkswap -q "$SWAP"
@@ -125,22 +125,22 @@ cleanup_swap
 install -m 755 "$BUILD_DIR/caddy" /usr/local/bin/caddy
 caddy version
 
-say "端口"
+say "Ports"
 # masque-vpn's own server, or another web server, would hold 443.
 for unit in masque-server caddy nginx apache2; do
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
-        die "$unit 正在运行，会占用 80/443 端口。先停掉它：systemctl disable --now $unit"
+        die "$unit is running and would hold ports 80/443. Stop it first: systemctl disable --now $unit"
     fi
 done
 for p in 80 443; do
     if ss -ltnH "sport = :$p" | grep -q . && ! systemctl is-active --quiet caddy-masque; then
-        die "TCP $p 端口被占用（$(ss -ltnpH "sport = :$p" | head -1)），先停掉占用的程序"
+        die "TCP port $p is in use ($(ss -ltnpH "sport = :$p" | head -1)); stop the program using it first"
     fi
 done
 
-say "伪装网站"
+say "Cover website"
 if [ -f "$SITE/index.html" ]; then
-    echo "已有 $SITE/index.html，保留"
+    echo "$SITE/index.html already exists; kept"
 else
     mkdir -p "$SITE"
     cat >"$SITE/index.html" <<'EOF'
@@ -162,12 +162,12 @@ else
 </body>
 </html>
 EOF
-    echo "放了一个简单的首页；想换成自己的网页，把文件放进 $SITE（要有 index.html）"
+    echo "Put a simple home page in place; to use your own pages, put the files in $SITE (with an index.html)"
 fi
 
-say "配置"
+say "Configuration"
 if [ -f "$CONFIG" ]; then
-    echo "已有 $CONFIG，保留（其中的用户不变）"
+    echo "$CONFIG already exists; kept (with its users unchanged)"
 else
     IPV6_LINE="# ipv6 fd89:6d61:7371::1/64"
     # Offer IPv6 in the tunnel only when this server reaches the IPv6 Internet.
@@ -176,7 +176,7 @@ else
     fi
     read -r HASH PASSWORD < <(caddy masque-passwd --name "$USER_NAME" |
         awk '/^user / {h=$3} /^password =/ {gsub(/"/, "", $3); p=$3} END {print h, p}')
-    if [ -z "$HASH" ] || [ -z "$PASSWORD" ]; then die "生成用户失败"; fi
+    if [ -z "$HASH" ] || [ -z "$PASSWORD" ]; then die "creating the user failed"; fi
     mkdir -p /etc/caddy
     umask 077
     cat >"$CONFIG" <<EOF
@@ -199,18 +199,18 @@ $DOMAIN {
 EOF
     cat >"$CREDENTIALS" <<EOF
 MASQUE VPN, $(date '+%Y-%m-%d')
-服务器域名：$DOMAIN
-服务器 IP：${PUBLIC_IP:-}
-用户名：$USER_NAME
-密码：$PASSWORD
+Server domain: $DOMAIN
+Server IP:     ${PUBLIC_IP:-}
+User name:     $USER_NAME
+Password:      $PASSWORD
 EOF
     chmod 600 "$CONFIG" "$CREDENTIALS"
     umask 022
 fi
 caddy validate --config "$CONFIG" >/dev/null 2>&1 ||
-    { caddy validate --config "$CONFIG" || true; die "$CONFIG 有错误，见上面的输出"; }
+    { caddy validate --config "$CONFIG" || true; die "$CONFIG has errors; see the output above"; }
 
-say "防火墙"
+say "Firewall"
 # A host firewall that drops forwarded packets makes the tunnel connect and
 # carry nothing; open it for the tunnel's interface (the name in the default
 # configuration).
@@ -219,15 +219,15 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: activ
     ufw allow 443/tcp >/dev/null
     ufw allow 443/udp >/dev/null
     ufw route allow in on masque0 >/dev/null
-    echo "ufw 正在运行：已放行 TCP 80、TCP 443、UDP 443，并允许从 masque0 转发"
+    echo "ufw is running: opened TCP 80, TCP 443 and UDP 443, and allowed forwarding from masque0"
 elif command -v iptables >/dev/null && iptables -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then
-    echo "警告：iptables 的 FORWARD 默认策略是 DROP（多半是 Docker 设的），隧道的流量会被丢掉。"
-    echo "      放行它：iptables -I DOCKER-USER -i masque0 -j ACCEPT（Docker 之外的写法：iptables -I FORWARD -i masque0 -j ACCEPT），并让这条规则开机生效"
+    echo "Warning: the iptables FORWARD default policy is DROP (most likely set by Docker), so tunnel traffic will be dropped."
+    echo "         Allow it with: iptables -I DOCKER-USER -i masque0 -j ACCEPT (without Docker: iptables -I FORWARD -i masque0 -j ACCEPT), and make the rule persist across reboots"
 else
-    echo "没有发现会拦截转发的防火墙"
+    echo "No firewall found that would block forwarding"
 fi
 
-say "启动服务"
+say "Starting the service"
 install -m 644 "$SRC/deploy/caddy-masque.service" /etc/systemd/system/caddy-masque.service
 systemctl daemon-reload
 systemctl enable --now caddy-masque
@@ -235,10 +235,10 @@ systemctl restart caddy-masque
 sleep 3
 if ! systemctl is-active --quiet caddy-masque; then
     journalctl -u caddy-masque -n 30 --no-pager -o cat
-    die "caddy-masque 没有启动，原因见上面的日志"
+    die "caddy-masque did not start; see the log above for why"
 fi
 
-say "检查（第一次要等 Caddy 申请证书）"
+say "Checking (the first time, this waits for Caddy to get the certificate)"
 ok=""
 for _ in $(seq 30); do
     if curl -fsS --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" 2>/dev/null | grep -qi '<title>'; then
@@ -248,38 +248,38 @@ for _ in $(seq 30); do
     sleep 2
 done
 if [ -n "$ok" ]; then
-    echo "网站正常：https://$DOMAIN/"
+    echo "Website OK: https://$DOMAIN/"
 else
-    echo "警告：本机访问 https://$DOMAIN/ 没有得到网页（多半是证书还没申请下来），看日志：journalctl -u caddy-masque -n 50 -o cat"
+    echo "Warning: https://$DOMAIN/ did not return a web page from this server (most likely the certificate has not been issued yet); see the log: journalctl -u caddy-masque -n 50 -o cat"
 fi
 # The service keeps the forwarding and NAT rules in place (and puts them back
 # if a firewall reload removes them); they must be there now.
 if nft list table inet caddy-masque >/dev/null 2>&1 && [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ]; then
-    echo "转发和 NAT 规则已就位"
+    echo "Forwarding and NAT rules are in place"
 else
-    echo "警告：转发或 NAT 规则不在（nft list table inet caddy-masque），隧道不会通。看日志：journalctl -u caddy-masque -n 50 -o cat"
+    echo "Warning: the forwarding or NAT rules are missing (nft list table inet caddy-masque), so the tunnel will not carry traffic. See the log: journalctl -u caddy-masque -n 50 -o cat"
 fi
-ss -lunH 'sport = :443' | grep -q . && echo "UDP 443（HTTP/3）在监听"
-ss -ltnH 'sport = :443' | grep -q . && echo "TCP 443（HTTP/2、HTTP/1.1）在监听"
+ss -lunH 'sport = :443' | grep -q . && echo "UDP 443 (HTTP/3) is listening"
+ss -ltnH 'sport = :443' | grep -q . && echo "TCP 443 (HTTP/2, HTTP/1.1) is listening"
 
-say "完成"
+say "Done"
 cat <<EOF
 
-客户端（Mac 上的 MasqueVPN，或 masque-client）这样填：
-$(if [ -f "$CREDENTIALS" ]; then sed -n '2,$p' "$CREDENTIALS"; else echo "  （用户在已有的 $CONFIG 里）"; fi)
-  （IP 可不填。）
+Enter this in the client (MasqueVPN on the Mac, or masque-client):
+$(if [ -f "$CREDENTIALS" ]; then sed -n '2,$p' "$CREDENTIALS"; else echo "  (the users are in the existing $CONFIG)"; fi)
+  (The IP may be left out.)
 
-这些信息也保存在 $CREDENTIALS（只有 root 能读）。
+This is also saved in $CREDENTIALS (readable only by root).
 
-还要确认云服务商的防火墙（安全组）放行了：
-  TCP 443、UDP 443（VPN 和网站）  TCP 80（证书申请和续期）
-UDP 443 没开也能用，但只能走较慢的 TCP。
+Also make sure the cloud provider's firewall (security group) allows:
+  TCP 443, UDP 443 (VPN and website)  TCP 80 (getting and renewing the certificate)
+Without UDP 443 it still works, but only over the slower TCP.
 
-常用命令：
-  systemctl status caddy-masque              状态
-  journalctl -u caddy-masque -f -o cat       实时日志
-  curl -s localhost:2019/metrics | grep caddy_masque   在线隧道、流量、认证失败（Prometheus 格式）
-  caddy masque-passwd --name 新用户名        再建一个用户（每台设备一个），
-                                             把输出的 user 行加进 $CONFIG，
-                                             然后 systemctl reload caddy-masque
+Useful commands:
+  systemctl status caddy-masque              status
+  journalctl -u caddy-masque -f -o cat       live log
+  curl -s localhost:2019/metrics | grep caddy_masque   live tunnels, traffic, failed logins (Prometheus format)
+  caddy masque-passwd --name NEW_USER        add another user (one per device),
+                                             add the user line it prints to $CONFIG,
+                                             then systemctl reload caddy-masque
 EOF

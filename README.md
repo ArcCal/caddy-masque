@@ -1,53 +1,56 @@
 # caddy-masque
 
-用 Go 重写的 [masque-vpn](https://github.com/ArcCal/masque-vpn) 服务端，做成 Caddy 模块：
+The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as a Caddy module:
 
-- **标准**：IETF MASQUE 的 IP 代理 CONNECT-IP（RFC 9484），HTTP Datagram 与 Capsule（RFC 9297），
-  HTTP/2、HTTP/3 的扩展 CONNECT（RFC 8441、RFC 9220）。HTTP/3、HTTP/2、HTTP/1.1 三种方式都支持。
-- **客户端不变**：masque-vpn 的 `masque-client` 和 Mac 上的 MasqueVPN 直接连，配置一个字都不用改。
-  `caddy masque-passwd` 生成的密码哈希和 masque-vpn 的 `masque-passwd` 通用。
-- **Caddy 管证书和流量**：证书自动申请、续期；VPN 和网站共用 443 端口（TCP 和 UDP）；
-  同一个 Caddy 还可以照常托管别的网站、反向代理。
-- **看起来就是个网站**：只有带正确用户名密码的 CONNECT-IP 请求才会变成隧道；
-  其他所有请求（包括密码错误的、探测的）都交给网站处理，回应和普通 Caddy 网站一模一样。
+- **Standards**: IETF MASQUE IP proxying, CONNECT-IP (RFC 9484); HTTP Datagrams and Capsules (RFC 9297);
+  extended CONNECT over HTTP/2 and HTTP/3 (RFC 8441, RFC 9220). HTTP/3, HTTP/2 and HTTP/1.1 are all supported.
+- **Clients unchanged**: masque-vpn's `masque-client` and MasqueVPN on the Mac connect directly, without changing a single
+  line of their configuration. Password hashes made by `caddy masque-passwd` and by masque-vpn's `masque-passwd` are interchangeable.
+- **Caddy handles certificates and traffic**: certificates are obtained and renewed automatically; the VPN and the website
+  share port 443 (TCP and UDP); the same Caddy can go on hosting other sites and reverse proxies as usual.
+- **Looks like just a website**: only CONNECT-IP requests with a correct user name and password become tunnels;
+  every other request (including ones with a wrong password, and probes) goes to the website, and the response is
+  exactly what an ordinary Caddy website gives.
 
-只支持 Linux（需要 root：创建 TUN 设备、设置转发和 NAT）。
+Linux only (needs root: it creates a TUN device and sets up forwarding and NAT).
 
-## 一键安装
+## One-step install
 
-在 Debian 12/13 或 Ubuntu 22.04/24.04 上，域名先解析到服务器，然后：
+On Debian 12/13 or Ubuntu 22.04/24.04, with the domain already pointing at the server:
 
 ```sh
 git clone https://github.com/ArcCal/caddy-masque && cd caddy-masque
 sudo bash deploy/install-server.sh vpn.example.com
 ```
 
-脚本会装 Go（当前这一版的最新补丁版本，带着标准库的安全修复）、编译、写好 `/etc/caddy/Caddyfile`（带一个伪装首页和一个随机密码的用户）、
-启动 `caddy-masque` 服务。最后打印客户端要填的域名、用户名、密码。
-云服务商的防火墙要放行 TCP 80、TCP 443、UDP 443。
-脚本还会检查 `/dev/net/tun` 是否存在（OpenVZ、LXC 类 VPS 要在服务商面板里开启 TUN/TAP），
-发现 ufw 在运行时放行端口并允许从 `masque0` 转发；Docker 把 FORWARD 默认策略设成 DROP 时给出警告和放行命令。
+The script installs Go (the newest patch release of the current line, which carries the standard library's security fixes), builds,
+writes `/etc/caddy/Caddyfile` (with a cover home page and one user with a random password), and starts the
+`caddy-masque` service. At the end it prints the domain, user name and password to enter in the client.
+The cloud provider's firewall must allow TCP 80, TCP 443 and UDP 443.
+The script also checks that `/dev/net/tun` exists (on OpenVZ- and LXC-type VPSes, turn on TUN/TAP in the provider's panel);
+when it finds ufw running, it opens the ports and allows forwarding from `masque0`; when Docker has set the FORWARD default
+policy to DROP, it prints a warning and the command to allow the traffic.
 
-服务以 root 运行（要写 `/proc/sys`），但 `deploy/caddy-masque.service` 把权限收到只剩
-CAP_NET_ADMIN、CAP_NET_BIND_SERVICE、CAP_DAC_READ_SEARCH，文件系统除 `/var/lib/caddy*` 和 `/var/log/caddy` 外只读，
-并限制了系统调用和地址族。站点要写其他目录（如自己的日志文件）时：`systemctl edit caddy-masque`，加
-`[Service]` 和 `ReadWritePaths=/那个目录`。
+The service runs as root (it writes to `/proc/sys`), but `deploy/caddy-masque.service` cuts its privileges down to
+CAP_NET_ADMIN, CAP_NET_BIND_SERVICE and CAP_DAC_READ_SEARCH, makes the file system read-only except `/var/lib/caddy*` and
+`/var/log/caddy`, and restricts system calls and address families. When a site needs to write to another directory
+(for example its own log file): `systemctl edit caddy-masque`, and add `[Service]` and `ReadWritePaths=/that/directory`.
 
-已经装了 masque-vpn 的服务端？先 `systemctl disable --now masque-server`，它们都要用 443 端口。
-原来的用户可以照搬：`server.toml` 里每个 `[[user]]` 写成 Caddyfile 里的一行 `user 名字 哈希`。
+Already running the masque-vpn server? First `systemctl disable --now masque-server`; both need port 443.
+Existing users carry over as they are: each `[[user]]` in `server.toml` becomes one `user NAME HASH` line in the Caddyfile.
 
-## 手动编译
+## Building by hand
 
-需要 Go 1.26：
+Needs Go 1.26:
 
 ```sh
 go build -o caddy ./cmd/caddy
 ```
 
-得到的 `caddy` 就是完整的 Caddy（带全部标准模块）加上本模块。也可以用 xcaddy：
-`xcaddy build --with github.com/ArcCal/caddy-masque`。
+The resulting `caddy` is a complete Caddy (with all the standard modules) plus this module. xcaddy works too:
+`xcaddy build --with github.com/ArcCal/caddy-masque`.
 
-## 配置
+## Configuration
 
 ```caddyfile
 {
@@ -66,165 +69,196 @@ vpn.example.com {
 }
 ```
 
-站点里的 `masque` 指令负责接 VPN 请求，其余请求照常往下走（这里是 `file_server` 提供网页）。
-它会自动排在 `file_server`、`reverse_proxy` 等指令前面。
+The `masque` directive in the site takes the VPN requests; all other requests carry on as usual (here, to `file_server`
+for the web pages). It is ordered automatically before `file_server`, `reverse_proxy` and the like.
 
-### 全局选项 `masque { ... }`
+### Global option `masque { ... }`
 
-| 选项 | 说明 | 默认 |
+| Option | Meaning | Default |
 |---|---|---|
-| `ipv4 地址/前缀` | 服务器自己的隧道地址，前缀里其余地址分给客户端。必填 | — |
-| `ipv6 地址/前缀` | 隧道里提供 IPv6；服务器能上 IPv6 网时再开 | 不提供 |
-| `user 名字 哈希` | 一个用户，哈希由 `caddy masque-passwd` 生成。每台设备一个 | — |
-| `interface 名字` | TUN 设备名 | `masque0` |
-| `mtu 字节` | 隧道 MTU（576–1500；开 IPv6 时至少 1280） | `1350` |
-| `block 前缀...` | 不许客户端访问的目的地址，可写多行。写了就替换默认列表；`block none` 表示不屏蔽 | 私有地址、本机、组播、基准测试和过渡机制（NAT64、6to4、Teredo）地址等（含云服务商内网和 169.254.169.254） |
-| `allow_client_to_client` | 允许客户端之间互相访问 | 不允许 |
-| `allow_host_access` | 允许客户端访问服务器本机的服务（隧道地址和服务器的公网地址上监听的端口） | 只许 ping |
-| `max_sessions 数量` | 同一个用户同时最多几条隧道；`unlimited` 不限 | 8 |
-| `manage_network off` | 不改转发和 NAT（sysctl、nftables），自己管 | 自动管理 |
-| `http3 off` | 不接管 HTTP/3（见下文），VPN 只走 HTTP/2 和 HTTP/1.1 | 接管 |
-| `mtu_probe off` | 不做 IPv6 MTU 探测（见下文）。只在确知客户端都直连、中间没有 HTTP 代理时关 | 探测 |
+| `ipv4 ADDRESS/PREFIX` | The server's own tunnel address; the rest of the prefix is given to clients. Required | — |
+| `ipv6 ADDRESS/PREFIX` | Offer IPv6 in the tunnel; turn it on only when the server has IPv6 Internet access | Not offered |
+| `user NAME HASH` | A user; the hash comes from `caddy masque-passwd`. One per device | — |
+| `interface NAME` | TUN device name | `masque0` |
+| `mtu BYTES` | Tunnel MTU (576–1500; at least 1280 with IPv6) | `1350` |
+| `block PREFIX...` | Destination addresses clients may not reach; may be given on several lines. Replaces the default list; `block none` blocks nothing | Private addresses, loopback, multicast, benchmarking and transition-mechanism (NAT64, 6to4, Teredo) addresses and so on (including cloud providers' internal networks and 169.254.169.254) |
+| `allow_client_to_client` | Let clients reach each other | Not allowed |
+| `allow_host_access` | Let clients reach services on the server itself (ports listening on the tunnel address and the server's public addresses) | Ping only |
+| `max_sessions COUNT` | The most tunnels one user may have at once; `unlimited` for no limit | 8 |
+| `manage_network off` | Leave forwarding and NAT (sysctl, nftables) alone; manage them yourself | Managed automatically |
+| `http3 off` | Do not take over HTTP/3 (see below); the VPN uses only HTTP/2 and HTTP/1.1 | Taken over |
+| `mtu_probe off` | Skip the IPv6 MTU probe (see below). Turn it off only when you know every client connects directly, with no HTTP proxy in between | Probe |
 
-带 IPv6 的 HTTP/3 隧道（QUIC datagram）建立后，服务器向客户端的 IPv6 地址发 1280 字节的
-ICMPv6 Echo 请求，确认隧道装得下 IPv6 的最小 MTU；10 秒内收不到回复就拆掉隧道（RFC 9484 §7.2
-要求这样做，除非有带外手段保证 QUIC Initial 包的填充已经足够，即中间没有 HTTP 代理）。
-客户端的 IPv6 协议栈会自动回复；**客户端防火墙丢弃 ICMPv6 Echo（如 macOS 的隐身模式）时，
-HTTP/3 隧道会被拆掉**，这时放行 ICMPv6 Echo，或在确知没有中间代理时用 `mtu_probe off`。
+Once an HTTP/3 tunnel (QUIC datagrams) with IPv6 is up, the server sends a 1280-byte ICMPv6 Echo Request to the
+client's IPv6 address, to confirm that the tunnel can carry IPv6's minimum MTU; with no reply within 10 seconds it closes
+the tunnel (RFC 9484 §7.2 requires this, unless an out-of-band means ensures the QUIC Initial packets were padded enough,
+that is, there is no HTTP proxy in between). The client's IPv6 stack replies by itself; **when a client firewall drops
+ICMPv6 Echo (such as macOS stealth mode), HTTP/3 tunnels are closed**. Then allow ICMPv6 Echo, or, when you know there
+is no intermediate proxy, use `mtu_probe off`.
 
-链路本地地址（169.254.0.0/16、fe80::/10）无论怎么配置都不转发（RFC 9484 §7.2）。
+Link-local addresses (169.254.0.0/16, fe80::/10) are never forwarded, whatever the configuration (RFC 9484 §7.2).
 
-### 保护服务器本机
+### Protecting the server itself
 
-客户端发给服务器本机的包（目的是隧道地址 `ipv4` 或服务器的公网地址）不经过转发，
-不受 `block` 管。所以 nftables 规则里有一条 `input` 链：从隧道设备进来的包只放行 ICMP 和已建立连接的回包，
-其余丢弃。否则，监听在所有地址上的服务（SSH、数据库、管理界面……）对每个持有账号的客户端都是开放的，
-主机防火墙里只针对公网网卡的规则也管不到它们。确实要让客户端访问本机的某个服务时，写 `allow_host_access`
-（然后在主机防火墙里按 `masque0` 接口自己限制）。`manage_network off` 时不装规则，这件事要自己做。
-Caddy 的管理接口默认只听 `localhost:2019`，客户端够不着；不要把它改成监听所有地址。
+Packets that clients send to the server itself (to the `ipv4` tunnel address or the server's public addresses) are not
+forwarded, so `block` does not apply to them. That is why the nftables rules have an `input` chain: packets coming in
+from the tunnel device are allowed only for ICMP and replies on established connections; the rest are dropped. Otherwise,
+services listening on all addresses (SSH, databases, admin interfaces…) would be open to every client with an account,
+and host firewall rules written only for the public network interface would not cover them. When clients really should
+reach a service on the server, add `allow_host_access` (and restrict it yourself in the host firewall by the `masque0`
+interface). With `manage_network off` no rules are installed, and this is up to you.
+Caddy's admin endpoint listens only on `localhost:2019` by default, out of the clients' reach; do not make it listen on
+all addresses.
 
-### 防暴力猜密码和占满地址池
+### Against password guessing and pool exhaustion
 
-- 同一个客户端地址（IPv6 按 /64）一分钟内带错误凭据的请求超过 10 次，之后一分钟内它带凭据的请求不再校验，
-  直接当普通网页请求处理（和没带凭据的一样）。共用出口地址的用户在这一分钟里会互相影响。
-  自动生成的密码有 144 位，不可能被猜到；`masque-passwd --stdin` 自己定的密码至少 12 个字符，请用长而随机的。
-- 每个用户同时最多 `max_sessions` 条隧道（默认 8），超出的请求得到 429。否则一个账号就能占满整个地址池，
-  把其他用户挤掉。一台设备断线重连时，服务器还没发现旧连接已断，旧的也占一条，所以别设成 1。
+- After more than 10 requests with wrong credentials within a minute from one client address (for IPv6, per /64), its
+  requests that carry credentials are not checked for the next minute but are treated as ordinary web requests (like
+  requests without credentials). Users sharing an outgoing address affect one another during that minute.
+  Generated passwords have 144 bits and cannot be guessed; passwords of your own given to `masque-passwd --stdin` need
+  at least 12 characters; make them long and random.
+- Each user may have at most `max_sessions` tunnels at once (default 8); requests beyond that get 429. Otherwise one
+  account could take the whole address pool and crowd out the other users. When a device reconnects after losing its
+  connection, the old tunnel still counts until the server notices it is gone, so do not set this to 1.
 
-### 监控
+### Monitoring
 
-Caddy 的 `metrics` 指令和管理接口（`curl localhost:2019/metrics`）带有这些指标：
-`caddy_masque_sessions_active{user}`、`caddy_masque_sessions_started_total`、`caddy_masque_auth_failures_total`、
-`caddy_masque_auth_throttled_total`、`caddy_masque_packets_total{direction}`、`caddy_masque_bytes_total{direction}`、
-`caddy_masque_packets_dropped_total`。计数在重载配置时不清零。
+Caddy's `metrics` directive and admin endpoint (`curl localhost:2019/metrics`) include these metrics:
+`caddy_masque_sessions_active{user}`, `caddy_masque_sessions_started_total`, `caddy_masque_auth_failures_total`,
+`caddy_masque_auth_throttled_total`, `caddy_masque_packets_total{direction}`, `caddy_masque_bytes_total{direction}`,
+`caddy_masque_packets_dropped_total`. The counters are not reset when the configuration is reloaded.
 
-### 主机网络配置的自动修复
+### Automatic repair of the host network configuration
 
-服务每 30 秒检查一次转发和 NAT：主机防火墙重载（如 `nft flush ruleset`、firewalld 重载）删掉 nftables 表，
-或别的程序关掉了 `ip_forward` 时，服务把它们装回去并在日志里警告。服务正常退出时，把它改过的转发开关还原成原来的值
-（原来就是开着的则不动），删掉 nftables 表。
+Every 30 seconds the service checks forwarding and NAT: when a host firewall reload (such as `nft flush ruleset` or a
+firewalld reload) has removed the nftables table, or another program has turned off `ip_forward`, the service puts them
+back and logs a warning. When the service exits normally, it sets the forwarding switches it changed back to their
+original values (leaving them alone if they were already on) and removes the nftables table.
 
-### 指令 `masque [路径模板]`
+### Directive `masque [PATH_TEMPLATE]`
 
-路径模板默认是 `/.well-known/masque/ip/{target}/{ipproto}/`，和客户端默认值一致。
-改了的话，客户端的 `uri_template` 要跟着改。客户端 `uri_template` 里的主机名要和站点地址一致。
-模板可以用 RFC 9484 §3 允许的写法：路径和查询里的简单表达式（`{target}`、`{target,ipproto}`，
-前后可以有固定文字）、`{?target,ipproto}`、`{&...}`，以及固定参数（如 `?v=1`）。
-模板里可以有别的变量：客户端只定义 `target` 和 `ipproto`，别的变量展开时被省略（RFC 6570），服务器照此匹配。
-服务器没法无歧义地匹配的写法（两个表达式紧挨着、变量当参数名、`{?...}` 后面跟的文字不以 `&` 开头）
-在加载配置时报错，不会等到请求时才匹配不上。
+The path template defaults to `/.well-known/masque/ip/{target}/{ipproto}/`, which matches the client's default.
+If you change it, change the client's `uri_template` to match. The host name in the client's `uri_template` must match
+the site address.
+The template may use the forms RFC 9484 §3 allows: simple expressions in the path and query (`{target}`,
+`{target,ipproto}`, with fixed text before or after), `{?target,ipproto}`, `{&...}`, and fixed parameters (such as `?v=1`).
+The template may contain other variables: clients define only `target` and `ipproto`, other variables are left out when
+expanded (RFC 6570), and the server matches accordingly.
+Forms the server cannot match unambiguously (two expressions next to each other, a variable as a parameter name, text
+after `{?...}` that does not start with `&`) are an error when the configuration is loaded, rather than failing to match
+at request time.
 
-## 用户管理
+## Managing users
 
 ```sh
 caddy masque-passwd --name iphone
 ```
 
-把输出的 `user ...` 那一行加进 Caddyfile 的 `masque { }`，然后 `systemctl reload caddy-masque`。
-输出里也有客户端配置要填的用户名和随机密码。想自己定密码：`echo 密码 | caddy masque-passwd --name iphone --stdin`。
+Add the `user ...` line it prints to `masque { }` in the Caddyfile, then `systemctl reload caddy-masque`.
+The output also has the user name and the random password for the client configuration. To choose the password
+yourself: `echo PASSWORD | caddy masque-passwd --name iphone --stdin`.
 
-## 重载配置
+## Reloading the configuration
 
-`systemctl reload caddy-masque`（即 `caddy reload`）：
+`systemctl reload caddy-masque` (that is, `caddy reload`):
 
-- 已连接的隧道**不断**，HTTP/3、HTTP/2、HTTP/1.1 都一样；
-- 删掉的用户、改了密码的用户**立即断开**；
-- 改了 `block`、`allow_client_to_client`：多出来的目的地址**立即**以新的路由通告发给在线会话；
-  被收回的目的地址，相关隧道会被关闭（RFC 9484 要求隧道存续期间保持已分配的路由），
-  客户端自动重连后拿到新的路由；
-- `max_sessions` 重载后对新建隧道立即生效；
-- `interface`、`ipv4`、`ipv6`、`mtu`、`manage_network`、`allow_host_access` 改了要重启：`systemctl restart caddy-masque`。
+- Connected tunnels **stay up**, over HTTP/3, HTTP/2 and HTTP/1.1 alike;
+- Users that were removed, or whose password changed, are **disconnected at once**;
+- Changes to `block` or `allow_client_to_client`: destinations that were added are sent to live sessions **at once** in a
+  new route advertisement; for destinations that were withdrawn, the tunnels concerned are closed (RFC 9484 requires the
+  routes given to stay for the life of the tunnel), and clients get the new routes when they reconnect automatically;
+- `max_sessions` applies to new tunnels as soon as the configuration is reloaded;
+- Changes to `interface`, `ipv4`, `ipv6`, `mtu`, `manage_network` or `allow_host_access` need a restart:
+  `systemctl restart caddy-masque`.
 
-证书用的是自己的文件（`tls 证书 私钥`）时，文件换了而 Caddyfile 没变，要 `caddy reload --force`
-才会重新读（服务文件里的 reload 已经带了 `--force`）。Caddy 自动申请的证书不用管。
+When the certificate comes from files of your own (`tls CERT KEY`) and the files change while the Caddyfile does not,
+`caddy reload --force` is needed to read them again (the reload in the service file already has `--force`). Certificates
+Caddy obtains by itself need nothing.
 
-## 和 Caddy 的关系（技术细节）
+## How it fits with Caddy (technical details)
 
-- **HTTP/3**：Caddy 自己的 HTTP/3 关闭了 HTTP Datagram，CONNECT-IP 用不了。
-  所以本模块接管 HTTPS 站点的 UDP 端口，用同样的证书、同样的站点路由提供 HTTP/3（带 Datagram），
-  并照 Caddy 的样子发 `Alt-Svc` 头。普通网页请求走 HTTP/3 也照常由 Caddy 的路由处理。
-  `http3 off` 则把 HTTP/3 还给 Caddy。
-- **HTTP/2**：Go 的 HTTP/2 默认不接受扩展 CONNECT，要 `GODEBUG=http2xconnect=1`。
-  本模块在程序启动时自动设置（无论用本项目的 `cmd/caddy` 还是 xcaddy 编译）；
-  如果环境变量里明确写了 `http2xconnect=0`，就尊重它，此时 HTTP/2 隧道不可用，日志里有警告。
-- **只走加密连接**：RFC 9484 §4 要求 CONNECT-IP 跑在 TLS 或 QUIC 上。没有 TLS 的连接
-  （`http://` 站点、h2c）上的 CONNECT-IP 请求一律交给网站处理，不建隧道。
-- **畸形请求**：通过认证、但 `target`、`ipproto` 缺失或不合规，或带了内容头的请求是畸形的
-  （RFC 9484 §4.1、RFC 9297 §3.2）：回 400；HTTP/3 上还按 RFC 9114 §4.1.2 以 H3_MESSAGE_ERROR
-  结束请求流（STOP_SENDING，400 照样送达）。目的地址不允许（403）、DNS 失败（502）等是拒绝，不算畸形。
-- **超时**：Caddy 2.11 默认的读写空闲超时（1 分钟）和 `read_timeout`、`write_timeout` 不作用于隧道，
-  隧道空闲多久都不断；对普通网页请求照常生效。
-- **不支持 HTTP/3 Datagram 的客户端**：用 DATAGRAM capsule 在流上传数据包（RFC 9297 §3.5）。
-- **退出**：Caddy 退出时主动结束所有隧道，不会因为隧道一直开着而卡住。
-- **重载失败**：新配置启动失败时，用户、可达范围、HTTP/3 都回到旧配置。
+- **HTTP/3**: Caddy's own HTTP/3 has HTTP Datagrams turned off, so CONNECT-IP cannot work over it.
+  This module therefore takes over the UDP port of HTTPS sites and serves HTTP/3 (with Datagrams) with the same
+  certificates and the same site routes, and sends `Alt-Svc` headers the way Caddy does. Ordinary web requests over
+  HTTP/3 are still handled by Caddy's routes. `http3 off` gives HTTP/3 back to Caddy.
+- **HTTP/2**: Go's HTTP/2 does not accept extended CONNECT by default; it needs `GODEBUG=http2xconnect=1`.
+  This module sets it automatically at program start (whether built with this project's `cmd/caddy` or with xcaddy);
+  if the environment explicitly says `http2xconnect=0`, that is respected, HTTP/2 tunnels are then unavailable, and the
+  log has a warning.
+- **Encrypted connections only**: RFC 9484 §4 requires CONNECT-IP to run over TLS or QUIC. CONNECT-IP requests on
+  connections without TLS (`http://` sites, h2c) always go to the website; no tunnel is set up.
+- **Malformed requests**: an authenticated request whose `target` or `ipproto` is missing or invalid, or that has content
+  headers, is malformed (RFC 9484 §4.1, RFC 9297 §3.2): the answer is 400; over HTTP/3 the request stream is also ended
+  with H3_MESSAGE_ERROR as RFC 9114 §4.1.2 says (STOP_SENDING; the 400 still gets through). A destination that is not
+  allowed (403), a DNS failure (502) and the like are refusals, not malformed requests.
+- **Timeouts**: Caddy 2.11's default read and write idle timeouts (1 minute) and `read_timeout` and `write_timeout` do not
+  apply to tunnels, which stay up however long they are idle; they apply to ordinary web requests as usual.
+- **Clients without HTTP/3 Datagram support**: packets are carried on the stream in DATAGRAM capsules (RFC 9297 §3.5).
+- **Exit**: when Caddy exits it ends every tunnel itself, so open tunnels do not keep it from exiting.
+- **Failed reloads**: when the new configuration fails to start, users, reachable destinations and HTTP/3 all go back to
+  the old configuration.
 
-已知的限制：
+Known limitations:
 
-- `Alt-Svc` 头只加在带 `masque` 指令的站点上；同一端口上的其他站点照样能用 HTTP/3，只是不会被告知。
-- VPN 接管的 HTTP/3 不接受 0-RTT（重放风险），也不套用 Caddy 的 `packet_conn_wrappers`（如 UDP 上的 proxy protocol）。
-- HTTP/2 上，RFC 9113 §8.1.1 要求把畸形请求（以及畸形 capsule，RFC 9297 §3.3）当作 PROTOCOL_ERROR 流错误。
-  Caddy 用的 Go HTTP/2 服务端（`x/net/http2`）不让处理器指定错误码，处理器能触发的流重置只有 INTERNAL_ERROR，
-  所以畸形请求只回 400，畸形 capsule 中止隧道时错误码是 INTERNAL_ERROR。遵守 RFC 9484 的客户端照样把它当作失败
-  （§4.5：非成功响应即失败），但错误码的语义仍不符合 RFC 9113。这在本模块里修不了：给 `x/net/http2` 打补丁
-  只对本仓库的 `cmd/caddy` 生效，用 xcaddy 编译的照样是原样，同一版本会因编译方式不同而行为不同。
-  要等 Go 提供让处理器以指定错误码重置流的接口。
+- The `Alt-Svc` header is added only on sites with the `masque` directive; other sites on the same port can still use
+  HTTP/3, they just are not advertised.
+- The HTTP/3 the VPN takes over does not accept 0-RTT (replay risk), and does not apply Caddy's `packet_conn_wrappers`
+  (such as the PROXY protocol over UDP).
+- Over HTTP/2, RFC 9113 §8.1.1 requires malformed requests (and malformed capsules, RFC 9297 §3.3) to be treated as
+  stream errors of type PROTOCOL_ERROR. The Go HTTP/2 server Caddy uses (`x/net/http2`) does not let handlers choose the
+  error code; the only stream reset a handler can cause is INTERNAL_ERROR. So malformed requests get only a 400, and
+  malformed capsules end the tunnel with INTERNAL_ERROR. Clients that follow RFC 9484 still treat this as a failure
+  (§4.5: any non-successful response is a failure), but the meaning of the error code still does not conform to RFC 9113.
+  This cannot be fixed in this module: patching `x/net/http2` would affect only this repository's `cmd/caddy`, while
+  builds made with xcaddy would stay as they are, and the same version would behave differently depending on how it was
+  built. It has to wait for Go to provide a way for handlers to reset a stream with a given error code.
 
-## 测试
+## Tests
 
 ```sh
-go test -race ./...                 # 单元测试和进程内集成测试（不需要 root）
-sudo tests/e2e-netns.sh             # 端到端测试：网络命名空间里跑 Caddy 和原版 masque-client
+go test -race ./...                 # unit tests and in-process integration tests (no root needed)
+sudo tests/e2e-netns.sh             # end-to-end tests: Caddy and the original masque-client in network namespaces
 ```
 
-进程内测试在测试进程里启动真的 Caddy（TUN 设备换成假的），用 Go 写的小客户端
-走 HTTP/3、HTTP/2、HTTP/1.1 做 CONNECT-IP：收发数据包、伪装成网站的拒绝、重载（含失败的重载）、删用户、新屏蔽、空闲超时等。
+The in-process tests start a real Caddy inside the test process (with a fake TUN device) and use a small client written
+in Go to do CONNECT-IP over HTTP/3, HTTP/2 and HTTP/1.1: sending and receiving packets, refusals that look like the
+website, reloads (including failed ones), removed users, new blocks, idle timeouts and more.
 
-端到端测试需要 masque-vpn 的客户端（默认找 `../masque-vpn/target/debug/masque-client`，
-或用 `CLIENT_BIN=` 指定），覆盖：三种传输方式、UDP 被封时回退到 TCP、限定范围的请求
-（含服务器解析域名）、证书和用户的重载、服务器崩溃和重启、客户端互访、SOCKS 模式、
-局域网网关模式、地址复用时清理连接跟踪、带校验的大文件传输（HTTP/3 下载 300 MB、上传 100 MB，
-HTTP/2 和 HTTP/1.1 各 100 MB / 50 MB）、差网络（见下）、MTU 1300 的窄路径等。
+The end-to-end tests need the masque-vpn client (by default `../masque-vpn/target/debug/masque-client`, or set with
+`CLIENT_BIN=`) and cover: the three transports, falling back to TCP when UDP is blocked, scoped requests (including
+domain names the server resolves), reloading certificates and users, server crashes and restarts, client-to-client
+traffic, SOCKS mode, LAN gateway mode, clearing connection tracking when addresses are reused, large file transfers with
+checksums (300 MB download and 100 MB upload over HTTP/3, 100 MB / 50 MB each over HTTP/2 and HTTP/1.1), bad networks
+(see below), a narrow path with an MTU of 1300, and more.
 
-### 差网络下的表现
+### Behaviour on bad networks
 
-内核没有 netem 时，测试用 `tests/netsim` 在路由器里造一条慢链路（TUN 设备上的用户态 netem：
-按包加延迟和抖动、随机丢包，保持包序），再用 tbf 限速：120 ms RTT、1% 和 5% 丢包、4 Mbit/s 带宽、
-20 秒和 70 秒断网。结果：
+When the kernel has no netem, the tests use `tests/netsim` to make a slow link in the router (a user-space netem on a TUN
+device: per-packet delay and jitter, random loss, packet order kept), rate-limited with tbf: 120 ms RTT, 1% and 5% loss,
+4 Mbit/s bandwidth, and 20-second and 70-second outages. Results:
 
-- 隧道在这些条件下都能正常收发、校验通过；20 秒断网后 QUIC 连接自己恢复、不重连；
-  70 秒断网超过空闲超时，客户端自动重连，服务端清理掉死会话。
-- **随机丢包下 HTTP/3 隧道的吞吐量远低于 HTTP/2 隧道。** 120 ms RTT、1% 丢包时，HTTP/3 隧道下载 1.7 Mbit/s、
-  隧道内 UDP 约 7 Mbit/s；HTTP/2 隧道下载 13 Mbit/s、隧道内 UDP 约 19 Mbit/s。对照实验（同一条链路，不经过隧道）：
-  Linux TCP 约 70 Mbit/s，quic-go 的流和 datagram 都只有 2 Mbit/s 左右；无丢包时两者都是几百 Mbit/s。
-  这是 quic-go 拥塞控制对随机丢包的反应方式决定的，不是本模块能改的；Rust 服务端（quinn）类似。
-  **在丢包明显的网络上，客户端配置 `transport = "h2"` 会快得多。**
-- 带宽受限时，服务端队列里等待超过 200 ms 的包会被丢掉，不会积压出几秒的延迟。
-- 路径 MTU 只有 1300 时，HTTP/3 建不起来（两端都把 QUIC Initial 包填充到约 1400 字节，
-  这是 RFC 9484 §7.2 保证 IPv6 1280 字节包能通过的办法），客户端回退到 HTTP/2，大文件传输正常。
+- The tunnel sends and receives normally under all these conditions, and the checksums match; after a 20-second outage
+  the QUIC connection recovers by itself without reconnecting; a 70-second outage is longer than the idle timeout, the
+  client reconnects automatically, and the server cleans up the dead session.
+- **Under random loss, HTTP/3 tunnels have much lower throughput than HTTP/2 tunnels.** At 120 ms RTT and 1% loss, an
+  HTTP/3 tunnel downloads at 1.7 Mbit/s, with about 7 Mbit/s of UDP inside the tunnel; an HTTP/2 tunnel downloads at
+  13 Mbit/s, with about 19 Mbit/s of UDP inside the tunnel. For comparison (same link, no tunnel): Linux TCP gets about
+  70 Mbit/s, while quic-go streams and datagrams both get only about 2 Mbit/s; without loss both get hundreds of Mbit/s.
+  This comes from how quic-go's congestion control reacts to random loss and is not something this module can change;
+  the Rust server (quinn) is similar.
+  **On networks with noticeable loss, `transport = "h2"` in the client configuration is much faster.**
+- When bandwidth is limited, packets that have waited in the server's queue for more than 200 ms are dropped, so seconds
+  of delay do not build up.
+- When the path MTU is only 1300, HTTP/3 cannot be set up (both ends pad QUIC Initial packets to about 1400 bytes,
+  which is how RFC 9484 §7.2 ensures that 1280-byte IPv6 packets get through), the client falls back to HTTP/2, and
+  large file transfers work normally.
 
-GitHub Actions 对每次推送到 main 和每个 PR 跑单元测试，另有 `govulncheck`（每周一次，也在每次推送和 PR 上跑）检查依赖和标准库的已知漏洞，
-Dependabot 每周发依赖和 Actions 的更新 PR，发布的压缩包带有 build provenance 证明（`gh attestation verify 文件 --repo ArcCal/caddy-masque`）；仓库设置了 `MASQUE_VPN_TOKEN`（能读 masque-vpn 的令牌）时也跑端到端测试。
+GitHub Actions runs the unit tests on every push to main and on every PR, plus `govulncheck` (weekly, and also on every
+push and PR) to check dependencies and the standard library for known vulnerabilities. Dependabot sends weekly PRs with
+dependency and Actions updates, and release archives carry build provenance attestations
+(`gh attestation verify FILE --repo ArcCal/caddy-masque`). When the repository has `MASQUE_VPN_TOKEN` set (a token that
+can read masque-vpn), the end-to-end tests run too.
 
-## 许可证
+## License
 
-MIT 或 Apache-2.0，与 masque-vpn 相同。
+MIT or Apache-2.0, the same as masque-vpn.
