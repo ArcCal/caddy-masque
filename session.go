@@ -69,6 +69,60 @@ type session struct {
 	probeID    uint16
 	probeReply chan struct{}
 	probeOnce  sync.Once
+	frags      fragments
+}
+
+// fragments remembers the upper-layer protocol of the first fragments of
+// the client's IPv6 packets, for scoping their later fragments; at most
+// maxFragments packets, each for as long as reassembly may take.
+type fragments struct {
+	mu sync.Mutex
+	m  map[fragmentKey]fragment
+}
+
+type fragmentKey struct {
+	src, dst netip.Addr
+	id       uint32
+}
+
+type fragment struct {
+	protocol uint8
+	at       time.Time
+}
+
+const (
+	maxFragments     = 64
+	fragmentLifetime = 60 * time.Second // RFC 8200 §4.5
+)
+
+func (f *fragments) note(h ip.Header) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := time.Now()
+	if f.m == nil {
+		f.m = map[fragmentKey]fragment{}
+	}
+	if len(f.m) >= maxFragments {
+		for k, v := range f.m {
+			if now.Sub(v.at) > fragmentLifetime {
+				delete(f.m, k)
+			}
+		}
+		if len(f.m) >= maxFragments {
+			return
+		}
+	}
+	f.m[fragmentKey{h.Src, h.Dst, h.FragmentID}] = fragment{h.Protocol, now}
+}
+
+func (f *fragments) protocol(h ip.Header) (uint8, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.m[fragmentKey{h.Src, h.Dst, h.FragmentID}]
+	if !ok || time.Since(v.at) > fragmentLifetime {
+		return 0, false
+	}
+	return v.protocol, true
 }
 
 func newSession(c *core, l *lease, sc scope, tun tunnel, log *zap.Logger) *session {
@@ -358,6 +412,20 @@ func (s *session) clientPacket(payload []byte) error {
 	}
 	if s.isProbeReply(pkt, h) {
 		return nil
+	}
+	if h.Fragment && s.scope.protocol != 0 {
+		// A later IPv6 fragment may not show its upper-layer protocol: it
+		// is the first fragment's (RFC 9484 §4.8). Unknown, it is dropped.
+		if h.FirstFragment {
+			s.frags.note(h)
+		} else if h.ProtocolUnknown {
+			p, ok := s.frags.protocol(h)
+			if !ok {
+				s.stats.dropped.Add(1)
+				return nil
+			}
+			h.Protocol = p
+		}
 	}
 	if !s.current.Load().allows(h) {
 		s.stats.dropped.Add(1)
