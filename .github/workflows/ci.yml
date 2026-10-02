@@ -30,7 +30,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           # The newest patch release of the line go.mod asks for: it carries the
           # standard library security fixes (go.mod says 1.26.0, the first release).
@@ -65,7 +65,7 @@ jobs:
           repository: ArcCal/masque-vpn
           token: ${{ secrets.MASQUE_VPN_TOKEN }}
           path: masque-vpn
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         if: env.HAVE_CLIENT == 'true'
         with:
           # The newest patch release of the line go.mod asks for: it carries the
@@ -105,7 +105,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           # The newest patch release of the line go.mod asks for: it carries the
           # standard library security fixes (go.mod says 1.26.0, the first release).
