@@ -42,6 +42,7 @@ func TestCaddyfileGlobalOption(t *testing.T) {
 		block fc00::/7
 		allow_client_to_client
 		http3 off
+		mtu_probe off
 		user alice `+testHash+`
 		user bob `+testHash+`
 	}`)
@@ -49,7 +50,7 @@ func TestCaddyfileGlobalOption(t *testing.T) {
 		t.Fatal(err)
 	}
 	if app.Interface != "vpn0" || app.IPv4 != "10.9.0.1/24" || app.IPv6 != "fd09::1/64" || app.MTU != 1400 ||
-		*app.ManageNetwork || *app.HTTP3 || !app.AllowClientToClient || len(app.Users) != 2 ||
+		*app.ManageNetwork || *app.HTTP3 || *app.MTUProbe || !app.AllowClientToClient || len(app.Users) != 2 ||
 		app.Users[1].Name != "bob" || app.Users[1].PasswordHash != testHash ||
 		strings.Join(*app.BlockedDestinations, " ") != "10.0.0.0/8 192.168.0.0/16 fc00::/7" {
 		t.Errorf("parsed %+v", app)
@@ -63,7 +64,7 @@ func TestCaddyfileGlobalOption(t *testing.T) {
 		t.Errorf("block none: %v %v", app, err)
 	}
 	app, err = parseGlobal(t, "masque {\n ipv4 10.9.0.1/24\n}")
-	if err != nil || app.BlockedDestinations != nil || app.ManageNetwork != nil || app.HTTP3 != nil {
+	if err != nil || app.BlockedDestinations != nil || app.ManageNetwork != nil || app.HTTP3 != nil || app.MTUProbe != nil {
 		t.Errorf("defaults: %+v %v", app, err)
 	}
 }
@@ -78,6 +79,7 @@ func TestCaddyfileGlobalOptionErrors(t *testing.T) {
 		"masque {\n mtu big\n}",
 		"masque {\n manage_network maybe\n}",
 		"masque {\n http3\n}",
+		"masque {\n mtu_probe sometimes\n}",
 		"masque {\n allow_client_to_client yes\n}",
 		"masque {\n block\n}",
 		"masque {\n user alice\n}",

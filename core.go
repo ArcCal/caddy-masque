@@ -108,8 +108,10 @@ type core struct {
 	auth *auth.Authenticator
 	// Destinations any client may reach; scoped requests narrow it.
 	allowed atomic.Pointer[routes.Set]
-	gw4     netip.Addr
-	gw6     netip.Addr
+	// The configuration turned the IPv6 MTU probe off.
+	noMTUProbe atomic.Bool
+	gw4        netip.Addr
+	gw6        netip.Addr
 
 	// Lock order: sessMu, then poolMu.
 	sessMu   sync.RWMutex
@@ -320,6 +322,7 @@ func (c *core) deactivate(a *App) {
 
 func (c *core) apply(a *App) {
 	c.setAllowed(a.allowed)
+	c.noMTUProbe.Store(a.MTUProbe != nil && !*a.MTUProbe)
 	c.setUsers(a.users)
 }
 

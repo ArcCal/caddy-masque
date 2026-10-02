@@ -204,3 +204,30 @@ func TestNoErrorsAboutErrorsOrMulticast(t *testing.T) {
 		t.Error("broadcast")
 	}
 }
+
+func TestICMPv6Echo(t *testing.T) {
+	src, dst := addr("fd89::1"), addr("fd89::2")
+	req := EchoV6(EchoRequestV6, src, dst, 0x1234, 7, IPv6MinMTU-48)
+	h, ok := Parse(req)
+	if !ok || len(req) != IPv6MinMTU || h.Src != src || h.Dst != dst || h.Protocol != ProtoICMPv6 {
+		t.Fatalf("request: %+v, %d bytes", h, len(req))
+	}
+	valid := func(p []byte, h Header) bool {
+		return Checksum(pseudoHeader(h.Src, h.Dst, h.TotalLen-40, ProtoICMPv6), p[40:h.TotalLen]) == 0
+	}
+	if typ, id, ok := Echo(req, h); !ok || typ != EchoRequestV6 || id != 0x1234 || !valid(req, h) {
+		t.Errorf("request: %d %#x %v", typ, id, ok)
+	}
+	req[100] = 0xab // data is echoed back
+	binary.BigEndian.PutUint16(req[42:44], 0)
+	binary.BigEndian.PutUint16(req[42:44], Checksum(pseudoHeader(src, dst, len(req)-40, ProtoICMPv6), req[40:]))
+	reply := EchoReply(req)
+	rh, ok := Parse(reply)
+	if typ, id, ok2 := Echo(reply, rh); !ok || !ok2 || typ != EchoReplyV6 || id != 0x1234 || rh.Src != dst || rh.Dst != src ||
+		reply[47] != 7 || reply[100] != 0xab || !valid(reply, rh) {
+		t.Errorf("reply: %+v % x", rh, reply[40:48])
+	}
+	if EchoReply(reply) != nil {
+		t.Error("a reply was answered")
+	}
+}

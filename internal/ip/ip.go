@@ -325,6 +325,57 @@ func icmpv6Error(original []byte, h Header, from netip.Addr, typ, code byte, res
 	return out
 }
 
+// ICMPv6 Echo Request and Echo Reply types (RFC 4443 §4).
+const (
+	EchoRequestV6 = 128
+	EchoReplyV6   = 129
+)
+
+// EchoV6 is an ICMPv6 Echo message (RFC 4443 §4) from src to dst with the
+// identifier, sequence number and n bytes of data.
+func EchoV6(typ byte, src, dst netip.Addr, id, seq uint16, n int) []byte {
+	icmpLen := 8 + n
+	out := make([]byte, 40+icmpLen)
+	out[0] = 0x60
+	binary.BigEndian.PutUint16(out[4:6], uint16(icmpLen))
+	out[6], out[7] = ProtoICMPv6, 64
+	copy(out[8:24], src.AsSlice())
+	copy(out[24:40], dst.AsSlice())
+	out[40] = typ
+	binary.BigEndian.PutUint16(out[44:46], id)
+	binary.BigEndian.PutUint16(out[46:48], seq)
+	binary.BigEndian.PutUint16(out[42:44], Checksum(pseudoHeader(src, dst, icmpLen, ProtoICMPv6), out[40:]))
+	return out
+}
+
+// Echo returns the type and identifier of an ICMPv6 Echo message, p
+// parsed as h.
+func Echo(p []byte, h Header) (typ byte, id uint16, ok bool) {
+	if h.IsIPv4() || h.Protocol != ProtoICMPv6 || h.PayloadOffset < 0 || h.PayloadOffset+8 > h.TotalLen {
+		return 0, 0, false
+	}
+	icmp := p[h.PayloadOffset:]
+	if icmp[0] != EchoRequestV6 && icmp[0] != EchoReplyV6 || icmp[1] != 0 {
+		return 0, 0, false
+	}
+	return icmp[0], binary.BigEndian.Uint16(icmp[4:6]), true
+}
+
+// EchoReply answers an ICMPv6 Echo Request as an IPv6 node does (RFC 4443
+// §4.2), or returns nil.
+func EchoReply(request []byte) []byte {
+	h, ok := Parse(request)
+	if typ, _, ok2 := Echo(request, h); !ok || !ok2 || typ != EchoRequestV6 {
+		return nil
+	}
+	icmp := request[h.PayloadOffset:h.TotalLen]
+	reply := EchoV6(EchoReplyV6, h.Dst, h.Src, binary.BigEndian.Uint16(icmp[4:6]), binary.BigEndian.Uint16(icmp[6:8]), len(icmp)-8)
+	copy(reply[48:], icmp[8:])
+	binary.BigEndian.PutUint16(reply[42:44], 0)
+	binary.BigEndian.PutUint16(reply[42:44], Checksum(pseudoHeader(h.Dst, h.Src, len(icmp), ProtoICMPv6), reply[40:]))
+	return reply
+}
+
 // pseudoHeader is the IPv6 pseudo-header for upper-layer checksums (RFC
 // 8200 §8.1).
 func pseudoHeader(src, dst netip.Addr, upperLen int, next byte) []byte {

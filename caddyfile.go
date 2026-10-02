@@ -28,6 +28,7 @@ func init() {
 //	    block                  <prefix...>|none
 //	    allow_client_to_client
 //	    http3                  on|off
+//	    mtu_probe              on|off
 //	    user                   <name> <argon2id hash>
 //	}
 func parseGlobalOption(d *caddyfile.Dispenser, existing any) (any, error) {
@@ -89,6 +90,8 @@ func parseGlobalOption(d *caddyfile.Dispenser, existing any) (any, error) {
 			app.ManageNetwork, err = onOff()
 		case "http3":
 			app.HTTP3, err = onOff()
+		case "mtu_probe":
+			app.MTUProbe, err = onOff()
 		case "allow_client_to_client":
 			if d.NextArg() {
 				return nil, d.ArgErr()
