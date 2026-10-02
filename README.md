@@ -86,7 +86,7 @@ for the web pages). It is ordered automatically before `file_server`, `reverse_p
 | `allow_host_access` | Let clients reach services on the server itself (ports listening on the tunnel address and the server's public addresses) | Ping only |
 | `max_sessions COUNT` | The most tunnels one user may have at once; `unlimited` for no limit | 8 |
 | `manage_network off` | Leave forwarding and NAT (sysctl, nftables) alone; manage them yourself | Managed automatically |
-| `http3 off` | Do not take over HTTP/3 (see below); the VPN uses only HTTP/2 and HTTP/1.1 | Taken over |
+| `http3 off` | Do not take over HTTP/3 (see below); VPN packets then travel inside the stream (DATAGRAM capsules) on every HTTP version | Taken over |
 | `mtu_probe off` | Skip the IPv6 MTU probe (see below). Turn it off only when you know every client connects directly, with no HTTP proxy in between | Probe |
 
 Once an HTTP/3 tunnel (QUIC datagrams) with IPv6 is up, the server sends a 1280-byte ICMPv6 Echo Request to the
@@ -252,7 +252,8 @@ Caddy obtains by itself need nothing.
 
 ## How it fits with Caddy (technical details)
 
-- **HTTP/3**: Caddy's own HTTP/3 has HTTP Datagrams turned off, so CONNECT-IP cannot work over it.
+- **HTTP/3**: Caddy's own HTTP/3 has HTTP Datagrams turned off, so CONNECT-IP over it can only carry packets in
+  DATAGRAM capsules on the request stream (RFC 9297 §2.1.1, §3.5), which suffer TCP-like head-of-line blocking.
   This module therefore takes over the UDP port of HTTPS sites and serves HTTP/3 (with Datagrams) with the same
   certificates and the same site routes, and sends `Alt-Svc` headers the way Caddy does. Ordinary web requests over
   HTTP/3 are still handled by Caddy's routes. `http3 off` gives HTTP/3 back to Caddy.
