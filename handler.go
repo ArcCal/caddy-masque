@@ -132,13 +132,30 @@ type rejection struct {
 	// Proxy error type (RFC 9209 §2.3) for a Proxy-Status field, which RFC
 	// 9484 §4.1 asks for when resolving the target fails.
 	proxyError string
+	// The request is malformed, not only refused.
+	malformed bool
 }
 
-func (h *Handler) reject(w http.ResponseWriter, rej rejection) error {
+// malformed answers a malformed request: 400, then for HTTP/3 the stream
+// error H3_MESSAGE_ERROR (RFC 9114 §4.1.2), sent with STOP_SENDING so that
+// the response still arrives. The HTTP/2 server gives handlers no way to
+// reset a stream with PROTOCOL_ERROR (RFC 9113 §8.1.1); the response alone
+// tells the client the request failed (RFC 9484 §4.5).
+var malformed = rejection{status: http.StatusBadRequest, malformed: true}
+
+func (h *Handler) reject(w http.ResponseWriter, r *http.Request, rej rejection) error {
 	if rej.proxyError != "" {
 		w.Header().Set("Proxy-Status", "caddy-masque; error="+rej.proxyError)
 	}
 	w.WriteHeader(rej.status)
+	if rej.malformed && r.ProtoMajor == 3 {
+		_ = http.NewResponseController(w).Flush()
+		if s, ok := unwrapStreamer(w); ok {
+			str := s.HTTPStream()
+			str.CancelRead(h3MessageError)
+			_ = str.Close()
+		}
+	}
 	return nil
 }
 
@@ -165,7 +182,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if errors.Is(err, auth.ErrBusy) {
 		// Like any web server under more load than it can take; whether the
 		// credentials were valid is not known.
-		return h.reject(w, rejection{status: http.StatusServiceUnavailable})
+		return h.reject(w, r, rejection{status: http.StatusServiceUnavailable})
 	}
 	if err != nil {
 		return nil // the request was cancelled
@@ -188,20 +205,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	log := h.log.With(zap.String("user", user.Name), zap.String("remote", remote), zap.String("transport", req.transport))
 	rejectLogged := func(rej rejection) error {
 		log.Info("rejected request", zap.Int("status", rej.status), zap.String("error", rej.proxyError))
-		return h.reject(w, rej)
+		return h.reject(w, r, rej)
 	}
 	// The recognized upgrade or extended CONNECT selects the Capsule
 	// Protocol, so the Capsule-Protocol header is not required (RFC 9297
 	// §3.4 only recommends it); content header fields make the request
 	// malformed (§3.2).
 	if !req.wellFormed || carriesContent(r) {
-		return rejectLogged(rejection{status: http.StatusBadRequest})
+		return rejectLogged(malformed)
 	}
 	// A variable of the template missing, or not percent-encoded UTF-8,
 	// makes the request malformed (RFC 9484 §4.1).
 	for _, name := range []string{"target", "ipproto"} {
 		if _, has := vars[name]; h.tpl.HasVariable(name) && !has {
-			return rejectLogged(rejection{status: http.StatusBadRequest})
+			return rejectLogged(malformed)
 		}
 	}
 	value := func(name string) string {
@@ -210,10 +227,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 		return "*"
 	}
+	// Values that do not meet RFC 9484 §4.6 make it malformed too (§4.1).
 	target, err1 := proto.ParseTarget(value("target"))
 	ipproto, err2 := proto.ParseIPProtocol(value("ipproto"))
 	if err1 != nil || err2 != nil {
-		return rejectLogged(rejection{status: http.StatusBadRequest})
+		return rejectLogged(malformed)
 	}
 	sc, rej := h.resolveScope(r.Context(), target, ipproto)
 	if rej != nil {

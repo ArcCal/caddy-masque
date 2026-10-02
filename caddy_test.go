@@ -229,13 +229,15 @@ const anyTarget = "/.well-known/masque/ip/*/*/"
 
 // tunnelClient is the client's side of a CONNECT-IP stream.
 type tunnelClient struct {
-	status  int
-	header  http.Header
-	body    string // of a refusal
-	capsule func() (proto.Capsule, error)
-	send    func(pkt []byte) error // an IP packet, with context ID 0
-	recv    func() ([]byte, error) // an IP packet
-	close   func()
+	status int
+	header http.Header
+	body   string // of a refusal
+	// HTTP/3 refusals: the error code of the server's STOP_SENDING.
+	stopSending quic.StreamErrorCode
+	capsule     func() (proto.Capsule, error)
+	send        func(pkt []byte) error // an IP packet, with context ID 0
+	recv        func() ([]byte, error) // an IP packet
+	close       func()
 }
 
 func authorization(password string) string { return auth.BasicAuthorization("alice", password) }
@@ -277,6 +279,14 @@ func (e *caddyEnv) dialH3(t *testing.T, password, path string) *tunnelClient {
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Capsule-Protocol") == "" {
 		b, _ := io.ReadAll(resp.Body)
 		c.body = string(b)
+		// Write until the server's STOP_SENDING arrives.
+		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			var se *quic.StreamError
+			if _, err := str.Write([]byte{0}); errors.As(err, &se) {
+				c.stopSending = se.ErrorCode
+				break
+			}
+		}
 		c.close()
 		return c
 	}
@@ -486,18 +496,25 @@ func TestCaddyRefusalsLookLikeTheSite(t *testing.T) {
 			}
 		}
 		// Authenticated, but blocked or malformed: status codes for users.
+		// Only a malformed request is a stream error too: H3_MESSAGE_ERROR
+		// in HTTP/3 (RFC 9114 §4.1.2), else H3_NO_ERROR.
+		const noError, messageError = 0x100, h3MessageError
 		for _, c := range []struct {
 			path   string
 			status int
+			stop   quic.StreamErrorCode
 		}{
-			{"/.well-known/masque/ip/192.168.0.0%2F16/*/", http.StatusForbidden},
-			{"/.well-known/masque/ip/*/0/", http.StatusBadRequest},
-			{"/.well-known/masque/ip/not%20a%20name/*/", http.StatusBadRequest},
-			{"/.well-known/masque/ip/name.invalid/*/", http.StatusBadGateway},
+			{"/.well-known/masque/ip/192.168.0.0%2F16/*/", http.StatusForbidden, noError},
+			{"/.well-known/masque/ip/*/0/", http.StatusBadRequest, noError}, // refused by policy (RFC 9484 §4.8)
+			{"/.well-known/masque/ip/not%20a%20name/*/", http.StatusBadRequest, messageError},
+			{"/.well-known/masque/ip/name.invalid/*/", http.StatusBadGateway, noError},
 		} {
 			got := tr.dial(e, t, testPassword, c.path)
 			if got.status != c.status {
 				t.Errorf("%s %s: %d, want %d", tr.name, c.path, got.status, c.status)
+			}
+			if tr.name == "HTTP/3" && got.stopSending != c.stop {
+				t.Errorf("HTTP/3 %s: STOP_SENDING %#x, want %#x", c.path, got.stopSending, c.stop)
 			}
 			if c.status == http.StatusBadGateway && !strings.Contains(got.header.Get("Proxy-Status"), "error=dns_") {
 				t.Errorf("%s: Proxy-Status %q", tr.name, got.header.Get("Proxy-Status"))
@@ -564,8 +581,12 @@ func TestCaddyBadlyEncodedVariablesAreMalformed(t *testing.T) {
 		t.Helper()
 		for _, tr := range transports {
 			for _, path := range paths {
-				if got := tr.dial(e, t, testPassword, path); got.status != http.StatusBadRequest {
+				got := tr.dial(e, t, testPassword, path)
+				if got.status != http.StatusBadRequest {
 					t.Errorf("%s %s: %d, want 400", tr.name, path, got.status)
+				}
+				if tr.name == "HTTP/3" && got.stopSending != h3MessageError {
+					t.Errorf("HTTP/3 %s: STOP_SENDING %#x, want H3_MESSAGE_ERROR", path, got.stopSending)
 				}
 				// Without the password, the site as for any other request.
 				if got := tr.dial(e, t, "wrong password!!", path); got.status != http.StatusOK || got.body != "cover page" {
