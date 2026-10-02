@@ -123,6 +123,8 @@ type caddyEnv struct {
 	storage string
 	// Extra settings of the HTTP server.
 	server map[string]any
+	// Extra settings of the masque handler.
+	handler map[string]any
 }
 
 // newCaddyEnv replaces the host network with a fake device and stops
@@ -156,7 +158,7 @@ func (e *caddyEnv) config(masque map[string]any) []byte {
 				"tls_connection_policies": []any{map[string]any{}},
 				"automatic_https":         map[string]any{"disable": true},
 				"routes": []any{map[string]any{"handle": []any{
-					map[string]any{"handler": "masque"},
+					e.handlerConfig(),
 					map[string]any{"handler": "static_response", "status_code": 200, "body": "cover page"},
 				}}},
 			})}},
@@ -167,6 +169,14 @@ func (e *caddyEnv) config(masque map[string]any) []byte {
 		e.t.Fatal(err)
 	}
 	return b
+}
+
+func (e *caddyEnv) handlerConfig() map[string]any {
+	h := map[string]any{"handler": "masque"}
+	for k, v := range e.handler {
+		h[k] = v
+	}
+	return h
 }
 
 func (e *caddyEnv) serverConfig(srv map[string]any) map[string]any {
@@ -493,6 +503,44 @@ func TestCaddyRefusalsLookLikeTheSite(t *testing.T) {
 				t.Errorf("%s: Proxy-Status %q", tr.name, got.header.Get("Proxy-Status"))
 			}
 		}
+	}
+}
+
+// A variable of the template that is not percent-encoded UTF-8 makes an
+// authenticated request malformed (RFC 9484 §4.1), in the path as in the
+// query. (A path that is not percent-encoding at all, such as %ZZ, the HTTP
+// servers refuse before any handler.)
+func TestCaddyBadlyEncodedVariablesAreMalformed(t *testing.T) {
+	e := newCaddyEnv(t)
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	check := func(paths []string) {
+		t.Helper()
+		for _, tr := range transports {
+			for _, path := range paths {
+				if got := tr.dial(e, t, testPassword, path); got.status != http.StatusBadRequest {
+					t.Errorf("%s %s: %d, want 400", tr.name, path, got.status)
+				}
+				// Without the password, the site as for any other request.
+				if got := tr.dial(e, t, "wrong password!!", path); got.status != http.StatusOK || got.body != "cover page" {
+					t.Errorf("%s %s without the password: %d %q", tr.name, path, got.status, got.body)
+				}
+			}
+		}
+	}
+	check([]string{"/.well-known/masque/ip/%FF/*/", "/.well-known/masque/ip/*/%FF/"})
+	e.handler = map[string]any{"template": "/masque/ip{?target,ipproto}"}
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	check([]string{"/masque/ip?target=%ZZ&ipproto=17", "/masque/ip?target=%FF&ipproto=17", "/masque/ip?target=*&ipproto=1%"})
+	for _, tr := range transports {
+		c := tr.dial(e, t, testPassword, "/masque/ip?target=*&ipproto=*&utm=%ZZ")
+		if c.status != tr.ok {
+			t.Errorf("%s: %d with a badly encoded unrelated parameter", tr.name, c.status)
+		}
+		c.close()
 	}
 }
 

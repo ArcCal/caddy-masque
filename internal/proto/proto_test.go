@@ -351,17 +351,24 @@ func TestMatch(t *testing.T) {
 	if m, ok := q.Match("/masque/ip"); !ok || len(m) != 0 {
 		t.Error("variables are optional")
 	}
-	// A variable badly percent-encoded (or not UTF-8) does not match, in
-	// the query as in the path; other parameters do not matter.
-	for _, path := range []string{"/masque/ip?target=%ZZ&ipproto=17", "/masque/ip?target=%FF&ipproto=17",
-		"/masque/ip?target=*&ipproto=1%"} {
-		if m, ok := q.Match(path); ok {
-			t.Errorf("%s matched: %v", path, m)
+	// A variable not percent-encoded UTF-8 is left out, in the query as in
+	// the path: the request is for the resource but malformed (RFC 9484
+	// §4.1), which the handler answers. Other parameters do not matter.
+	for path, bad := range map[string]string{
+		"/masque/ip?target=%ZZ&ipproto=17":         "target",
+		"/masque/ip?target=%FF&ipproto=17":         "target",
+		"/masque/ip?target=*&ipproto=1%":           "ipproto",
+		"/masque/ip?target=%ZZ&target=*&ipproto=6": "target", // the first one counts
+	} {
+		m, ok := q.Match(path)
+		if _, has := m[bad]; !ok || has || len(m) != 1 {
+			t.Errorf("%s: %v %v", path, m, ok)
 		}
 	}
-	for _, path := range []string{"/.well-known/masque/ip/%ZZ/*/", "/.well-known/masque/ip/*/%FF/"} {
-		if m, ok := d.Match(path); ok {
-			t.Errorf("%s matched: %v", path, m)
+	for path, bad := range map[string]string{"/.well-known/masque/ip/%ZZ/*/": "target", "/.well-known/masque/ip/*/%FF/": "ipproto"} {
+		m, ok := d.Match(path)
+		if _, has := m[bad]; !ok || has || len(m) != 1 {
+			t.Errorf("%s: %v %v", path, m, ok)
 		}
 	}
 	if m, ok := q.Match("/masque/ip?target=*&utm=%ZZ&%ZZ=1&ipproto=17"); !ok || m["target"] != "*" || m["ipproto"] != "17" {
