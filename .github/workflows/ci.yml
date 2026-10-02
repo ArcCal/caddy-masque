@@ -26,7 +26,7 @@ jobs:
     name: test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
@@ -53,12 +53,12 @@ jobs:
       - name: Skipped without MASQUE_VPN_TOKEN
         if: env.HAVE_CLIENT != 'true'
         run: echo "::notice::the end-to-end test needs the MASQUE_VPN_TOKEN secret to fetch masque-vpn's client"
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: env.HAVE_CLIENT == 'true'
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: env.HAVE_CLIENT == 'true'
         with:
           persist-credentials: false
@@ -101,7 +101,7 @@ jobs:
           - { os: linux, arch: arm64 }
           - { os: darwin, arch: arm64 }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
