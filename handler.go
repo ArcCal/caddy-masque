@@ -191,6 +191,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if !req.wellFormed || carriesContent(r) {
 		return rejectLogged(rejection{status: http.StatusBadRequest})
 	}
+	// A variable of the template missing, or not percent-encoded UTF-8,
+	// makes the request malformed (RFC 9484 §4.1).
 	for _, name := range []string{"target", "ipproto"} {
 		if _, has := vars[name]; h.tpl.HasVariable(name) && !has {
 			return rejectLogged(rejection{status: http.StatusBadRequest})
