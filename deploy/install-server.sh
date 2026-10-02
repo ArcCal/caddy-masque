@@ -38,7 +38,7 @@ esac
 say "安装系统软件"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q curl ca-certificates nftables iproute2 dnsutils
+apt-get install -y -q curl ca-certificates nftables iproute2 dnsutils jq
 
 say "检查域名 $DOMAIN 是否指向这台服务器"
 PUBLIC_IP=$(curl -4 -fsS --max-time 10 https://api.ipify.org || curl -4 -fsS --max-time 10 https://ip.sb || true)
@@ -59,10 +59,19 @@ if ! go version 2>/dev/null | grep -q "go$GO_VERSION"; then
         aarch64) GOARCH=arm64 ;;
         *) die "不支持的 CPU：$(uname -m)" ;;
     esac
-    curl -fsSL "https://go.dev/dl/go$GO_VERSION.linux-$GOARCH.tar.gz" -o /tmp/go.tar.gz || die "下载 Go 失败"
+    GO_FILE="go$GO_VERSION.linux-$GOARCH.tar.gz"
+    # A directory of our own: nobody else can put a file in its place.
+    GO_TMP=$(mktemp -d)
+    curl -fsSL "https://go.dev/dl/$GO_FILE" -o "$GO_TMP/$GO_FILE" || die "下载 Go 失败"
+    # The SHA-256 from the official release list.
+    GO_SHA256=$(curl -fsSL --max-time 60 'https://go.dev/dl/?mode=json&include=all' |
+        jq -r --arg f "$GO_FILE" 'first(.[].files[] | select(.filename == $f) | .sha256) // empty') ||
+        die "取不到 Go 的官方校验值"
+    [ -n "$GO_SHA256" ] || die "Go 的官方发布列表里没有 $GO_FILE"
+    echo "$GO_SHA256  $GO_TMP/$GO_FILE" | sha256sum -c --quiet - || die "Go 安装包的 SHA-256 不对，没有安装"
     rm -rf /usr/local/go
-    tar -C /usr/local -xzf /tmp/go.tar.gz
-    rm -f /tmp/go.tar.gz
+    tar -C /usr/local -xzf "$GO_TMP/$GO_FILE"
+    rm -rf "$GO_TMP"
 fi
 go version
 
