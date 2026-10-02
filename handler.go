@@ -364,6 +364,10 @@ func isTimeout(err error) bool {
 // arrive before its first request.
 const settingsTimeout = 3 * time.Second
 
+// h3DatagramsKey marks requests served by this module's HTTP/3 server,
+// which announces SETTINGS_H3_DATAGRAM.
+type h3DatagramsKey struct{}
+
 // accept sends the successful response and returns the tunnel over the
 // request stream. The tunnel bypasses Caddy's idle-timeout wrappers and
 // clears the server's read and write deadlines: a tunnel lasts as long as
@@ -399,10 +403,13 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 		if !ok {
 			return nil, errors.New("no HTTP/3 stream behind the response writer")
 		}
-		// HTTP Datagrams go in QUIC DATAGRAM frames only if the client
-		// announced support (RFC 9297 §2.1.1); else in DATAGRAM capsules.
+		// HTTP Datagrams go in QUIC DATAGRAM frames only if both sides
+		// announced SETTINGS_H3_DATAGRAM (RFC 9297 §2.1.1): this module's
+		// HTTP/3 server does, Caddy's own does not. Otherwise they go in
+		// DATAGRAM capsules (§3.5).
 		quicDatagrams := false
-		if st, ok := raw.(http3.Settingser); ok {
+		ours, _ := r.Context().Value(h3DatagramsKey{}).(bool)
+		if st, ok := raw.(http3.Settingser); ok && ours {
 			timer := time.NewTimer(settingsTimeout)
 			select {
 			case <-st.ReceivedSettings():
