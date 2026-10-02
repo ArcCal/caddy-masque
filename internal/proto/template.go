@@ -251,16 +251,22 @@ func (t *Template) Match(pathAndQuery string) (map[string]string, bool) {
 	if !matchPath(pathParts, path, out) {
 		return nil, false
 	}
-	type kv struct{ k, v string }
+	type kv struct {
+		k, v string
+		ok   bool // the value is well encoded
+	}
 	var params []kv
 	for _, pair := range strings.Split(query, "&") {
 		if pair == "" {
 			continue
 		}
 		k, v, _ := strings.Cut(pair, "=")
-		dk, _ := decode(k)
-		dv, _ := decode(v)
-		params = append(params, kv{dk, dv})
+		dk, ok := decode(k)
+		if !ok {
+			continue // not a parameter of the template
+		}
+		dv, ok := decode(v)
+		params = append(params, kv{dk, dv, ok})
 	}
 	// Fixed parameters written in the template must be present.
 	for _, pair := range strings.Split(queryLiteral.String(), "&") {
@@ -270,7 +276,7 @@ func (t *Template) Match(pathAndQuery string) (map[string]string, bool) {
 		k, v, _ := strings.Cut(pair, "=")
 		found := false
 		for _, p := range params {
-			if p.k == k && p.v == v {
+			if p.k == k && p.ok && p.v == v {
 				found = true
 				break
 			}
@@ -282,6 +288,10 @@ func (t *Template) Match(pathAndQuery string) (map[string]string, bool) {
 	for _, e := range queryExprs {
 		for _, p := range params {
 			if p.k == e.param {
+				// Like a path, a variable badly encoded does not match.
+				if !p.ok {
+					return nil, false
+				}
 				out[e.variable] = p.v
 				break
 			}

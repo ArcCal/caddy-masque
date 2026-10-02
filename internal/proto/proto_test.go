@@ -351,6 +351,22 @@ func TestMatch(t *testing.T) {
 	if m, ok := q.Match("/masque/ip"); !ok || len(m) != 0 {
 		t.Error("variables are optional")
 	}
+	// A variable badly percent-encoded (or not UTF-8) does not match, in
+	// the query as in the path; other parameters do not matter.
+	for _, path := range []string{"/masque/ip?target=%ZZ&ipproto=17", "/masque/ip?target=%FF&ipproto=17",
+		"/masque/ip?target=*&ipproto=1%"} {
+		if m, ok := q.Match(path); ok {
+			t.Errorf("%s matched: %v", path, m)
+		}
+	}
+	for _, path := range []string{"/.well-known/masque/ip/%ZZ/*/", "/.well-known/masque/ip/*/%FF/"} {
+		if m, ok := d.Match(path); ok {
+			t.Errorf("%s matched: %v", path, m)
+		}
+	}
+	if m, ok := q.Match("/masque/ip?target=*&utm=%ZZ&%ZZ=1&ipproto=17"); !ok || m["target"] != "*" || m["ipproto"] != "17" {
+		t.Errorf("unrelated parameters: %v %v", m, ok)
+	}
 	lit := tpl(t, "https://p.example/masque/ip?t={target}&i={ipproto}")
 	if m, ok := lit.Match("/masque/ip?t=*&i=17"); !ok || m["target"] != "*" || m["ipproto"] != "17" {
 		t.Error(m)
