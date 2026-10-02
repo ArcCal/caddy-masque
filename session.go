@@ -155,6 +155,12 @@ var (
 
 const probeData = ip.IPv6MinMTU - 40 - 8
 
+// dropped counts a packet the session did not forward.
+func (s *session) dropped() {
+	s.stats.dropped.Add(1)
+	s.core.counters.dropped.Add(1)
+}
+
 func (s *session) icmpAllow() bool {
 	s.icmpMu.Lock()
 	defer s.icmpMu.Unlock()
@@ -393,7 +399,7 @@ func (s *session) sendToClientLoop(ctx context.Context) error {
 		select {
 		case q := <-s.lease.handle.toClient:
 			if time.Since(q.at) > maxQueueDelay {
-				s.stats.dropped.Add(1)
+				s.dropped()
 				continue
 			}
 			if err := s.sendToClient(q.pkt); err != nil {
@@ -410,17 +416,17 @@ func (s *session) sendToClientLoop(ctx context.Context) error {
 func (s *session) clientPacket(payload []byte) error {
 	id, pkt, err := proto.SplitContextID(payload)
 	if err != nil || id != proto.ContextIDIPPacket {
-		s.stats.dropped.Add(1) // unknown context ID (§5) or empty datagram
+		s.dropped() // unknown context ID (§5) or empty datagram
 		return nil
 	}
 	h, ok := ip.Parse(pkt)
 	if !ok {
-		s.stats.dropped.Add(1)
+		s.dropped()
 		return nil
 	}
 	if !s.lease.owns(h.Src) {
 		// BCP 38: never forward a source address the client was not given.
-		s.stats.dropped.Add(1)
+		s.dropped()
 		s.log.Debug("dropping packet with spoofed source", zap.Stringer("src", h.Src))
 		return nil
 	}
@@ -435,20 +441,22 @@ func (s *session) clientPacket(payload []byte) error {
 		} else if h.ProtocolUnknown {
 			p, ok := s.frags.protocol(h)
 			if !ok {
-				s.stats.dropped.Add(1)
+				s.dropped()
 				return nil
 			}
 			h.Protocol = p
 		}
 	}
 	if !s.current.Load().allows(h) {
-		s.stats.dropped.Add(1)
+		s.dropped()
 		if e := ip.DestUnreachable(pkt, s.core.gateway(!h.IsIPv4()), ip.AdminProhibited); e != nil && s.icmpAllow() {
 			return s.sendToClient(append([]byte{0}, e...))
 		}
 		return nil
 	}
 	s.stats.fromClient.Add(1)
+	s.core.counters.fromClient.Add(1)
+	s.core.counters.bytesFromClient.Add(uint64(h.TotalLen))
 	s.core.toNetwork(pkt[:h.TotalLen])
 	return nil
 }
@@ -460,6 +468,8 @@ func (s *session) sendToClient(payload []byte) error {
 	switch {
 	case err == nil:
 		s.stats.toClient.Add(1)
+		s.core.counters.toClient.Add(1)
+		s.core.counters.bytesToClient.Add(uint64(len(payload) - 1))
 	case errors.As(err, &tooBig):
 		pkt := payload[1:]
 		v6 := len(pkt) > 0 && pkt[0]>>4 == 6
@@ -480,7 +490,7 @@ func (s *session) sendToClient(payload []byte) error {
 			return nil
 		}
 		// §10.1: drop and report, never fall back to reliable delivery.
-		s.stats.dropped.Add(1)
+		s.dropped()
 		if e := ip.PacketTooBig(pkt, s.core.gateway(v6), mtu); e != nil && s.icmpAllow() {
 			s.core.toNetwork(e)
 		}

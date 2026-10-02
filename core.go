@@ -35,6 +35,15 @@ type queued struct {
 	at  time.Time
 }
 
+// Failed logins from one client address per minute before its requests with
+// credentials stop being checked for a minute.
+var loginFailures = 10
+
+// DefaultMaxSessions is how many sessions one user may have at a time,
+// unless configured: a few devices sharing one user, and the old session of
+// a device that reconnects before the server has noticed its loss.
+const DefaultMaxSessions = 8
+
 // A user who reconnects within this time gets the previous addresses back
 // if they are still free, so connections through the tunnel survive a brief
 // outage; longer gaps get fresh addresses (RFC 9484 §11).
@@ -48,6 +57,8 @@ type tunnelConfig struct {
 	ipv6   netip.Prefix
 	mtu    int
 	manage bool
+	// Clients may reach the host's own services.
+	hostAccess bool
 }
 
 // logLimit lets through at most max events a minute and counts the rest,
@@ -121,7 +132,12 @@ type core struct {
 	recent   map[string]recentLease // by user name, under poolMu
 	nextID   atomic.Uint64
 	// Session handlers that have not returned.
-	running atomic.Int64
+	running  atomic.Int64
+	counters counters
+	// Clients that keep sending wrong credentials.
+	loginLimit *auth.FailureLimiter
+	// Sessions one user may have at a time (0: no limit).
+	maxSessions atomic.Int64
 	// Logging of failed logins and device errors.
 	authLog, deviceLog logLimit
 	// Deletes connection tracking entries (replaced in tests).
@@ -166,17 +182,18 @@ func (h *sessionHandle) revoke(why string) {
 
 func newCore(cfg tunnelConfig, log *zap.Logger) (*core, error) {
 	c := &core{
-		cfg:       cfg,
-		log:       log,
-		auth:      auth.New(),
-		gw4:       cfg.ipv4.Addr(),
-		sessions:  map[netip.Addr]*sessionHandle{},
-		pool:      pool.New(cfg.ipv4, cfg.ipv6),
-		recent:    map[string]recentLease{},
-		forget:    forgetConntrack,
-		authLog:   logLimit{max: 60},
-		deviceLog: logLimit{max: 1},
-		done:      make(chan struct{}),
+		cfg:        cfg,
+		log:        log,
+		auth:       auth.New(),
+		gw4:        cfg.ipv4.Addr(),
+		sessions:   map[netip.Addr]*sessionHandle{},
+		pool:       pool.New(cfg.ipv4, cfg.ipv6),
+		recent:     map[string]recentLease{},
+		forget:     forgetConntrack,
+		loginLimit: auth.NewFailureLimiter(loginFailures, time.Minute),
+		authLog:    logLimit{max: 60},
+		deviceLog:  logLimit{max: 1},
+		done:       make(chan struct{}),
 	}
 	if cfg.ipv6.IsValid() {
 		c.gw6 = cfg.ipv6.Addr()
@@ -193,7 +210,7 @@ func newCore(cfg tunnelConfig, log *zap.Logger) (*core, error) {
 // start opens the host network and starts reading from it.
 func (c *core) start() error {
 	n, err := openDevice(hostnet.Config{Interface: c.cfg.iface, IPv4: c.cfg.ipv4, IPv6: c.cfg.ipv6, MTU: c.cfg.mtu,
-		Manage: c.cfg.manage, Log: func(s string) { c.log.Info(s) }})
+		Manage: c.cfg.manage, HostAccess: c.cfg.hostAccess, Log: func(s string) { c.log.Info(s) }})
 	if err != nil {
 		return err
 	}
@@ -212,7 +229,31 @@ func (c *core) start() error {
 		c.log.Info("deleted connection tracking entries of the tunnel addresses (left by an earlier run)", zap.Int("count", deleted))
 	}
 	c.attach(n)
+	if r, ok := device(n).(interface{ Repair() []string }); ok {
+		go c.watchHost(r)
+	}
 	return nil
+}
+
+// How often the host's forwarding and NAT configuration is checked.
+const hostCheckInterval = 30 * time.Second
+
+// watchHost repairs the host configuration that something else undid, until
+// the core stops. Without it, a firewall reload that removes the NAT rules
+// leaves a tunnel that connects and carries nothing, with nothing logged.
+func (c *core) watchHost(r interface{ Repair() []string }) {
+	t := time.NewTicker(hostCheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			for _, msg := range r.Repair() {
+				c.log.Warn(msg)
+			}
+		case <-c.ctx.Done():
+			return
+		}
+	}
 }
 
 // attach starts handing packets from the device to the sessions.
@@ -323,6 +364,7 @@ func (c *core) deactivate(a *App) {
 func (c *core) apply(a *App) {
 	c.setAllowed(a.allowed)
 	c.noMTUProbe.Store(a.MTUProbe != nil && !*a.MTUProbe)
+	c.maxSessions.Store(int64(a.sessionLimit()))
 	c.setUsers(a.users)
 }
 
@@ -453,7 +495,7 @@ func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease 
 	h := &sessionHandle{id: c.nextID.Add(1), user: user, toClient: make(chan queued, queueLen), revoked: make(chan struct{}),
 		rescope: make(chan struct{}, 1)}
 	c.sessMu.Lock()
-	if !c.auth.IsCurrent(user) {
+	if !c.auth.IsCurrent(user) || c.atSessionLimit(user) {
 		c.sessMu.Unlock()
 		releaseAll()
 		return nil
@@ -463,6 +505,29 @@ func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease 
 	}
 	c.sessMu.Unlock()
 	return &lease{core: c, handle: h, addrs: addrs}
+}
+
+// atSessionLimit reports whether the user has as many sessions as allowed.
+// sessMu is held.
+func (c *core) atSessionLimit(user auth.User) bool {
+	limit := c.maxSessions.Load()
+	if limit <= 0 {
+		return false
+	}
+	ids := map[uint64]bool{}
+	for _, s := range c.sessions {
+		if s.user.Name == user.Name {
+			ids[s.id] = true
+		}
+	}
+	return int64(len(ids)) >= limit
+}
+
+// tooManySessions is the same check for a request that was refused.
+func (c *core) tooManySessions(user auth.User) bool {
+	c.sessMu.RLock()
+	defer c.sessMu.RUnlock()
+	return c.atSessionLimit(user)
 }
 
 func (l *lease) owns(a netip.Addr) bool {

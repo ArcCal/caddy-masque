@@ -41,6 +41,8 @@ func TestCaddyfileGlobalOption(t *testing.T) {
 		block 10.0.0.0/8 192.168.0.0/16
 		block fc00::/7
 		allow_client_to_client
+		allow_host_access
+		max_sessions 3
 		http3 off
 		mtu_probe off
 		user alice `+testHash+`
@@ -50,7 +52,7 @@ func TestCaddyfileGlobalOption(t *testing.T) {
 		t.Fatal(err)
 	}
 	if app.Interface != "vpn0" || app.IPv4 != "10.9.0.1/24" || app.IPv6 != "fd09::1/64" || app.MTU != 1400 ||
-		*app.ManageNetwork || *app.HTTP3 || *app.MTUProbe || !app.AllowClientToClient || len(app.Users) != 2 ||
+		*app.ManageNetwork || *app.HTTP3 || *app.MTUProbe || !app.AllowClientToClient || !app.AllowHostAccess || app.MaxSessions != 3 || app.sessionLimit() != 3 || len(app.Users) != 2 ||
 		app.Users[1].Name != "bob" || app.Users[1].PasswordHash != testHash ||
 		strings.Join(*app.BlockedDestinations, " ") != "10.0.0.0/8 192.168.0.0/16 fc00::/7" {
 		t.Errorf("parsed %+v", app)
@@ -62,6 +64,13 @@ func TestCaddyfileGlobalOption(t *testing.T) {
 	app, err = parseGlobal(t, "masque {\n ipv4 10.9.0.1/24\n block none\n}")
 	if err != nil || app.BlockedDestinations == nil || len(*app.BlockedDestinations) != 0 {
 		t.Errorf("block none: %v %v", app, err)
+	}
+	if app, err = parseGlobal(t, "masque {\n ipv4 10.9.0.1/24\n max_sessions unlimited\n}"); err != nil || app.sessionLimit() != 0 {
+		t.Errorf("max_sessions unlimited: %+v %v", app, err)
+	}
+	app, err = parseGlobal(t, "masque {\n ipv4 10.9.0.1/24\n}")
+	if err == nil && (app.sessionLimit() != DefaultMaxSessions) {
+		t.Errorf("default sessions %d", app.sessionLimit())
 	}
 	app, err = parseGlobal(t, "masque {\n ipv4 10.9.0.1/24\n}")
 	if err != nil || app.BlockedDestinations != nil || app.ManageNetwork != nil || app.HTTP3 != nil || app.MTUProbe != nil {
@@ -81,6 +90,9 @@ func TestCaddyfileGlobalOptionErrors(t *testing.T) {
 		"masque {\n http3\n}",
 		"masque {\n mtu_probe sometimes\n}",
 		"masque {\n allow_client_to_client yes\n}",
+		"masque {\n allow_host_access yes\n}",
+		"masque {\n max_sessions 0\n}",
+		"masque {\n max_sessions many\n}",
 		"masque {\n block\n}",
 		"masque {\n user alice\n}",
 		"masque {\n user alice hash extra\n}",

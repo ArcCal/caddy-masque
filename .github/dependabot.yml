@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Caddy, quic-go and the rest: security fixes arrive as pull requests.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+  # The actions in the workflows are pinned by tag; this keeps them current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

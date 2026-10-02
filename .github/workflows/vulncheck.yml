@@ -1,0 +1,31 @@
+# Known vulnerabilities in the code this module actually calls, in its
+# dependencies (Caddy, quic-go, ...) and in the Go standard library, checked
+# against the Go vulnerability database. Runs on changes and weekly: a new
+# advisory for an old dependency shows up without a push.
+name: vulncheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          # The newest patch release of the line go.mod asks for: it carries the
+          # standard library security fixes (go.mod says 1.26.0, the first release).
+          go-version: "1.26"
+          check-latest: true
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
