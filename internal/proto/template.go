@@ -32,6 +32,8 @@ type Template struct {
 	raw       string
 	authority string
 	parts     []part
+	m         *matcher // nil when requests cannot be matched: see matchErr
+	matchErr  error
 }
 
 // TemplateError reports an invalid template.
@@ -71,7 +73,8 @@ func ParseTemplate(raw string) (*Template, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Template{raw: raw, authority: authority, parts: parts}, nil
+	m, merr := compile(parts)
+	return &Template{raw: raw, authority: authority, parts: parts, m: m, matchErr: merr}, nil
 }
 
 // ParsePathTemplate parses a template for just the path and query, as the
@@ -80,7 +83,16 @@ func ParsePathTemplate(path string) (*Template, error) {
 	if !strings.HasPrefix(path, "/") {
 		return nil, TemplateError("path must start with '/'")
 	}
-	return ParseTemplate("https://server" + path)
+	t, err := ParseTemplate("https://server" + path)
+	if err != nil {
+		return nil, err
+	}
+	// The proxy matches requests against it: a template it could not
+	// match is refused now rather than failing every request.
+	if t.matchErr != nil {
+		return nil, t.matchErr
+	}
+	return t, nil
 }
 
 func validVarName(v string) bool {
@@ -206,124 +218,212 @@ func (t *Template) Expand(vars map[string]string) string {
 	return out.String()
 }
 
+// matcher recovers a template's variables from a request's path and
+// query: the path as literals and simple expressions, matched left to
+// right; the query as parameters found by name, so that their order and
+// other parameters do not matter.
+type matcher struct {
+	path  []part
+	query []queryParam
+}
+
+// queryParam is a parameter of the template's query: name=value where the
+// value is literals and simple expressions, or a variable of a {?...} or
+// {&...} expression, which may be left out.
+type queryParam struct {
+	name    string // decoded
+	value   []part
+	formVar string
+}
+
+// compile prepares the matcher, or tells why requests cannot be matched
+// against the template unambiguously.
+func compile(parts []part) (*matcher, error) {
+	m := &matcher{}
+	var query []part
+	// The path: up to a literal '?' or a {?...} expression.
+	for i, p := range parts {
+		if p.vars == nil {
+			before, after, found := strings.Cut(p.literal, "?")
+			if before != "" {
+				m.path = append(m.path, part{literal: normalize(before)})
+			}
+			if found {
+				query = append([]part{{literal: after}}, parts[i+1:]...)
+				break
+			}
+			continue
+		}
+		if p.op != opSimple {
+			query = parts[i:]
+			break
+		}
+		if n := len(m.path); n > 0 && m.path[n-1].vars != nil {
+			return nil, TemplateError("two expressions in a row cannot be told apart")
+		}
+		m.path = append(m.path, p)
+	}
+	// The query.
+	var pair []part
+	afterForm := false
+	flush := func() error {
+		defer func() { pair = nil }()
+		if len(pair) == 0 {
+			return nil
+		}
+		if pair[0].vars != nil {
+			return TemplateError("a query parameter name cannot be a variable")
+		}
+		name, rest, hasValue := strings.Cut(pair[0].literal, "=")
+		if !hasValue && len(pair) > 1 {
+			return TemplateError("a query parameter name cannot be a variable")
+		}
+		dname, ok := decode(name)
+		if !ok || name == "" {
+			return TemplateError("invalid query parameter name")
+		}
+		var value []part
+		if rest != "" {
+			value = append(value, part{literal: normalize(rest)})
+		}
+		for _, p := range pair[1:] {
+			if p.vars != nil && len(value) > 0 && value[len(value)-1].vars != nil {
+				return TemplateError("two expressions in a row cannot be told apart")
+			}
+			if p.vars == nil {
+				p.literal = normalize(p.literal)
+			}
+			value = append(value, p)
+		}
+		m.query = append(m.query, queryParam{name: dname, value: value})
+		return nil
+	}
+	for _, p := range query {
+		switch {
+		case p.vars == nil:
+			lit := p.literal
+			if afterForm && lit != "" && lit[0] != '&' {
+				return nil, TemplateError("text after a {?...} or {&...} expression must start with '&'")
+			}
+			afterForm = false
+			for {
+				before, after, more := strings.Cut(lit, "&")
+				if before != "" {
+					pair = append(pair, part{literal: before})
+				}
+				if !more {
+					break
+				}
+				if err := flush(); err != nil {
+					return nil, err
+				}
+				lit = after
+			}
+		case p.op == opSimple:
+			if afterForm {
+				return nil, TemplateError("text after a {?...} or {&...} expression must start with '&'")
+			}
+			pair = append(pair, p)
+		default:
+			if p.op == opQuery && (len(m.query) > 0 || len(pair) > 0) {
+				return nil, TemplateError("{?...} after the query started: use {&...}")
+			}
+			if err := flush(); err != nil {
+				return nil, err
+			}
+			for _, v := range p.vars {
+				m.query = append(m.query, queryParam{name: v, formVar: v})
+			}
+			afterForm = true
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // Match matches a request's path and query against the template and
 // returns the percent-decoded variables it carries, or nil and false. A
 // variable whose value is not percent-encoded UTF-8 is left out: the
 // request is for the template's resource, but malformed (RFC 9484 §4.1).
 func (t *Template) Match(pathAndQuery string) (map[string]string, bool) {
-	path, query, _ := strings.Cut(pathAndQuery, "?")
-	var pathParts []part
-	type queryExpr struct{ param, variable string }
-	var queryExprs []queryExpr
-	var queryLiteral strings.Builder
-	inQuery := false
-	for _, p := range t.parts {
-		switch {
-		case p.vars == nil && !inQuery:
-			before, after, found := strings.Cut(p.literal, "?")
-			if found {
-				pathParts = append(pathParts, part{literal: before})
-				queryLiteral.WriteString(after)
-				inQuery = true
-			} else {
-				pathParts = append(pathParts, p)
-			}
-		case p.vars == nil:
-			queryLiteral.WriteString(p.literal)
-		case p.op == opSimple && inQuery:
-			// A simple expression in a literal query such as ?t={target}.
-			lit := queryLiteral.String()
-			name := lit[strings.LastIndexAny(lit, "&?")+1:]
-			name = strings.TrimRight(name, "=")
-			if len(p.vars) != 1 || name == "" {
-				return nil, false
-			}
-			queryExprs = append(queryExprs, queryExpr{name, p.vars[0]})
-			queryLiteral.WriteByte(0) // placeholder for the value
-		case p.op == opSimple:
-			pathParts = append(pathParts, p)
-		default:
-			inQuery = true
-			for _, v := range p.vars {
-				queryExprs = append(queryExprs, queryExpr{v, v})
-			}
-		}
-	}
-	out := map[string]string{}
-	if !matchPath(pathParts, path, out) {
+	if t.m == nil {
 		return nil, false
 	}
-	type kv struct {
-		k, v string
-		ok   bool // the value is well encoded
+	path, query, _ := strings.Cut(pathAndQuery, "?")
+	out := map[string]string{}
+	if !matchSegments(t.m.path, normalize(path), out) {
+		return nil, false
 	}
+	type kv struct{ k, v string }
 	var params []kv
 	for _, pair := range strings.Split(query, "&") {
 		if pair == "" {
 			continue
 		}
 		k, v, _ := strings.Cut(pair, "=")
-		dk, ok := decode(k)
-		if !ok {
-			continue // not a parameter of the template
+		if dk, ok := decode(k); ok {
+			params = append(params, kv{dk, v})
 		}
-		dv, ok := decode(v)
-		params = append(params, kv{dk, dv, ok})
 	}
-	// Fixed parameters written in the template must be present.
-	for _, pair := range strings.Split(queryLiteral.String(), "&") {
-		if pair == "" || strings.ContainsRune(pair, 0) {
-			continue
-		}
-		k, v, _ := strings.Cut(pair, "=")
+	for _, q := range t.m.query {
+		var value string
 		found := false
 		for _, p := range params {
-			if p.k == k && p.ok && p.v == v {
-				found = true
+			if p.k == q.name {
+				value, found = p.v, true
 				break
 			}
 		}
-		if !found {
+		switch {
+		case q.formVar != "":
+			if d, ok := decode(value); found && ok {
+				out[q.formVar] = d
+			}
+		case !found:
+			// A fixed parameter must be there; without a parameter that
+			// carries variables, they are missing.
+			if !hasVariables(q.value) {
+				return nil, false
+			}
+		case !matchSegments(q.value, normalize(value), out):
 			return nil, false
-		}
-	}
-	for _, e := range queryExprs {
-		for _, p := range params {
-			if p.k == e.param {
-				if p.ok {
-					out[e.variable] = p.v
-				}
-				break
-			}
 		}
 	}
 	return out, true
 }
 
-// matchPath matches path parts left to right: a simple expression captures
-// up to the next literal; two expressions in a row are ambiguous.
-func matchPath(parts []part, path string, out map[string]string) bool {
+func hasVariables(parts []part) bool {
+	for _, p := range parts {
+		if p.vars != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// matchSegments matches literals and simple expressions left to right: an
+// expression captures up to the next literal (compile rules out two
+// expressions in a row).
+func matchSegments(parts []part, s string, out map[string]string) bool {
 	for i, p := range parts {
 		if p.vars == nil {
-			if !strings.HasPrefix(path, p.literal) {
+			if !strings.HasPrefix(s, p.literal) {
 				return false
 			}
-			path = path[len(p.literal):]
+			s = s[len(p.literal):]
 			continue
 		}
 		var captured string
 		if i+1 < len(parts) {
-			next := parts[i+1]
-			if next.vars != nil || next.literal == "" {
-				return false
-			}
-			end := strings.Index(path, next.literal)
+			end := strings.Index(s, parts[i+1].literal)
 			if end < 0 {
 				return false
 			}
-			captured, path = path[:end], path[end:]
+			captured, s = s[:end], s[end:]
 		} else {
-			captured, path = path, ""
+			captured, s = s, ""
 		}
 		values := strings.Split(captured, ",")
 		if len(values) != len(p.vars) {
@@ -336,7 +436,32 @@ func matchPath(parts []part, path string, out map[string]string) bool {
 			}
 		}
 	}
-	return path == ""
+	return s == ""
+}
+
+// normalize applies percent-encoding normalization (RFC 3986 §6.2.2):
+// escaped unreserved characters are decoded, other escapes uppercased.
+func normalize(s string) string {
+	if !strings.Contains(s, "%") {
+		return s
+	}
+	var out strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) {
+			if b, err := strconv.ParseUint(s[i+1:i+3], 16, 8); err == nil {
+				c := byte(b)
+				if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("-._~", c) >= 0 {
+					out.WriteByte(c)
+				} else {
+					fmt.Fprintf(&out, "%%%02X", c)
+				}
+				i += 2
+				continue
+			}
+		}
+		out.WriteByte(s[i])
+	}
+	return out.String()
 }
 
 func encode(value string) string {
