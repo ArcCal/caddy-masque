@@ -39,9 +39,9 @@ func init() {
 // Handler answers CONNECT-IP requests (RFC 9484): extended CONNECT with
 // :protocol connect-ip over HTTP/2 and HTTP/3, and GET with Upgrade:
 // connect-ip over HTTP/1.1. Every other request, and any CONNECT-IP request
-// without valid credentials, goes to the next handler, so visitors and
-// probes see the site as usual and status codes only reach authenticated
-// users.
+// without TLS or without valid credentials, goes to the next handler, so
+// visitors and probes see the site as usual and status codes only reach
+// authenticated users.
 type Handler struct {
 	// Path and query of the URI Template clients are configured with.
 	Template string `json:"template,omitempty"`
@@ -147,6 +147,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	h.advertiseHTTP3(w, r)
 	req, ok := connectIPRequest(r)
 	if !ok {
+		return next.ServeHTTP(w, r)
+	}
+	// IP proxying runs over TLS or QUIC only (RFC 9484 §4): without it, the
+	// request is not ours.
+	if r.TLS == nil {
+		h.log.Debug("CONNECT-IP request without TLS", zap.String("remote", r.RemoteAddr))
 		return next.ServeHTTP(w, r)
 	}
 	vars, ok := h.tpl.Match(r.URL.RequestURI())

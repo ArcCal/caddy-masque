@@ -510,6 +510,51 @@ func TestCaddyRefusalsLookLikeTheSite(t *testing.T) {
 // authenticated request malformed (RFC 9484 §4.1), in the path as in the
 // query. (A path that is not percent-encoding at all, such as %ZZ, the HTTP
 // servers refuse before any handler.)
+// IP proxying runs over TLS or QUIC only (RFC 9484 §4): a CONNECT-IP
+// request with valid credentials over plain HTTP/1.1 or HTTP/2 gets the
+// site.
+func TestCaddyRefusesTunnelsWithoutTLS(t *testing.T) {
+	e := newCaddyEnv(t)
+	e.server = map[string]any{"tls_connection_policies": nil, "protocols": []string{"h1", "h2c"}}
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := e.dialTCP(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: vpn.test:%d\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\n"+
+		"Capsule-Protocol: ?1\r\nAuthorization: %s\r\n\r\n", anyTarget, e.port, authorization(testPassword))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "cover page" {
+		t.Errorf("HTTP/1.1 without TLS: %d %q", resp.StatusCode, body)
+	}
+
+	// HTTP/2 over cleartext TCP (h2c, prior knowledge).
+	tr := &http2.Transport{AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+			return e.dialTCP(ctx, nil)
+		}}
+	defer tr.CloseIdleConnections()
+	req, _ := http.NewRequest(http.MethodConnect, fmt.Sprintf("http://vpn.test:%d%s", e.port, anyTarget), http.NoBody)
+	req.Header = http.Header{":protocol": {"connect-ip"}, "Capsule-Protocol": {"?1"}, "Authorization": {authorization(testPassword)}}
+	resp, err = tr.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK || string(body) != "cover page" {
+		t.Errorf("h2c: HTTP/%d %d %q", resp.ProtoMajor, resp.StatusCode, body)
+	}
+	waitNoSessions(t)
+}
+
 func TestCaddyBadlyEncodedVariablesAreMalformed(t *testing.T) {
 	e := newCaddyEnv(t)
 	if err := e.load(masqueConfig("alice")); err != nil {
