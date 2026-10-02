@@ -5,9 +5,12 @@ import (
 	"errors"
 	"net/netip"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/yosida95/uritemplate/v3"
 )
 
 func encoded(t uint64, value []byte) []byte { return AppendCapsule(nil, t, value) }
@@ -402,13 +405,20 @@ func TestExpandThenMatch(t *testing.T) {
 		"/ip/{target}?p={ipproto}",
 		"/ip/{target}.x/{ipproto}/?v=1",
 		"/x%2dy/{target},{ipproto}",
+		"/ip?t={target}.example&i={ipproto}",
+		"/ip/{target}.x/{ipproto}.x/y",
+		"/ip/{target,extra}/{ipproto}/",
+		"/ip/{extra,target,ipproto}",
+		"/ip/{extra1,extra2}/{target}/{ipproto}/",
+		"/ip?t={target}{&extra,ipproto}",
 	} {
 		x, err := ParsePathTemplate(s)
 		if err != nil {
 			t.Errorf("%s: %v", s, err)
 			continue
 		}
-		for _, c := range [][2]string{{"*", "*"}, {"2001:db8::/32", "58"}, {"vpn.example.net", "6"}, {"192.0.2.0/24", "17"}} {
+		for _, c := range [][2]string{{"*", "*"}, {"2001:db8::/32", "58"}, {"vpn.example.net", "6"}, {"192.0.2.0/24", "17"},
+			{"foo.example", "17"}, {"a.x.b.x", "6"}} {
 			path := x.Expand(map[string]string{"target": c[0], "ipproto": c[1]})
 			m, ok := x.Match(path)
 			if !ok || len(m) != 2 || m["target"] != c[0] || m["ipproto"] != c[1] {
@@ -433,6 +443,64 @@ func TestExpandThenMatch(t *testing.T) {
 	x, _ = ParsePathTemplate("/ip?t={target}.suffix&i={ipproto}")
 	if m, ok := x.Match("/ip?t=192.0.2.1&i=17"); ok {
 		t.Errorf("without the suffix: %v", m)
+	}
+}
+
+// Expansions by an independent RFC 6570 implementation, with only the
+// variables a CONNECT-IP client defines, match and give them back.
+func TestMatchIndependentExpansions(t *testing.T) {
+	for _, s := range []string{
+		"/.well-known/masque/ip/{target}/{ipproto}/",
+		"/ip{?target,ipproto}",
+		"/ip?t={target}&i={ipproto}",
+		"/ip?t={target}.example&i={ipproto}",
+		"/ip?fixed=%41{&target,ipproto}",
+		"/ip?scope={target,ipproto}",
+		"/ip/{target}?p={ipproto}",
+		"/ip/{target,extra}/{ipproto}/",
+		"/ip/{extra1,extra2}/{target}/{ipproto}/",
+		"/ip{?extra,target}{&ipproto}",
+	} {
+		x, err := ParsePathTemplate(s)
+		if err != nil {
+			t.Errorf("%s: %v", s, err)
+			continue
+		}
+		u, err := uritemplate.New("https://proxy.example" + s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range [][2]string{{"*", "*"}, {"2001:db8::/32", "58"}, {"foo.example", "17"}, {"192.0.2.0/24", "6"}} {
+			vals := uritemplate.Values{}
+			vals.Set("target", uritemplate.String(c[0]))
+			vals.Set("ipproto", uritemplate.String(c[1]))
+			expanded, err := u.Expand(vals)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := strings.TrimPrefix(expanded, "https://proxy.example")
+			m, ok := x.Match(path)
+			if !ok || len(m) != 2 || m["target"] != c[0] || m["ipproto"] != c[1] {
+				t.Errorf("%s %s: %v %v", s, path, m, ok)
+			}
+		}
+	}
+}
+
+// Matching comes before authentication: a request built to make the
+// matcher try many split points costs little.
+func TestMatchIsBounded(t *testing.T) {
+	x, err := ParsePathTemplate("/ip/{a}.{b}.{c}.{d}.{e}/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/ip/" + strings.Repeat("a.", 4000) + "/y"
+	start := time.Now()
+	if _, ok := x.Match(path); ok {
+		t.Error("matched")
+	}
+	if d := time.Since(start); d > 200*time.Millisecond {
+		t.Errorf("took %v", d)
 	}
 }
 

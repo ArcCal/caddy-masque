@@ -403,40 +403,88 @@ func hasVariables(parts []part) bool {
 	return false
 }
 
-// matchSegments matches literals and simple expressions left to right: an
-// expression captures up to the next literal (compile rules out two
-// expressions in a row).
+// matchSegments matches literals and simple expressions left to right.
+// An expression captures up to an occurrence of the literal after it
+// (compile rules out two expressions in a row): the first, unless only a
+// later one lets the rest match, as when the value contains the literal
+// (t={target}.example with target foo.example). Requests come before
+// authentication, so the attempts are bounded.
 func matchSegments(parts []part, s string, out map[string]string) bool {
-	for i, p := range parts {
-		if p.vars == nil {
-			if !strings.HasPrefix(s, p.literal) {
-				return false
-			}
-			s = s[len(p.literal):]
-			continue
-		}
-		var captured string
-		if i+1 < len(parts) {
-			end := strings.Index(s, parts[i+1].literal)
-			if end < 0 {
-				return false
-			}
-			captured, s = s[:end], s[end:]
-		} else {
-			captured, s = s, ""
-		}
-		values := strings.Split(captured, ",")
-		if len(values) != len(p.vars) {
+	budget := maxMatchSteps
+	return matchFrom(parts, s, out, &budget)
+}
+
+// maxMatchSteps bounds the split points tried for one request.
+const maxMatchSteps = 1024
+
+func matchFrom(parts []part, s string, out map[string]string, budget *int) bool {
+	if len(parts) == 0 {
+		return s == ""
+	}
+	p := parts[0]
+	if p.vars == nil {
+		return strings.HasPrefix(s, p.literal) && matchFrom(parts[1:], s[len(p.literal):], out, budget)
+	}
+	if len(parts) == 1 {
+		return assign(p.vars, s, out)
+	}
+	next := parts[1].literal
+	if len(parts) == 2 {
+		// The literal ends it: no choice to make.
+		return strings.HasSuffix(s, next) && assign(p.vars, s[:len(s)-len(next)], out)
+	}
+	for end := 0; end <= len(s); end++ {
+		i := strings.Index(s[end:], next)
+		if i < 0 {
 			return false
 		}
-		for j, name := range p.vars {
-			// Keep empty values so the protocol layer can reject them.
-			if d, ok := decode(values[j]); ok {
-				out[name] = d
+		end += i
+		if *budget--; *budget < 0 {
+			return false
+		}
+		trial := map[string]string{}
+		if assign(p.vars, s[:end], trial) && matchFrom(parts[1:], s[end:], trial, budget) {
+			for k, v := range trial {
+				out[k] = v
 			}
+			return true
 		}
 	}
-	return s == ""
+	return false
+}
+
+// clientVariables are those a CONNECT-IP client defines (RFC 9484 §3).
+// It leaves the template's other variables undefined, so they are left out
+// of its expansions (RFC 6570 §3.2.1).
+var clientVariables = map[string]bool{"target": true, "ipproto": true}
+
+// assign gives a simple expression's variables the comma-separated values
+// captured: one each, or, when the client left the other variables out,
+// one to each of target and ipproto in order.
+func assign(vars []string, captured string, out map[string]string) bool {
+	values := strings.Split(captured, ",")
+	names := vars
+	if len(values) != len(vars) {
+		names = nil
+		for _, v := range vars {
+			if clientVariables[v] {
+				names = append(names, v)
+			}
+		}
+		if len(names) == 0 && captured == "" {
+			return true // all left out: an empty expansion
+		}
+		if len(values) != len(names) {
+			return false
+		}
+	}
+	for j, name := range names {
+		// Keep empty values so the protocol layer can reject them.
+		if d, ok := decode(values[j]); ok {
+			out[name] = d
+		}
+	}
+	return true
 }
 
 // normalize applies percent-encoding normalization (RFC 3986 §6.2.2):
