@@ -2,12 +2,14 @@ package masque
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +30,10 @@ type scope struct {
 	requested []netip.Prefix
 	protocol  uint8
 	routes    routes.Set
+	// The server's IPv6 tunnel address when it is outside routes: the
+	// client may still send ICMPv6 to it, or it could not answer the MTU
+	// probe, which comes from there (RFC 9484 §7.2).
+	gateway6 netip.Addr
 }
 
 // anyDestination is the request of target "*".
@@ -43,7 +49,30 @@ func newScope(allowed routes.Set, requested []netip.Prefix, protocol uint8) scop
 
 func (s scope) allows(h ip.Header) bool {
 	icmp := h.Protocol == ip.ProtoICMP && h.IsIPv4() || h.Protocol == ip.ProtoICMPv6 && !h.IsIPv4()
+	if icmp && s.gateway6.IsValid() && h.Dst == s.gateway6 {
+		return true
+	}
 	return s.routes.Contains(h.Dst) && (s.protocol == 0 || h.Protocol == s.protocol || icmp)
+}
+
+// advertised are the ranges of the ROUTE_ADVERTISEMENT: the routes, and
+// ICMPv6 to the gateway when the routes leave it out, in the order RFC 9484
+// §4.7.3 requires (IP version, then protocol, then address).
+func (s scope) advertised() []proto.AddressRange {
+	out := s.routes.Routes(s.protocol)
+	if s.gateway6.IsValid() {
+		out = append(out, proto.AddressRange{Start: s.gateway6, End: s.gateway6, Protocol: ip.ProtoICMPv6})
+		slices.SortStableFunc(out, func(a, b proto.AddressRange) int {
+			if a.Start.Is4() != b.Start.Is4() {
+				if a.Start.Is4() {
+					return -1
+				}
+				return 1
+			}
+			return cmp.Compare(a.Protocol, b.Protocol)
+		})
+	}
+	return out
 }
 
 type stats struct{ toClient, fromClient, dropped atomic.Uint64 }
@@ -346,12 +375,15 @@ func (s *session) narrow() *scope {
 		v4, v6 = v4 || a.Is4(), v6 || a.Is6()
 	}
 	sc.routes = sc.routes.Families(v4, v6)
+	if gw := s.core.gateway(true); v6 && gw.IsValid() && !sc.routes.Contains(gw) {
+		sc.gateway6 = gw
+	}
 	return &sc
 }
 
 func (s *session) advertise() error {
 	sc := s.current.Load()
-	return s.tun.writeCapsule(proto.RouteAdvertisement(sc.routes.Routes(sc.protocol)))
+	return s.tun.writeCapsule(proto.RouteAdvertisement(sc.advertised()))
 }
 
 func (s *session) readCapsules() error {
