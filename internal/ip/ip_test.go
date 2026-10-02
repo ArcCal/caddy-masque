@@ -221,27 +221,36 @@ func TestNoErrorsAboutErrorsOrMulticast(t *testing.T) {
 
 func TestICMPv6Echo(t *testing.T) {
 	src, dst := addr("fd89::1"), addr("fd89::2")
-	req := EchoV6(EchoRequestV6, src, dst, 0x1234, 7, IPv6MinMTU-48)
+	data := make([]byte, IPv6MinMTU-48)
+	data[52] = 0xab
+	req := EchoV6(EchoRequestV6, src, dst, 0x1234, 7, data)
 	h, ok := Parse(req)
 	if !ok || len(req) != IPv6MinMTU || h.Src != src || h.Dst != dst || h.Protocol != ProtoICMPv6 {
 		t.Fatalf("request: %+v, %d bytes", h, len(req))
 	}
-	valid := func(p []byte, h Header) bool {
-		return Checksum(pseudoHeader(h.Src, h.Dst, h.TotalLen-40, ProtoICMPv6), p[40:h.TotalLen]) == 0
+	if m, ok := Echo(req, h); !ok || m.Type != EchoRequestV6 || m.ID != 0x1234 || m.Seq != 7 || !bytes.Equal(m.Data, data) {
+		t.Errorf("request: %+v %v", m, ok)
 	}
-	if typ, id, ok := Echo(req, h); !ok || typ != EchoRequestV6 || id != 0x1234 || !valid(req, h) {
-		t.Errorf("request: %d %#x %v", typ, id, ok)
-	}
-	req[100] = 0xab // data is echoed back
-	binary.BigEndian.PutUint16(req[42:44], 0)
-	binary.BigEndian.PutUint16(req[42:44], Checksum(pseudoHeader(src, dst, len(req)-40, ProtoICMPv6), req[40:]))
+	// The reply returns the data unmodified (RFC 4443 §4.2).
 	reply := EchoReply(req)
 	rh, ok := Parse(reply)
-	if typ, id, ok2 := Echo(reply, rh); !ok || !ok2 || typ != EchoReplyV6 || id != 0x1234 || rh.Src != dst || rh.Dst != src ||
-		reply[47] != 7 || reply[100] != 0xab || !valid(reply, rh) {
-		t.Errorf("reply: %+v % x", rh, reply[40:48])
+	m, ok2 := Echo(reply, rh)
+	if !ok || !ok2 || m.Type != EchoReplyV6 || m.ID != 0x1234 || m.Seq != 7 || rh.Src != dst || rh.Dst != src || !bytes.Equal(m.Data, data) {
+		t.Errorf("reply: %+v %+v", rh, m)
 	}
 	if EchoReply(reply) != nil {
 		t.Error("a reply was answered")
+	}
+	// A wrong checksum is not an echo message.
+	reply[100] ^= 1
+	if _, ok := Echo(reply, rh); ok {
+		t.Error("wrong checksum accepted")
+	}
+	// Nor is a fragment of one.
+	frag := ext{44, []byte{0, 0, 0, 1, 0, 0, 0, 9}}
+	icmp := req[40:]
+	fh, _ := Parse(ipv6Packet("fd89::1", "fd89::2", []ext{frag}, ProtoICMPv6, icmp[:512]))
+	if _, ok := Echo(ipv6Packet("fd89::1", "fd89::2", []ext{frag}, ProtoICMPv6, icmp[:512]), fh); ok {
+		t.Error("a fragment accepted")
 	}
 }

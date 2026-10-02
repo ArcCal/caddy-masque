@@ -344,9 +344,9 @@ const (
 )
 
 // EchoV6 is an ICMPv6 Echo message (RFC 4443 §4) from src to dst with the
-// identifier, sequence number and n bytes of data.
-func EchoV6(typ byte, src, dst netip.Addr, id, seq uint16, n int) []byte {
-	icmpLen := 8 + n
+// identifier, sequence number and data.
+func EchoV6(typ byte, src, dst netip.Addr, id, seq uint16, data []byte) []byte {
+	icmpLen := 8 + len(data)
 	out := make([]byte, 40+icmpLen)
 	out[0] = 0x60
 	binary.BigEndian.PutUint16(out[4:6], uint16(icmpLen))
@@ -356,36 +356,44 @@ func EchoV6(typ byte, src, dst netip.Addr, id, seq uint16, n int) []byte {
 	out[40] = typ
 	binary.BigEndian.PutUint16(out[44:46], id)
 	binary.BigEndian.PutUint16(out[46:48], seq)
+	copy(out[48:], data)
 	binary.BigEndian.PutUint16(out[42:44], Checksum(pseudoHeader(src, dst, icmpLen, ProtoICMPv6), out[40:]))
 	return out
 }
 
-// Echo returns the type and identifier of an ICMPv6 Echo message, p
-// parsed as h.
-func Echo(p []byte, h Header) (typ byte, id uint16, ok bool) {
-	if h.IsIPv4() || h.Protocol != ProtoICMPv6 || h.PayloadOffset < 0 || h.PayloadOffset+8 > h.TotalLen {
-		return 0, 0, false
-	}
-	icmp := p[h.PayloadOffset:]
-	if icmp[0] != EchoRequestV6 && icmp[0] != EchoReplyV6 || icmp[1] != 0 {
-		return 0, 0, false
-	}
-	return icmp[0], binary.BigEndian.Uint16(icmp[4:6]), true
+// EchoMessage is an ICMPv6 Echo Request or Reply.
+type EchoMessage struct {
+	Type    byte
+	ID, Seq uint16
+	Data    []byte // in the packet
 }
 
-// EchoReply answers an ICMPv6 Echo Request as an IPv6 node does (RFC 4443
-// §4.2), or returns nil.
+// Echo reads an ICMPv6 Echo message, p parsed as h; false for anything
+// else, a fragment, or a wrong checksum.
+func Echo(p []byte, h Header) (EchoMessage, bool) {
+	if h.IsIPv4() || h.Protocol != ProtoICMPv6 || h.Fragment || h.PayloadOffset < 0 || h.PayloadOffset+8 > h.TotalLen {
+		return EchoMessage{}, false
+	}
+	icmp := p[h.PayloadOffset:h.TotalLen]
+	if icmp[0] != EchoRequestV6 && icmp[0] != EchoReplyV6 || icmp[1] != 0 ||
+		Checksum(pseudoHeader(h.Src, h.Dst, len(icmp), ProtoICMPv6), icmp) != 0 {
+		return EchoMessage{}, false
+	}
+	return EchoMessage{Type: icmp[0], ID: binary.BigEndian.Uint16(icmp[4:6]), Seq: binary.BigEndian.Uint16(icmp[6:8]), Data: icmp[8:]}, true
+}
+
+// EchoReply answers an ICMPv6 Echo Request as an IPv6 node does, returning
+// its data unmodified (RFC 4443 §4.2), or returns nil.
 func EchoReply(request []byte) []byte {
 	h, ok := Parse(request)
-	if typ, _, ok2 := Echo(request, h); !ok || !ok2 || typ != EchoRequestV6 {
+	if !ok {
 		return nil
 	}
-	icmp := request[h.PayloadOffset:h.TotalLen]
-	reply := EchoV6(EchoReplyV6, h.Dst, h.Src, binary.BigEndian.Uint16(icmp[4:6]), binary.BigEndian.Uint16(icmp[6:8]), len(icmp)-8)
-	copy(reply[48:], icmp[8:])
-	binary.BigEndian.PutUint16(reply[42:44], 0)
-	binary.BigEndian.PutUint16(reply[42:44], Checksum(pseudoHeader(h.Dst, h.Src, len(icmp), ProtoICMPv6), reply[40:]))
-	return reply
+	m, ok := Echo(request, h)
+	if !ok || m.Type != EchoRequestV6 {
+		return nil
+	}
+	return EchoV6(EchoReplyV6, h.Dst, h.Src, m.ID, m.Seq, m.Data)
 }
 
 // pseudoHeader is the IPv6 pseudo-header for upper-layer checksums (RFC
