@@ -16,12 +16,13 @@ const NFTTable = "caddy-masque"
 
 // Config describes the tunnel interface.
 type Config struct {
-	Interface string
-	IPv4      netip.Prefix
-	IPv6      netip.Prefix
-	MTU       int
-	Manage    bool
-	Log       func(msg string)
+	Interface  string
+	IPv4       netip.Prefix
+	IPv6       netip.Prefix
+	MTU        int
+	Manage     bool
+	HostAccess bool
+	Log        func(msg string)
 }
 
 // Network is the TUN device and the host configuration around it.
@@ -36,5 +37,6 @@ func (*Network) Name() string              { return "" }
 func (*Network) Read([]byte) (int, error)  { return 0, errLinuxOnly }
 func (*Network) Write([]byte) (int, error) { return 0, errLinuxOnly }
 func (*Network) Close() error              { return nil }
+func (*Network) Repair() []string          { return nil }
 func SetSysctl(string, string) error       { return errLinuxOnly }
 func Forget([]netip.Prefix) (int, error)   { return 0, errLinuxOnly }

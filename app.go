@@ -67,9 +67,16 @@ type App struct {
 	ManageNetwork *bool `json:"manage_network,omitempty"`
 	// Destinations clients may not reach; nil means routes.DefaultBlocked.
 	BlockedDestinations *[]string `json:"blocked_destinations,omitempty"`
+	// Let clients reach the host's own services through the tunnel (the
+	// server's tunnel address and its public addresses), not just ping it.
+	AllowHostAccess bool `json:"allow_host_access,omitempty"`
 	// Let clients reach each other's tunnel addresses.
 	AllowClientToClient bool   `json:"allow_client_to_client,omitempty"`
 	Users               []User `json:"users,omitempty"`
+	// Sessions one user may have at a time; 0 means the default
+	// (DefaultMaxSessions), -1 no limit. A user who uses up the client
+	// address pool would lock the others out.
+	MaxSessions int `json:"max_sessions,omitempty"`
 	// Serve HTTP/3 with datagrams for the HTTPS servers (default true). When
 	// off, CONNECT-IP uses HTTP/2 and HTTP/1.1 only and Caddy keeps its own
 	// HTTP/3.
@@ -98,6 +105,17 @@ type App struct {
 }
 
 type h3Addr struct{ server, network, hostport string }
+
+// sessionLimit is the sessions one user may have, 0 for no limit.
+func (a *App) sessionLimit() int {
+	switch {
+	case a.MaxSessions == 0:
+		return DefaultMaxSessions
+	case a.MaxSessions < 0:
+		return 0
+	}
+	return a.MaxSessions
+}
 
 // CaddyModule returns the Caddy module information.
 func (App) CaddyModule() caddy.ModuleInfo {
@@ -133,10 +151,13 @@ func (a *App) Provision(ctx caddy.Context) error {
 		return err
 	}
 	a.core = val.(*core)
+	if err := ctx.GetMetricsRegistry().Register(newCollector(a.core)); err != nil {
+		a.log.Warn("could not register the masque metrics", zap.Error(err))
+	}
 	if a.core.cfg != a.cfg {
 		_, _ = cores.Delete(a.coreKey)
 		a.released = true
-		return errors.New("masque: the tunnel settings (interface, ipv4, ipv6, mtu, manage_network) changed; restart Caddy to apply them")
+		return errors.New("masque: the tunnel settings (interface, ipv4, ipv6, mtu, manage_network, allow_host_access) changed; restart Caddy to apply them")
 	}
 	return nil
 }
@@ -173,7 +194,11 @@ func (a *App) parse() error {
 		return fmt.Errorf("masque: mtu must be between %d and 1500, got %d", minMTU, a.cfg.mtu)
 	}
 	a.cfg.manage = a.ManageNetwork == nil || *a.ManageNetwork
+	a.cfg.hostAccess = a.AllowHostAccess
 
+	if a.MaxSessions < -1 {
+		return fmt.Errorf("masque: max_sessions must be 0 (default), -1 (no limit) or positive, got %d", a.MaxSessions)
+	}
 	a.users = map[string]string{}
 	for _, u := range a.Users {
 		if err := auth.ValidateUserName(u.Name); err != nil {

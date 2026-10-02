@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.6
+	github.com/prometheus/client_golang v1.24.1
 	github.com/quic-go/connect-ip-go v0.4.0
 	github.com/quic-go/quic-go v0.63.0
 	github.com/spf13/cobra v1.10.2
@@ -95,7 +96,6 @@ require (
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/pires/go-proxyproto v0.15.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/prometheus/client_golang v1.24.1 // indirect
 	github.com/prometheus/client_model v0.6.3 // indirect
 	github.com/prometheus/common v0.71.0 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect

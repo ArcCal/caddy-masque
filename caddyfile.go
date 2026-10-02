@@ -27,8 +27,10 @@ func init() {
 //	    manage_network         on|off
 //	    block                  <prefix...>|none
 //	    allow_client_to_client
+//	    allow_host_access
 //	    http3                  on|off
 //	    mtu_probe              on|off
+//	    max_sessions           <n>|unlimited
 //	    user                   <name> <argon2id hash>
 //	}
 func parseGlobalOption(d *caddyfile.Dispenser, existing any) (any, error) {
@@ -97,6 +99,23 @@ func parseGlobalOption(d *caddyfile.Dispenser, existing any) (any, error) {
 				return nil, d.ArgErr()
 			}
 			app.AllowClientToClient = true
+		case "max_sessions":
+			var s string
+			if err = single(&s); err == nil {
+				switch n, perr := strconv.Atoi(s); {
+				case s == "unlimited":
+					app.MaxSessions = -1
+				case perr != nil || n < 1:
+					return nil, d.Errf("max_sessions: expected a positive number or unlimited, got %q", s)
+				default:
+					app.MaxSessions = n
+				}
+			}
+		case "allow_host_access":
+			if d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			app.AllowHostAccess = true
 		case "block":
 			args := d.RemainingArgs()
 			if len(args) == 0 {
