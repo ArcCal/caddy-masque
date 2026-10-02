@@ -1111,6 +1111,43 @@ func TestScopeAllows(t *testing.T) {
 	}
 }
 
+// A scope that leaves out the server's IPv6 tunnel address still lets the
+// client send ICMPv6 to it, and says so in the ROUTE_ADVERTISEMENT: the
+// MTU probe comes from there, and a client sends only where routes lead
+// (RFC 9484 §7.2), so it could not reply otherwise.
+func TestScopedIPv6KeepsICMPv6ToTheGateway(t *testing.T) {
+	gw := netip.MustParseAddr("fd89::1")
+	for _, protocol := range []uint8{0, ip.ProtoTCP, 132} {
+		e := newTestEnv(t, dualStack())
+		sc := newScope(*e.core.allowed.Load(), []netip.Prefix{netip.MustParsePrefix("2001:db8::/64")}, protocol)
+		r := e.startScoped(t, alice, true, sc)
+		adv := r.s.current.Load().advertised()
+		if err := proto.ValidateRoutes(adv); err != nil {
+			t.Fatalf("protocol %d: %v: %v", protocol, err, adv)
+		}
+		want := proto.AddressRange{Start: gw, End: gw, Protocol: ip.ProtoICMPv6}
+		if !slices.Contains(adv, want) || len(adv) != 2 {
+			t.Fatalf("protocol %d: routes %v, want the scope's and %v", protocol, adv, want)
+		}
+		src := r.addr(true)
+		r.tun.datagrams <- append([]byte{0}, echoRequest(src, gw.String())...)
+		hostPacket(t, e.dev)
+		r.tun.datagrams <- append([]byte{0}, udp(src, gw.String(), 10)...)
+		noHostPacket(t, e.dev)
+		if reply := r.tun.nextPacket(t); len(reply) < 48 || reply[40] != 1 || reply[41] != 1 {
+			t.Errorf("protocol %d: UDP to the gateway is not administratively prohibited", protocol)
+		}
+	}
+	// The full scope holds the gateway already: nothing is added.
+	e := newTestEnv(t, dualStack())
+	r := e.start(t, alice, true)
+	for _, rt := range r.s.current.Load().advertised() {
+		if rt.Protocol != 0 {
+			t.Errorf("full scope: extra route %v", rt)
+		}
+	}
+}
+
 func TestConfigurationChangesAndRunningSessions(t *testing.T) {
 	e := newTestEnv(t, dualStack())
 	r := e.start(t, alice, true)

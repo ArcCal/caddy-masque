@@ -1125,8 +1125,12 @@ func TestCaddyIPv6Target(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// The scope, and ICMPv6 to the server's tunnel address, which is
+		// outside it: the MTU probe comes from there.
+		gw := netip.MustParseAddr("fd89::1")
 		want := proto.RouteAdvertisement{{Start: netip.MustParseAddr("2001:db8::"),
-			End: netip.MustParseAddr("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"), Protocol: 17}}
+			End: netip.MustParseAddr("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"), Protocol: 17},
+			{Start: gw, End: gw, Protocol: 58}}
 		if !slices.Equal(second.(proto.RouteAdvertisement), want) {
 			t.Errorf("%s: routes %v", tr.name, second)
 		}

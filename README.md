@@ -5,7 +5,7 @@ The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as
 - **Standards**: IETF MASQUE IP proxying, CONNECT-IP (RFC 9484); HTTP Datagrams and Capsules (RFC 9297);
   extended CONNECT over HTTP/2 and HTTP/3 (RFC 8441, RFC 9220). HTTP/3, HTTP/2 and HTTP/1.1 are all supported.
 - **Clients unchanged**: masque-vpn's `masque-client` and MasqueVPN on the Mac connect directly, without changing a single
-  line of their configuration. Password hashes made by `caddy masque-passwd` and by masque-vpn's `masque-passwd` are interchangeable.
+  line of their configuration (over HTTP/3 with IPv6 on, older clients need the note on the MTU probe below). Password hashes made by `caddy masque-passwd` and by masque-vpn's `masque-passwd` are interchangeable.
 - **Caddy handles certificates and traffic**: certificates are obtained and renewed automatically; the VPN and the website
   share port 443 (TCP and UDP); the same Caddy can go on hosting other sites and reverse proxies as usual.
 - **Looks like just a website**: only CONNECT-IP requests with a correct user name and password become tunnels;
@@ -95,6 +95,13 @@ the tunnel (RFC 9484 §7.2 requires this, unless an out-of-band means ensures th
 that is, there is no HTTP proxy in between). The client's IPv6 stack replies by itself; **when a client firewall drops
 ICMPv6 Echo (such as macOS stealth mode), HTTP/3 tunnels are closed**. Then allow ICMPv6 Echo, or, when you know there
 is no intermediate proxy, use `mtu_probe off`.
+
+The probe comes from the server's IPv6 tunnel address. A client sends only where the server's routes lead (RFC 9484 §7.2),
+so when a scoped request (`target`) leaves that address out, the route advertisement also lists it, for ICMPv6 only.
+The server assigns an IPv6 address even to clients that asked only for IPv4, and probes it. masque-vpn's `masque-client`
+answers the probe in every mode from [ArcCal/masque-vpn#14](https://github.com/ArcCal/masque-vpn/pull/14) on; with older
+clients, HTTP/3 tunnels are closed every 10 seconds when the client has `ipv6 = false`, or runs in SOCKS mode (the Mac
+app). Give such clients `transport = "h2"`, or use `mtu_probe off` as above.
 
 Link-local addresses (169.254.0.0/16, fe80::/10) are never forwarded, whatever the configuration (RFC 9484 §7.2).
 
