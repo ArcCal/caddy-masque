@@ -151,7 +151,7 @@ jobs:
           merge-multiple: true
       # Signed (Sigstore) statement of which workflow run built each archive:
       # verify with `gh attestation verify FILE --repo ArcCal/caddy-masque`.
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.tar.gz
       - name: Upload
