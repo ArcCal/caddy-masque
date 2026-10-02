@@ -75,6 +75,13 @@ vpn.example.com {
 | `allow_client_to_client` | 允许客户端之间互相访问 | 不允许 |
 | `manage_network off` | 不改转发和 NAT（sysctl、nftables），自己管 | 自动管理 |
 | `http3 off` | 不接管 HTTP/3（见下文），VPN 只走 HTTP/2 和 HTTP/1.1 | 接管 |
+| `mtu_probe off` | 不做 IPv6 MTU 探测（见下文）。只在确知客户端都直连、中间没有 HTTP 代理时关 | 探测 |
+
+带 IPv6 的 HTTP/3 隧道（QUIC datagram）建立后，服务器向客户端的 IPv6 地址发 1280 字节的
+ICMPv6 Echo 请求，确认隧道装得下 IPv6 的最小 MTU；10 秒内收不到回复就拆掉隧道（RFC 9484 §7.2
+要求这样做，除非有带外手段保证 QUIC Initial 包的填充已经足够，即中间没有 HTTP 代理）。
+客户端的 IPv6 协议栈会自动回复；**客户端防火墙丢弃 ICMPv6 Echo（如 macOS 的隐身模式）时，
+HTTP/3 隧道会被拆掉**，这时放行 ICMPv6 Echo，或在确知没有中间代理时用 `mtu_probe off`。
 
 链路本地地址（169.254.0.0/16、fe80::/10）无论怎么配置都不转发（RFC 9484 §7.2）。
 

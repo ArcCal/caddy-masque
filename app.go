@@ -74,6 +74,12 @@ type App struct {
 	// off, CONNECT-IP uses HTTP/2 and HTTP/1.1 only and Caddy keeps its own
 	// HTTP/3.
 	HTTP3 *bool `json:"http3,omitempty"`
+	// Check that a tunnel with IPv6 over QUIC datagrams carries 1280-byte
+	// packets with an ICMPv6 echo request, ending it without a reply (RFC
+	// 9484 §7.2; default true). Turn it off only when clients are known to
+	// connect directly, with no HTTP intermediary: then the padded QUIC
+	// Initial packets are enough.
+	MTUProbe *bool `json:"mtu_probe,omitempty"`
 
 	ctx         caddy.Context
 	log         *zap.Logger

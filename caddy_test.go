@@ -39,6 +39,7 @@ import (
 
 	"github.com/ArcCal/caddy-masque/internal/auth"
 	"github.com/ArcCal/caddy-masque/internal/hostnet"
+	"github.com/ArcCal/caddy-masque/internal/ip"
 	"github.com/ArcCal/caddy-masque/internal/proto"
 )
 
@@ -293,14 +294,36 @@ func (e *caddyEnv) dialH3(t *testing.T, password, path string) *tunnelClient {
 	reader := newCapsuleReader(str)
 	c.capsule = reader.next
 	c.send = func(pkt []byte) error { return str.SendDatagram(append([]byte{0}, pkt...)) }
-	c.recv = func() ([]byte, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		d, err := str.ReceiveDatagram(ctx)
-		if err != nil {
-			return nil, err
+	// Datagrams are read as they come, as a client's stack does: the MTU
+	// probe (RFC 9484 §7.2) is answered, the rest queued for recv.
+	packets := make(chan []byte, 1024)
+	go func() {
+		defer close(packets)
+		for {
+			d, err := str.ReceiveDatagram(context.Background())
+			if err != nil {
+				return
+			}
+			if reply := ip.EchoReply(d[1:]); reply != nil && len(d) == 1+ip.IPv6MinMTU {
+				_ = str.SendDatagram(append([]byte{0}, reply...))
+				continue
+			}
+			select {
+			case packets <- d[1:]:
+			default: // dropped, as by a full socket buffer
+			}
 		}
-		return d[1:], nil
+	}()
+	c.recv = func() ([]byte, error) {
+		select {
+		case p, ok := <-packets:
+			if !ok {
+				return nil, errors.New("the stream is closed")
+			}
+			return p, nil
+		case <-time.After(2 * time.Second):
+			return nil, errors.New("no packet")
+		}
 	}
 	return c
 }
@@ -1149,5 +1172,32 @@ func TestCaddyMalformedHTTP1Requests(t *testing.T) {
 	got := send(fmt.Sprintf("POST %s HTTP/1.1\r\nHost: vpn.test\r\nUpgrade: connect-ip\r\nContent-Length: 0\r\n\r\n", anyTarget))
 	if got != "200 cover page" {
 		t.Errorf("anonymous: %q", got)
+	}
+}
+
+// mtu_probe off reaches the running core, and a reload without it turns
+// the probe back on.
+func TestCaddyMTUProbeSetting(t *testing.T) {
+	e := newCaddyEnv(t)
+	probeOff := func() (off bool) {
+		cores.Range(func(_ any, v any) bool {
+			off = v.(*core).noMTUProbe.Load()
+			return true
+		})
+		return off
+	}
+	cfg := masqueConfig("alice")
+	cfg["mtu_probe"] = false
+	if err := e.load(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !probeOff() {
+		t.Error("mtu_probe false: the probe is on")
+	}
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	if probeOff() {
+		t.Error("by default: the probe is off")
 	}
 }

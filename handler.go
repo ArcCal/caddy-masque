@@ -18,7 +18,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/ArcCal/caddy-masque/internal/auth"
-	"github.com/ArcCal/caddy-masque/internal/ip"
 	"github.com/ArcCal/caddy-masque/internal/proto"
 )
 
@@ -253,7 +252,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	c.running.Add(1)
 	defer c.running.Add(-1)
-	s := &session{core: c, lease: l, scope: sc, tun: tun, log: log, icmp: ip.NewRateLimit()}
+	s := newSession(c, l, sc, tun, log)
 	log.Info("session started", zap.Any("addresses", l.addrs))
 	// The request's context ends with the stream; a hijacked HTTP/1.1
 	// connection is no longer watched by the server, and ends with the

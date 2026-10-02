@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -64,7 +65,26 @@ type session struct {
 	// for its sake.
 	icmpMu sync.Mutex
 	icmp   *ip.RateLimit
+	// The IPv6 MTU probe: its echo identifier, and closed on its reply.
+	probeID    uint16
+	probeReply chan struct{}
+	probeOnce  sync.Once
 }
+
+func newSession(c *core, l *lease, sc scope, tun tunnel, log *zap.Logger) *session {
+	return &session{core: c, lease: l, scope: sc, tun: tun, log: log, icmp: ip.NewRateLimit(),
+		probeID: uint16(rand.Uint32()), probeReply: make(chan struct{})}
+}
+
+// The IPv6 MTU probe (RFC 9484 §7.2): an ICMPv6 echo request with 1232
+// bytes of data, a 1280-byte packet, sent again every probeInterval (a
+// datagram may be lost) until a reply, for at most probeTimeout.
+var (
+	probeInterval = time.Second
+	probeTimeout  = 10 * time.Second
+)
+
+const probeData = ip.IPv6MinMTU - 40 - 8
 
 func (s *session) icmpAllow() bool {
 	s.icmpMu.Lock()
@@ -85,7 +105,7 @@ func (e errAbort) Error() string { return "aborted: " + e.why }
 func (s *session) run(ctx context.Context) string {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	ended := make(chan error, 4)
+	ended := make(chan error, 5)
 	var wg sync.WaitGroup
 	spawn := func(f func() error) {
 		wg.Add(1)
@@ -114,6 +134,9 @@ func (s *session) run(ctx context.Context) string {
 				spawn(func() error { return s.readDatagrams(ctx) })
 			}
 			spawn(func() error { return s.sendToClientLoop(ctx) })
+			if s.tun.hasQUICDatagrams() && s.lease.hasIPv6() && !s.core.noMTUProbe.Load() {
+				spawn(func() error { return s.probeMTU(ctx) })
+			}
 		case <-s.lease.handle.revoked:
 			err = errors.New(s.lease.handle.why)
 		case <-ctx.Done():
@@ -188,6 +211,56 @@ func (s *session) announce(ctx context.Context, opened chan<- struct{}, readvert
 			return ctx.Err()
 		}
 	}
+}
+
+// probeMTU checks that the tunnel carries 1280-byte IPv6 packets, which
+// QUIC DATAGRAM frames may not (RFC 9484 §7.2): padding the QUIC Initial
+// packets shows it only without HTTP intermediaries, so unless told there
+// are none, the proxy sends ICMPv6 echo requests with 1232 bytes of data
+// to the client and tears the tunnel down without a reply. It returns nil
+// once the client replies.
+func (s *session) probeMTU(ctx context.Context) error {
+	var client netip.Addr
+	for _, a := range s.lease.addrs {
+		if a.Is6() {
+			client = a
+		}
+	}
+	gateway := s.core.gateway(true)
+	timeout := time.NewTimer(probeTimeout)
+	defer timeout.Stop()
+	tick := time.NewTicker(probeInterval)
+	defer tick.Stop()
+	for seq := uint16(0); ; seq++ {
+		// Too large for the path ends the session (sendToClient).
+		if err := s.sendToClient(append([]byte{0}, ip.EchoV6(ip.EchoRequestV6, gateway, client, s.probeID, seq, probeData)...)); err != nil {
+			return err
+		}
+		select {
+		case <-s.probeReply:
+			s.log.Debug("the tunnel carries 1280-byte IPv6 packets")
+			return nil
+		case <-timeout.C:
+			return errAbort{"no reply to 1280-byte ICMPv6 echo requests: the tunnel may not carry IPv6's minimum MTU (RFC 9484 §7.2)"}
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
+}
+
+// isProbeReply reports an echo reply to the MTU probe, which goes no
+// further.
+func (s *session) isProbeReply(pkt []byte, h ip.Header) bool {
+	if h.IsIPv4() || h.Dst != s.core.gateway(true) || s.probeReply == nil {
+		return false
+	}
+	typ, id, ok := ip.Echo(pkt, h)
+	if !ok || typ != ip.EchoReplyV6 || id != s.probeID {
+		return false
+	}
+	s.probeOnce.Do(func() { close(s.probeReply) })
+	return true
 }
 
 // narrow is the session's scope within what the server allows now, for the
@@ -281,6 +354,9 @@ func (s *session) clientPacket(payload []byte) error {
 		// BCP 38: never forward a source address the client was not given.
 		s.stats.dropped.Add(1)
 		s.log.Debug("dropping packet with spoofed source", zap.Stringer("src", h.Src))
+		return nil
+	}
+	if s.isProbeReply(pkt, h) {
 		return nil
 	}
 	if !s.current.Load().allows(h) {
