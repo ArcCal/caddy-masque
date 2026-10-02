@@ -1,6 +1,7 @@
 package masque
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -65,8 +66,12 @@ type session struct {
 	// for its sake.
 	icmpMu sync.Mutex
 	icmp   *ip.RateLimit
-	// The IPv6 MTU probe: its echo identifier, and closed on its reply.
+	// The IPv6 MTU probe: the client address it goes to, its echo
+	// identifier and data, how many were sent, and closed on a reply.
+	probeTo    netip.Addr
 	probeID    uint16
+	probeData  []byte
+	probeSent  atomic.Uint32
 	probeReply chan struct{}
 	probeOnce  sync.Once
 	frags      fragments
@@ -126,8 +131,18 @@ func (f *fragments) protocol(h ip.Header) (uint8, bool) {
 }
 
 func newSession(c *core, l *lease, sc scope, tun tunnel, log *zap.Logger) *session {
-	return &session{core: c, lease: l, scope: sc, tun: tun, log: log, icmp: ip.NewRateLimit(),
-		probeID: uint16(rand.Uint32()), probeReply: make(chan struct{})}
+	s := &session{core: c, lease: l, scope: sc, tun: tun, log: log, icmp: ip.NewRateLimit(),
+		probeID: uint16(rand.Uint32()), probeData: make([]byte, probeData), probeReply: make(chan struct{})}
+	for _, a := range l.addrs {
+		if a.Is6() {
+			s.probeTo = a
+		}
+	}
+	// Random data: only a client that got the probe can return it.
+	for i := range s.probeData {
+		s.probeData[i] = byte(rand.Uint32())
+	}
+	return s
 }
 
 // The IPv6 MTU probe (RFC 9484 §7.2): an ICMPv6 echo request with 1232
@@ -274,20 +289,15 @@ func (s *session) announce(ctx context.Context, opened chan<- struct{}, readvert
 // to the client and tears the tunnel down without a reply. It returns nil
 // once the client replies.
 func (s *session) probeMTU(ctx context.Context) error {
-	var client netip.Addr
-	for _, a := range s.lease.addrs {
-		if a.Is6() {
-			client = a
-		}
-	}
 	gateway := s.core.gateway(true)
 	timeout := time.NewTimer(probeTimeout)
 	defer timeout.Stop()
 	tick := time.NewTicker(probeInterval)
 	defer tick.Stop()
 	for seq := uint16(0); ; seq++ {
+		s.probeSent.Store(uint32(seq) + 1)
 		// Too large for the path ends the session (sendToClient).
-		if err := s.sendToClient(append([]byte{0}, ip.EchoV6(ip.EchoRequestV6, gateway, client, s.probeID, seq, probeData)...)); err != nil {
+		if err := s.sendToClient(append([]byte{0}, ip.EchoV6(ip.EchoRequestV6, gateway, s.probeTo, s.probeID, seq, s.probeData)...)); err != nil {
 			return err
 		}
 		select {
@@ -304,16 +314,20 @@ func (s *session) probeMTU(ctx context.Context) error {
 }
 
 // isProbeReply reports an echo reply to the MTU probe, which goes no
-// further.
+// further. It shows the tunnel carries 1280-byte packets both ways only if
+// it is whole: from the probed address, 1280 bytes, to a probe sent, with
+// the probe's data unmodified (RFC 4443 §4.2) and a valid checksum.
 func (s *session) isProbeReply(pkt []byte, h ip.Header) bool {
 	if h.IsIPv4() || h.Dst != s.core.gateway(true) || s.probeReply == nil {
 		return false
 	}
-	typ, id, ok := ip.Echo(pkt, h)
-	if !ok || typ != ip.EchoReplyV6 || id != s.probeID {
+	m, ok := ip.Echo(pkt, h)
+	if !ok || m.Type != ip.EchoReplyV6 || m.ID != s.probeID {
 		return false
 	}
-	s.probeOnce.Do(func() { close(s.probeReply) })
+	if h.Src == s.probeTo && h.TotalLen == ip.IPv6MinMTU && uint32(m.Seq) < s.probeSent.Load() && bytes.Equal(m.Data, s.probeData) {
+		s.probeOnce.Do(func() { close(s.probeReply) })
+	}
 	return true
 }
 

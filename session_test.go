@@ -877,10 +877,10 @@ func TestMTUProbe(t *testing.T) {
 	r := e.startOn(t, alice, tun, newScope(*e.core.allowed.Load(), anyDestination, 0))
 	probe := r.tun.nextPacket(t)
 	h, ok := ip.Parse(probe)
-	typ, id, isEcho := ip.Echo(probe, h)
-	if !ok || !isEcho || typ != ip.EchoRequestV6 || id != r.s.probeID || len(probe) != ip.IPv6MinMTU ||
+	m, isEcho := ip.Echo(probe, h)
+	if !ok || !isEcho || m.Type != ip.EchoRequestV6 || m.ID != r.s.probeID || len(probe) != ip.IPv6MinMTU ||
 		h.Src.String() != "fd89::1" || h.Dst.String() != r.addr(true) {
-		t.Fatalf("probe: %+v, %d bytes, echo %v type %d id %#x", h, len(probe), isEcho, typ, id)
+		t.Fatalf("probe: %+v, %d bytes, echo %v %+v", h, len(probe), isEcho, m)
 	}
 	r.tun.datagrams <- append([]byte{0}, ip.EchoReply(probe)...)
 	noHostPacket(t, e.dev)
@@ -897,6 +897,37 @@ func TestMTUProbe(t *testing.T) {
 		if v, ok := (<-r.tun.out).(sentDatagram); !ok || len(v) != 1+ip.IPv6MinMTU {
 			t.Fatalf("unexpected %T sent", v)
 		}
+	}
+}
+
+// Only a whole reply shows the tunnel carries 1280-byte packets both
+// ways: a short one, one to a probe not sent, one with other data or a
+// wrong checksum does not, and without a whole one the tunnel is torn
+// down.
+func TestMTUProbeNeedsAWholeReply(t *testing.T) {
+	shortProbe(t)
+	e := newTestEnv(t, dualStack())
+	tun := newFakeTunnel(true)
+	tun.ignoreProbes.Store(true)
+	r := e.startOn(t, alice, tun, newScope(*e.core.allowed.Load(), anyDestination, 0))
+	probe := r.tun.nextPacket(t)
+	h, _ := ip.Parse(probe)
+	m, _ := ip.Echo(probe, h)
+	data := slices.Clone(m.Data)
+	other := slices.Clone(data)
+	other[0] ^= 0xff
+	badChecksum := ip.EchoReply(probe)
+	badChecksum[100] ^= 1
+	for _, reply := range [][]byte{
+		ip.EchoV6(ip.EchoReplyV6, h.Dst, h.Src, m.ID, m.Seq, nil),
+		ip.EchoV6(ip.EchoReplyV6, h.Dst, h.Src, m.ID, 999, data),
+		ip.EchoV6(ip.EchoReplyV6, h.Dst, h.Src, m.ID, m.Seq, other),
+		badChecksum,
+	} {
+		r.tun.datagrams <- append([]byte{0}, reply...)
+	}
+	if why := r.waitEnd(t); !strings.Contains(why, "ICMPv6 echo") {
+		t.Errorf("ended: %s", why)
 	}
 }
 
