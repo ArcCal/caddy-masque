@@ -65,13 +65,20 @@ type fakeTunnel struct {
 	closed      atomic.Bool
 	done        chan struct{} // closed by abort and close
 	doneOnce    sync.Once
+	// Writes fail from this one on (1: the first; 0: none).
+	failFrom int
+	writes   atomic.Int32
+	// Writes block until the stream is stopped, as for a client that
+	// stopped reading; each one that blocks is reported on stalls.
+	stalled atomic.Bool
+	stalls  chan struct{}
 }
 
 type sentDatagram []byte
 
 func newFakeTunnel(quicDatagrams bool) *fakeTunnel {
 	return &fakeTunnel{capsules: make(chan proto.Capsule, 10), errs: make(chan error, 1), datagrams: make(chan []byte, 10),
-		quic: quicDatagrams, out: make(chan any, 100), done: make(chan struct{})}
+		quic: quicDatagrams, out: make(chan any, 100), done: make(chan struct{}), stalls: make(chan struct{}, 10)}
 }
 
 func (t *fakeTunnel) readCapsule() (proto.Capsule, error) {
@@ -89,6 +96,17 @@ func (t *fakeTunnel) readCapsule() (proto.Capsule, error) {
 }
 
 func (t *fakeTunnel) writeCapsule(c proto.Capsule) error {
+	if t.stalled.Load() {
+		select {
+		case t.stalls <- struct{}{}:
+		default:
+		}
+		<-t.done
+		return errors.New("stream closed")
+	}
+	if n := int(t.writes.Add(1)); t.failFrom > 0 && n >= t.failFrom {
+		return errors.New("write failed")
+	}
 	// What the client gets is what it decodes from the wire.
 	d := proto.NewDecoder(proto.DefaultMaxValueLen)
 	d.Push(proto.Append(nil, c))
@@ -626,6 +644,98 @@ func TestStreamErrorsEndTheSession(t *testing.T) {
 	if r.tun.aborted.Load() || !r.tun.closed.Load() {
 		t.Error("closed, not aborted")
 	}
+}
+
+// runSession runs a session for alice without reading the opening
+// capsules; it returns why the session ended, or fails after a while.
+func (e *testEnv) runSession(tb testing.TB, tun *fakeTunnel) <-chan string {
+	tb.Helper()
+	l := e.core.acquire(context.Background(), alice, true, true)
+	if l == nil {
+		tb.Fatal("no lease")
+	}
+	s := &session{core: e.core, lease: l, scope: newScope(*e.core.allowed.Load(), anyDestination, 0), tun: tun,
+		log: zaptest.NewLogger(tb), icmp: ip.NewRateLimit()}
+	ended := make(chan string, 1)
+	go func() {
+		why := s.run(context.Background())
+		l.release()
+		ended <- why
+	}()
+	return ended
+}
+
+func waitWhy(tb testing.TB, ended <-chan string) string {
+	tb.Helper()
+	select {
+	case why := <-ended:
+		return why
+	case <-time.After(2 * time.Second):
+		tb.Fatal("the session did not end")
+		return ""
+	}
+}
+
+func waitStall(tb testing.TB, tun *fakeTunnel) {
+	tb.Helper()
+	select {
+	case <-tun.stalls:
+	case <-time.After(2 * time.Second):
+		tb.Fatal("no write blocked")
+	}
+}
+
+// The opening capsules failing to go out ends the stream like any error.
+func TestOpeningWriteErrorsEndTheStream(t *testing.T) {
+	for n := 1; n <= 2; n++ {
+		e := newTestEnv(t, dualStack())
+		tun := newFakeTunnel(true)
+		tun.failFrom = n
+		if why := waitWhy(t, e.runSession(t, tun)); why != "write failed" {
+			t.Errorf("write %d failing: ended: %s", n, why)
+		}
+		select {
+		case <-tun.done:
+		default:
+			t.Errorf("write %d failing: the stream was not stopped", n)
+		}
+		if !tun.closed.Load() || tun.aborted.Load() {
+			t.Errorf("write %d failing: the stream was not closed", n)
+		}
+	}
+}
+
+// A client that stops reading blocks the capsules the session sends of
+// its own accord; removing its user still ends the session.
+func TestBlockedWritesDoNotKeepRemovedUsers(t *testing.T) {
+	const removed = "user removed or password changed"
+	t.Run("opening", func(t *testing.T) {
+		e := newTestEnv(t, dualStack())
+		tun := newFakeTunnel(true)
+		tun.stalled.Store(true)
+		ended := e.runSession(t, tun)
+		waitStall(t, tun)
+		e.core.setUsers(map[string]string{bob.Name: bob.Hash})
+		if why := waitWhy(t, ended); why != removed {
+			t.Errorf("ended: %s", why)
+		}
+	})
+	t.Run("more routes", func(t *testing.T) {
+		e := newTestEnv(t, dualStack())
+		r := e.start(t, alice, true)
+		r.tun.stalled.Store(true)
+		more := dualStack()
+		more.AllowClientToClient = true
+		if err := more.parse(); err != nil {
+			t.Fatal(err)
+		}
+		e.core.setAllowed(more.allowed)
+		waitStall(t, r.tun)
+		e.core.setUsers(map[string]string{bob.Name: bob.Hash})
+		if why := r.waitEnd(t); why != removed {
+			t.Errorf("ended: %s", why)
+		}
+	})
 }
 
 func TestTooLargeForTheQUICPath(t *testing.T) {
