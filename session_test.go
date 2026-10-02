@@ -780,14 +780,20 @@ func TestTooLargeForTheQUICPath(t *testing.T) {
 	r.tun.nextPacket(t)
 }
 
+// A tunnel with IPv6 whose QUIC datagrams turn out unable to carry
+// 1280-byte packets is aborted (RFC 9484 §7.2), whichever packet showed it:
+// an IPv6 one, or an IPv4 one too large for the path.
 func TestIPv6NeedsRoomFor1280BytePackets(t *testing.T) {
-	e := newTestEnv(t, dualStack())
-	r := e.start(t, alice, true)
-	r.tun.maxDatagram = 1280 // one byte short: the context ID
-	e.dev.fromHost <- udp("2606:4700::1111", r.addr(true), 1280-48)
-	r.waitEnd(t)
-	if !r.tun.aborted.Load() {
-		t.Error("the stream was not aborted (RFC 9484 §7.1)")
+	for _, v6 := range []bool{true, false} {
+		e := newTestEnv(t, dualStack())
+		r := e.start(t, alice, true)
+		r.tun.maxDatagram = 1280 // one byte short: the context ID
+		src := map[bool]string{true: "2606:4700::1111", false: "1.1.1.1"}[v6]
+		e.dev.fromHost <- udp(src, r.addr(v6), 1280)
+		r.waitEnd(t)
+		if !r.tun.aborted.Load() {
+			t.Errorf("IPv6 %v: the stream was not aborted", v6)
+		}
 	}
 }
 
