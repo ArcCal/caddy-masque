@@ -79,12 +79,15 @@ jobs:
           sudo CADDY="$PWD/caddy" CLIENT_BIN="$PWD/masque-vpn/target/debug/masque-client" tests/e2e-netns.sh
 
   build:
-    name: build ${{ matrix.arch }}
+    name: build ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        include:
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm64 }
+          - { os: darwin, arch: arm64 }
     steps:
       - uses: actions/checkout@v5
         with:
@@ -96,12 +99,12 @@ jobs:
         id: build
         env:
           CGO_ENABLED: "0"
-          GOOS: linux
+          GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
         run: |
           version=${GITHUB_REF_NAME#v}
           [ "$GITHUB_REF_TYPE" = tag ] || version=$(git rev-parse --short HEAD)
-          name=caddy-masque-$version-linux-${{ matrix.arch }}
+          name=caddy-masque-$version-${{ matrix.os }}-${{ matrix.arch }}
           mkdir -p dist/$name
           go build -trimpath -ldflags "-s -w" -o dist/$name/caddy ./cmd/caddy
           cp -r deploy README.md dist/$name/
