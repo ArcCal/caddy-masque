@@ -177,6 +177,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	c := h.app.core
 	remote := r.RemoteAddr
+	// A client that keeps failing is not checked again for a while; its
+	// request goes to the site like any without credentials.
+	client, haveClient := clientAddr(r)
+	_, _, hasCredentials := auth.ParseBasic(r.Header.Get("Authorization"))
+	if hasCredentials && haveClient && c.loginLimit.Blocked(client) {
+		c.counters.throttled.Add(1)
+		h.log.Debug("too many failed logins, not checking credentials", zap.String("remote", remote))
+		return next.ServeHTTP(w, r)
+	}
 	user, ok, err := c.auth.Verify(r.Context(), r.Header.Get("Authorization"))
 	if errors.Is(err, auth.ErrBusy) {
 		// Like any web server under more load than it can take; whether the
@@ -187,6 +196,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil // the request was cancelled
 	}
 	if !ok {
+		if haveClient && hasCredentials {
+			c.loginLimit.Fail(client)
+		}
+		c.counters.authFailures.Add(1)
 		if name, _, has := auth.ParseBasic(r.Header.Get("Authorization")); has {
 			if len(name) > 64 {
 				name = name[:64]
@@ -241,6 +254,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		if !c.auth.IsCurrent(user) {
 			return next.ServeHTTP(w, r)
 		}
+		if c.tooManySessions(user) {
+			return rejectLogged(rejection{status: http.StatusTooManyRequests})
+		}
 		return rejectLogged(rejection{status: http.StatusServiceUnavailable})
 	}
 	defer l.release()
@@ -253,6 +269,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	c.running.Add(1)
 	defer c.running.Add(-1)
 	s := newSession(c, l, sc, tun, log)
+	c.counters.sessionsStarted.Add(1)
 	log.Info("session started", zap.Any("addresses", l.addrs))
 	// The request's context ends with the stream; a hijacked HTTP/1.1
 	// connection is no longer watched by the server, and ends with the
@@ -266,6 +283,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	why := s.run(ctx)
 	log.Info("session ended", zap.String("why", why), zap.Stringer("stats", &s.stats))
 	return nil
+}
+
+// clientAddr is the address of the client, as Caddy works it out (behind
+// trusted proxies, the one they report), else the connection's.
+func clientAddr(r *http.Request) (netip.Addr, bool) {
+	if v, ok := caddyhttp.GetVar(r.Context(), caddyhttp.ClientIPVarKey).(string); ok {
+		if a, err := netip.ParseAddr(v); err == nil {
+			return a, true
+		}
+	}
+	if ap, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
+		return ap.Addr(), true
+	}
+	return netip.Addr{}, false
 }
 
 // advertiseHTTP3 adds the Alt-Svc header field (RFC 7838) Caddy adds when

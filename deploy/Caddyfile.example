@@ -2,12 +2,20 @@
 # certificate for the site by itself (TCP 80 and 443 must be reachable).
 # After changes: systemctl reload caddy-masque (tunnels stay up).
 {
+	# Let's Encrypt sends expiry warnings here.
+	# email you@example.com
 	masque {
 		# The server's own tunnel address; the rest of the prefix is the
 		# client address pool.
 		ipv4 10.89.0.1/24
 		# IPv6 in the tunnel, when this server has IPv6 Internet access:
 		# ipv6 fd89:6d61:7371::1/64
+
+		# Tunnels one user may have at once (default 8; "unlimited" for no limit).
+		# max_sessions 8
+		# Clients can only ping the server itself; allow its other services
+		# (anything listening on all addresses) only if you want that:
+		# allow_host_access
 
 		# One line per device, from: caddy masque-passwd --name NAME
 		user macbook $argon2id$v=19$m=19456,t=2,p=1$...$...

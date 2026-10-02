@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -150,5 +151,51 @@ func TestFullQueueIsAnsweredAtOnce(t *testing.T) {
 	}
 	if _, ok, err := a.Verify(context.Background(), BasicAuthorization("alice", rustPassword)); !ok || err != nil {
 		t.Fatal(ok, err)
+	}
+}
+
+func TestFailureLimiter(t *testing.T) {
+	l := NewFailureLimiter(3, time.Minute)
+	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		if l.blockedAt(a, now) {
+			t.Fatalf("blocked after %d failures", i)
+		}
+		l.failAt(a, now)
+	}
+	if !l.blockedAt(a, now.Add(30*time.Second)) {
+		t.Error("not blocked after 3 failures")
+	}
+	if l.blockedAt(b, now) {
+		t.Error("another address is blocked")
+	}
+	if l.blockedAt(a, now.Add(time.Minute)) {
+		t.Error("still blocked after the window")
+	}
+	l.failAt(a, now.Add(time.Minute))
+	if l.blockedAt(a, now.Add(time.Minute)) {
+		t.Error("one failure in the new window blocks")
+	}
+	// IPv6 clients count by /64.
+	x, y := netip.MustParseAddr("2001:db8:1:2::1"), netip.MustParseAddr("2001:db8:1:2:ffff::9")
+	for i := 0; i < 3; i++ {
+		l.failAt(x, now)
+	}
+	if !l.blockedAt(y, now) || l.blockedAt(netip.MustParseAddr("2001:db8:1:3::1"), now) {
+		t.Error("IPv6 addresses are not grouped by /64")
+	}
+	// A full table does not grow, and expired entries make room.
+	l = NewFailureLimiter(1, time.Minute)
+	l.maxEntries = 2
+	l.failAt(a, now)
+	l.failAt(b, now)
+	l.failAt(netip.MustParseAddr("192.0.2.3"), now)
+	if len(l.m) != 2 {
+		t.Errorf("%d entries, want 2", len(l.m))
+	}
+	l.failAt(netip.MustParseAddr("192.0.2.3"), now.Add(2*time.Minute))
+	if len(l.m) != 1 || !l.blockedAt(netip.MustParseAddr("192.0.2.3"), now.Add(2*time.Minute)) {
+		t.Errorf("expired entries kept: %d", len(l.m))
 	}
 }

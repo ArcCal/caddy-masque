@@ -197,8 +197,20 @@ func (s Set) Routes(protocol uint8) []proto.AddressRange {
 // DefaultBlocked are destinations a server does not forward to unless
 // configured otherwise: special-purpose and private space, including the
 // VPS provider's internal network and metadata service (169.254.169.254).
+// The IPv6 ranges that carry an IPv4 address (NAT64, 6to4, Teredo) are in
+// it too: a network with a gateway for them would deliver the packets to
+// IPv4 destinations this list blocks.
 var DefaultBlocked = []string{
+	// IPv4: "this network", private, shared address space, loopback,
+	// link-local, IETF protocol assignments, deprecated 6to4 relays,
+	// benchmarking, multicast, reserved. The documentation ranges are not
+	// here: nothing routes them, and tests use them as stand-ins for the
+	// Internet.
 	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
-	"192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
-	"::/127", "::ffff:0:0/96", "fc00::/7", "fe80::/10", "ff00::/8",
+	"192.0.0.0/24", "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+	// IPv6: unspecified and loopback, IPv4-mapped, NAT64, discard-only,
+	// IETF protocol assignments (Teredo and others), 6to4, SRv6 SIDs,
+	// unique local, link-local, multicast.
+	"::/127", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64", "2001::/23",
+	"2002::/16", "5f00::/16", "fc00::/7", "fe80::/10", "ff00::/8",
 }

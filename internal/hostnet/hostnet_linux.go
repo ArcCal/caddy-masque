@@ -30,6 +30,10 @@ type Config struct {
 	MTU       int
 	// Manage forwarding and NAT (sysctls and nftables).
 	Manage bool
+	// Let clients reach the host's own services (any local address) instead
+	// of only ping it. Off by default: the tunnel's clients arrive on an
+	// interface the host's firewall may trust.
+	HostAccess bool
 	// Log receives notices.
 	Log func(msg string)
 }
@@ -40,7 +44,11 @@ type Network struct {
 	tun  *os.File
 	nft  bool
 	name string
+	// Sysctls this process changed, with their earlier values, for Close.
+	changed []sysctl
 }
+
+type sysctl struct{ key, old string }
 
 // Open creates the TUN device and configures the host. Close undoes it.
 func Open(cfg Config) (*Network, error) {
@@ -106,22 +114,102 @@ func (n *Network) setup() error {
 	if !n.cfg.Manage {
 		return nil
 	}
-	if err := SetSysctl("net.ipv4.ip_forward", "1"); err != nil {
+	if err := n.changeSysctl("net.ipv4.ip_forward", "1"); err != nil {
 		return err
 	}
-	nat := fmt.Sprintf("\t\tip saddr %s oifname != %q masquerade\n", n.cfg.IPv4.Masked(), iface)
 	if n.cfg.IPv6.IsValid() {
 		n.keepRouterAdvertisements()
-		if err := SetSysctl("net.ipv6.conf.all.forwarding", "1"); err != nil {
+		if err := n.changeSysctl("net.ipv6.conf.all.forwarding", "1"); err != nil {
 			return err
 		}
-		nat += fmt.Sprintf("\t\tip6 saddr %s oifname != %q masquerade\n", n.cfg.IPv6.Masked(), iface)
 	}
-	// The first two lines make loading idempotent.
-	ruleset := fmt.Sprintf(`add table inet %[1]s
+	if err := n.installRules(); err != nil {
+		return err
+	}
+	n.cfg.Log("enabled forwarding and NAT")
+	return nil
+}
+
+func (n *Network) installRules() error {
+	ruleset := Ruleset(n.name, n.cfg.IPv4, n.cfg.IPv6, n.cfg.HostAccess)
+	if err := run([]byte(ruleset), "nft", "-f", "-"); err != nil {
+		return fmt.Errorf("installing nftables NAT rules: %w", err)
+	}
+	n.nft = true
+	return nil
+}
+
+// changeSysctl sets a sysctl and remembers its value for Close.
+func (n *Network) changeSysctl(key, value string) error {
+	old, err := os.ReadFile("/proc/sys/" + strings.ReplaceAll(key, ".", "/"))
+	if err := SetSysctl(key, value); err != nil {
+		return err
+	}
+	if v := strings.TrimSpace(string(old)); err == nil && v != value {
+		n.changed = append(n.changed, sysctl{key, v})
+	}
+	return nil
+}
+
+// Repair puts back what something else undid in the host's configuration
+// since Open: the nftables table (a firewall that reloads with `nft flush
+// ruleset` removes it, and the tunnel then carries no traffic) and IP
+// forwarding. It returns what it repaired.
+func (n *Network) Repair() []string {
+	if !n.cfg.Manage {
+		return nil
+	}
+	var fixed []string
+	if err := run(nil, "nft", "list", "table", "inet", NFTTable); err != nil {
+		if err := n.installRules(); err != nil {
+			fixed = append(fixed, "the nftables rules are gone and could not be installed again: "+err.Error())
+		} else {
+			fixed = append(fixed, "the nftables rules were removed by something else; installed them again")
+		}
+	}
+	keys := []string{"net.ipv4.ip_forward"}
+	if n.cfg.IPv6.IsValid() {
+		keys = append(keys, "net.ipv6.conf.all.forwarding")
+	}
+	for _, key := range keys {
+		if v, err := os.ReadFile("/proc/sys/" + strings.ReplaceAll(key, ".", "/")); err == nil && strings.TrimSpace(string(v)) != "1" {
+			if err := SetSysctl(key, "1"); err != nil {
+				fixed = append(fixed, err.Error())
+			} else {
+				fixed = append(fixed, key+" was turned off by something else; turned it on again")
+			}
+		}
+	}
+	return fixed
+}
+
+// Ruleset is the nftables script of forwarding, NAT and the protection of the
+// host itself for the tunnel interface. The first two lines make loading
+// idempotent.
+//
+// Traffic from clients to the host (the input chain) is limited to ICMP and
+// replies unless hostAccess: the server's own tunnel address and its public
+// addresses are reachable by clients, and without this, so would be every
+// service listening on all addresses.
+func Ruleset(iface string, v4, v6 netip.Prefix, hostAccess bool) string {
+	nat := fmt.Sprintf("\t\tip saddr %s oifname != %q masquerade\n", v4.Masked(), iface)
+	if v6.IsValid() {
+		nat += fmt.Sprintf("\t\tip6 saddr %s oifname != %q masquerade\n", v6.Masked(), iface)
+	}
+	input := ""
+	if !hostAccess {
+		input = fmt.Sprintf(`	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname %[1]q ct state established,related accept
+		iifname %[1]q meta l4proto { icmp, ipv6-icmp } accept
+		iifname %[1]q drop
+	}
+`, iface)
+	}
+	return fmt.Sprintf(`add table inet %[1]s
 delete table inet %[1]s
 table inet %[1]s {
-	chain forward {
+%[4]s	chain forward {
 		type filter hook forward priority filter; policy accept;
 		iifname %[2]q accept
 		oifname %[2]q ct state established,related accept
@@ -131,13 +219,7 @@ table inet %[1]s {
 		type nat hook postrouting priority srcnat; policy accept;
 %[3]s	}
 }
-`, NFTTable, iface, nat)
-	if err := run([]byte(ruleset), "nft", "-f", "-"); err != nil {
-		return fmt.Errorf("installing nftables NAT rules: %w", err)
-	}
-	n.nft = true
-	n.cfg.Log("enabled forwarding and NAT")
-	return nil
+`, NFTTable, iface, nat, input)
 }
 
 // keepRouterAdvertisements: enabling IPv6 forwarding makes Linux ignore
@@ -154,7 +236,7 @@ func (n *Network) keepRouterAdvertisements() {
 		if err != nil || strings.TrimSpace(string(v)) != "1" {
 			continue
 		}
-		if err := SetSysctl("net.ipv6.conf."+name+".accept_ra", "2"); err != nil {
+		if err := n.changeSysctl("net.ipv6.conf."+name+".accept_ra", "2"); err != nil {
 			n.cfg.Log(fmt.Sprintf("could not keep router advertisements on %s: %v", name, err))
 		} else {
 			n.cfg.Log("set accept_ra=2 on " + name + " so IPv6 forwarding keeps the default route")
@@ -171,13 +253,18 @@ func (n *Network) Read(b []byte) (int, error) { return n.tun.Read(b) }
 // Write writes one packet to the TUN device.
 func (n *Network) Write(b []byte) (int, error) { return n.tun.Write(b) }
 
-// Close removes the device (it disappears with its file descriptor) and
-// the NAT rules.
+// Close removes the device (it disappears with its file descriptor), the
+// NAT rules, and the sysctl changes (forwarding) made for them.
 func (n *Network) Close() error {
 	if n.nft {
 		_ = run(nil, "nft", "delete", "table", "inet", NFTTable)
 		n.nft = false
 	}
+	// Forwarding was off before: the host is not a router any more.
+	for i := len(n.changed) - 1; i >= 0; i-- {
+		_ = SetSysctl(n.changed[i].key, n.changed[i].old)
+	}
+	n.changed = nil
 	return n.tun.Close()
 }
 

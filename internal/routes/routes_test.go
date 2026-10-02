@@ -85,3 +85,21 @@ func TestAdjacentRangesMerge(t *testing.T) {
 		t.Fatal(r)
 	}
 }
+
+func TestDefaultBlocked(t *testing.T) {
+	s := Everything()
+	for _, b := range DefaultBlocked {
+		s.Remove(netip.MustParsePrefix(b))
+	}
+	for _, a := range []string{"10.1.2.3", "100.100.100.200", "169.254.169.254", "198.19.0.1", "192.0.0.8",
+		"64:ff9b::808:808", "2002:808:808::1", "2001::1", "fd00:ec2::254", "::ffff:10.0.0.1"} {
+		if s.Contains(netip.MustParseAddr(a)) {
+			t.Errorf("%s is not blocked by default", a)
+		}
+	}
+	for _, a := range []string{"1.1.1.1", "8.8.8.8", "2606:4700::1111", "2001:4860:4860::8888", "198.20.0.1"} {
+		if !s.Contains(netip.MustParseAddr(a)) {
+			t.Errorf("%s is blocked by default", a)
+		}
+	}
+}
