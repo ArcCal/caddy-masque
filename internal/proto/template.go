@@ -207,7 +207,9 @@ func (t *Template) Expand(vars map[string]string) string {
 }
 
 // Match matches a request's path and query against the template and
-// returns the percent-decoded variables it carries, or nil and false.
+// returns the percent-decoded variables it carries, or nil and false. A
+// variable whose value is not percent-encoded UTF-8 is left out: the
+// request is for the template's resource, but malformed (RFC 9484 §4.1).
 func (t *Template) Match(pathAndQuery string) (map[string]string, bool) {
 	path, query, _ := strings.Cut(pathAndQuery, "?")
 	var pathParts []part
@@ -288,11 +290,9 @@ func (t *Template) Match(pathAndQuery string) (map[string]string, bool) {
 	for _, e := range queryExprs {
 		for _, p := range params {
 			if p.k == e.param {
-				// Like a path, a variable badly encoded does not match.
-				if !p.ok {
-					return nil, false
+				if p.ok {
+					out[e.variable] = p.v
 				}
-				out[e.variable] = p.v
 				break
 			}
 		}
@@ -331,11 +331,9 @@ func matchPath(parts []part, path string, out map[string]string) bool {
 		}
 		for j, name := range p.vars {
 			// Keep empty values so the protocol layer can reject them.
-			d, ok := decode(values[j])
-			if !ok {
-				return false
+			if d, ok := decode(values[j]); ok {
+				out[name] = d
 			}
-			out[name] = d
 		}
 	}
 	return path == ""
