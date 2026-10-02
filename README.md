@@ -89,6 +89,10 @@ HTTP/3 隧道会被拆掉**，这时放行 ICMPv6 Echo，或在确知没有中�
 
 路径模板默认是 `/.well-known/masque/ip/{target}/{ipproto}/`，和客户端默认值一致。
 改了的话，客户端的 `uri_template` 要跟着改。客户端 `uri_template` 里的主机名要和站点地址一致。
+模板可以用 RFC 9484 §3 允许的写法：路径和查询里的简单表达式（`{target}`、`{target,ipproto}`，
+前后可以有固定文字）、`{?target,ipproto}`、`{&...}`，以及固定参数（如 `?v=1`）。
+服务器没法无歧义地匹配的写法（两个表达式紧挨着、变量当参数名、`{?...}` 后面跟的文字不以 `&` 开头）
+在加载配置时报错，不会等到请求时才匹配不上。
 
 ## 用户管理
 
@@ -122,6 +126,11 @@ caddy masque-passwd --name iphone
 - **HTTP/2**：Go 的 HTTP/2 默认不接受扩展 CONNECT，要 `GODEBUG=http2xconnect=1`。
   本模块在程序启动时自动设置（无论用本项目的 `cmd/caddy` 还是 xcaddy 编译）；
   如果环境变量里明确写了 `http2xconnect=0`，就尊重它，此时 HTTP/2 隧道不可用，日志里有警告。
+- **只走加密连接**：RFC 9484 §4 要求 CONNECT-IP 跑在 TLS 或 QUIC 上。没有 TLS 的连接
+  （`http://` 站点、h2c）上的 CONNECT-IP 请求一律交给网站处理，不建隧道。
+- **畸形请求**：通过认证、但 `target`、`ipproto` 缺失或不合规，或带了内容头的请求是畸形的
+  （RFC 9484 §4.1、RFC 9297 §3.2）：回 400；HTTP/3 上还按 RFC 9114 §4.1.2 以 H3_MESSAGE_ERROR
+  结束请求流（STOP_SENDING，400 照样送达）。目的地址不允许（403）、DNS 失败（502）等是拒绝，不算畸形。
 - **超时**：Caddy 2.11 默认的读写空闲超时（1 分钟）和 `read_timeout`、`write_timeout` 不作用于隧道，
   隧道空闲多久都不断；对普通网页请求照常生效。
 - **不支持 HTTP/3 Datagram 的客户端**：用 DATAGRAM capsule 在流上传数据包（RFC 9297 §3.5）。
@@ -132,7 +141,10 @@ caddy masque-passwd --name iphone
 
 - `Alt-Svc` 头只加在带 `masque` 指令的站点上；同一端口上的其他站点照样能用 HTTP/3，只是不会被告知。
 - VPN 接管的 HTTP/3 不接受 0-RTT（重放风险），也不套用 Caddy 的 `packet_conn_wrappers`（如 UDP 上的 proxy protocol）。
-- HTTP/2 隧道因协议错误被中止时，流的错误码是 INTERNAL_ERROR 而不是 PROTOCOL_ERROR（Go 的 HTTP/2 服务端不让处理器指定错误码）。
+- HTTP/2 上，RFC 9113 §8.1.1 要求把畸形请求（以及畸形 capsule，RFC 9297 §3.3）当作 PROTOCOL_ERROR 流错误。
+  Caddy 用的 Go HTTP/2 服务端（`x/net/http2`）不让处理器指定错误码，处理器能触发的流重置只有 INTERNAL_ERROR，
+  所以畸形请求只回 400，畸形 capsule 中止隧道时错误码是 INTERNAL_ERROR。客户端照样把它当作失败
+  （RFC 9484 §4.5：非成功响应即失败），互通不受影响；要做到完全符合，只能换掉 Caddy 的 HTTP/2 服务端。
 
 ## 测试
 
