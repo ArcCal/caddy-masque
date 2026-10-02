@@ -91,6 +91,7 @@ HTTP/3 隧道会被拆掉**，这时放行 ICMPv6 Echo，或在确知没有中�
 改了的话，客户端的 `uri_template` 要跟着改。客户端 `uri_template` 里的主机名要和站点地址一致。
 模板可以用 RFC 9484 §3 允许的写法：路径和查询里的简单表达式（`{target}`、`{target,ipproto}`，
 前后可以有固定文字）、`{?target,ipproto}`、`{&...}`，以及固定参数（如 `?v=1`）。
+模板里可以有别的变量：客户端只定义 `target` 和 `ipproto`，别的变量展开时被省略（RFC 6570），服务器照此匹配。
 服务器没法无歧义地匹配的写法（两个表达式紧挨着、变量当参数名、`{?...}` 后面跟的文字不以 `&` 开头）
 在加载配置时报错，不会等到请求时才匹配不上。
 
@@ -143,8 +144,10 @@ caddy masque-passwd --name iphone
 - VPN 接管的 HTTP/3 不接受 0-RTT（重放风险），也不套用 Caddy 的 `packet_conn_wrappers`（如 UDP 上的 proxy protocol）。
 - HTTP/2 上，RFC 9113 §8.1.1 要求把畸形请求（以及畸形 capsule，RFC 9297 §3.3）当作 PROTOCOL_ERROR 流错误。
   Caddy 用的 Go HTTP/2 服务端（`x/net/http2`）不让处理器指定错误码，处理器能触发的流重置只有 INTERNAL_ERROR，
-  所以畸形请求只回 400，畸形 capsule 中止隧道时错误码是 INTERNAL_ERROR。客户端照样把它当作失败
-  （RFC 9484 §4.5：非成功响应即失败），互通不受影响；要做到完全符合，只能换掉 Caddy 的 HTTP/2 服务端。
+  所以畸形请求只回 400，畸形 capsule 中止隧道时错误码是 INTERNAL_ERROR。遵守 RFC 9484 的客户端照样把它当作失败
+  （§4.5：非成功响应即失败），但错误码的语义仍不符合 RFC 9113。这在本模块里修不了：给 `x/net/http2` 打补丁
+  只对本仓库的 `cmd/caddy` 生效，用 xcaddy 编译的照样是原样，同一版本会因编译方式不同而行为不同。
+  要等 Go 提供让处理器以指定错误码重置流的接口。
 
 ## 测试
 
