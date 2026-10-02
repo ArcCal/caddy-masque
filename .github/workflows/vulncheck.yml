@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           # The newest patch release of the line go.mod asks for: it carries the
           # standard library security fixes (go.mod says 1.26.0, the first release).
