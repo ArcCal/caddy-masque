@@ -469,6 +469,9 @@ func (a *App) serveHTTP3(network, hostport string, srv *caddyhttp.Server, tlsCfg
 		}
 		l.server = &http3.Server{
 			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// This server announced SETTINGS_H3_DATAGRAM; Caddy's own
+				// HTTP/3 server does not.
+				r = r.WithContext(context.WithValue(r.Context(), h3DatagramsKey{}, true))
 				(*l.handler.Load()).ServeHTTP(w, r)
 			}),
 			TLSConfig:       http3.ConfigureTLSConfig(base),
