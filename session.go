@@ -305,10 +305,11 @@ func (s *session) sendToClient(payload []byte) error {
 	case errors.As(err, &tooBig):
 		pkt := payload[1:]
 		v6 := len(pkt) > 0 && pkt[0]>>4 == 6
-		// RFC 9484 §7.1: an IPv6 tunnel must carry 1280-byte packets; if
-		// QUIC DATAGRAM frames cannot, the stream must be aborted.
-		if v6 && s.lease.hasIPv6() && tooBig.MaxDatagramPayloadSize < 1+ip.IPv6MinMTU {
-			return errAbort{"the path cannot carry 1280-byte IPv6 packets in QUIC datagrams (RFC 9484 §7.1)"}
+		// RFC 9484 §7.2: a tunnel with IPv6 must carry 1280-byte packets;
+		// once QUIC DATAGRAM frames are known not to, whatever packet
+		// showed it, the stream must be aborted.
+		if s.lease.hasIPv6() && tooBig.MaxDatagramPayloadSize < 1+ip.IPv6MinMTU {
+			return errAbort{"the path cannot carry 1280-byte IPv6 packets in QUIC datagrams (RFC 9484 §7.2)"}
 		}
 		mtu := int(tooBig.MaxDatagramPayloadSize) - 1
 		// An IPv4 packet without DF is fragmented, as a router would.
