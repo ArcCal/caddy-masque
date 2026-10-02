@@ -1,5 +1,6 @@
 # Tests every push to main and every pull request, and builds Caddy with
-# the module for Linux on x86_64 and arm64. For a published GitHub Release,
+# the module for Linux on x86_64 and arm64 and macOS on Apple silicon. For a
+# published GitHub Release,
 # the builds are attached to it.
 #
 # The end-to-end test needs masque-vpn's client, from the private
