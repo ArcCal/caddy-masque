@@ -795,8 +795,11 @@ func TestCaddyWithoutHTTP3(t *testing.T) {
 	if err := e.load(cfg); err != nil {
 		t.Fatal(err)
 	}
-	// Caddy serves HTTP/3 itself, without datagrams: the client sees the
-	// SETTINGS and does not use it for CONNECT-IP.
+	// Caddy serves HTTP/3 itself, without datagrams: CONNECT-IP works there
+	// too, its packets in DATAGRAM capsules even though the client announced
+	// H3_DATAGRAM (RFC 9297 §2.1.1 needs both sides).
+	capsuleTunnelH3(t, e, true)
+	waitNoSessions(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	conn, err := quic.DialAddr(ctx, fmt.Sprintf("127.0.0.1:%d", e.port), http3.ConfigureTLSConfig(e.tlsConfig("h3")),
@@ -1003,22 +1006,34 @@ func TestCaddyHTTP3WithoutDatagrams(t *testing.T) {
 	if err := e.load(masqueConfig("alice")); err != nil {
 		t.Fatal(err)
 	}
+	capsuleTunnelH3(t, e, false)
+}
+
+// capsuleTunnelH3 opens a CONNECT-IP tunnel over HTTP/3 whose packets must
+// travel in DATAGRAM capsules, the client announcing H3_DATAGRAM or not,
+// and sends a packet each way.
+func capsuleTunnelH3(t *testing.T, e *caddyEnv, clientDatagrams bool) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := quic.DialAddr(ctx, fmt.Sprintf("127.0.0.1:%d", e.port), http3.ConfigureTLSConfig(e.tlsConfig("h3")), nil)
+	conn, err := quic.DialAddr(ctx, fmt.Sprintf("127.0.0.1:%d", e.port), http3.ConfigureTLSConfig(e.tlsConfig("h3")),
+		&quic.Config{EnableDatagrams: clientDatagrams})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.CloseWithError(0, "")
-	cc := (&http3.Transport{}).NewClientConn(conn)
+	cc := (&http3.Transport{EnableDatagrams: clientDatagrams}).NewClientConn(conn)
 	<-cc.ReceivedSettings()
+	if !cc.Settings().EnableExtendedConnect {
+		t.Fatal("no extended CONNECT")
+	}
 	str, err := cc.OpenRequestStream(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	u, _ := url.Parse(e.url(anyTarget))
 	if err := str.SendRequestHeader(&http.Request{Method: http.MethodConnect, Proto: "connect-ip", Host: u.Host, URL: u,
-		Header: http.Header{"Authorization": {authorization(testPassword)}}}); err != nil {
+		Header: http.Header{"Capsule-Protocol": {"?1"}, "Authorization": {authorization(testPassword)}}}); err != nil {
 		t.Fatal(err)
 	}
 	resp, err := str.ReadResponse()
