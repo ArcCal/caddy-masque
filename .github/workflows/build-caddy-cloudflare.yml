@@ -1,0 +1,65 @@
+name: Build Caddy with MASQUE and Cloudflare
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.8'
+          cache: false
+
+      - name: Build pinned modules
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          mkdir build
+          cd build
+          go mod init caddy-custom-build
+          cat > main.go <<'EOF'
+          package main
+          import (
+              caddycmd "github.com/caddyserver/caddy/v2/cmd"
+              _ "github.com/caddyserver/caddy/v2/modules/standard"
+              _ "github.com/ArcCal/caddy-masque"
+              _ "github.com/caddy-dns/cloudflare"
+          )
+          func main() { caddycmd.Main() }
+          EOF
+          go get github.com/caddyserver/caddy/v2@v2.11.6 github.com/ArcCal/caddy-masque@57e6d17b0f0a3ff9c1a81ba36a8da40e0e20c1ce github.com/caddy-dns/cloudflare@a8737d095ad5a48ca031cea6ab704057dbc2d250
+          go mod tidy
+          go mod verify
+          mkdir -p dist/caddy-masque-cloudflare-linux-amd64
+          go build -mod=readonly -buildvcs=false -trimpath -ldflags '-s -w' -o dist/caddy-masque-cloudflare-linux-amd64/caddy .
+          binary=dist/caddy-masque-cloudflare-linux-amd64/caddy
+          "$binary" version
+          "$binary" list-modules > modules.txt
+          for module in masque http.handlers.masque dns.providers.cloudflare; do
+            grep -Fx "$module" modules.txt
+          done
+          go version -m "$binary" > dist/caddy-masque-cloudflare-linux-amd64/build-info.txt
+          cp go.mod go.sum dist/caddy-masque-cloudflare-linux-amd64/
+          cd dist
+          tar -czf caddy-masque-cloudflare-linux-amd64.tar.gz caddy-masque-cloudflare-linux-amd64
+          sha256sum caddy-masque-cloudflare-linux-amd64.tar.gz > caddy-masque-cloudflare-linux-amd64.tar.gz.sha256
+
+      - name: Upload downloadable artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: caddy-masque-cloudflare-linux-amd64
+          path: |
+            build/dist/*.tar.gz
+            build/dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
