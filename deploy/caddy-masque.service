@@ -20,6 +20,14 @@ ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
 # Caddy's certificates and state in /var/lib/caddy, its autosaved
 # configuration in /var/lib/caddy-config.
 Environment=XDG_DATA_HOME=/var/lib XDG_CONFIG_HOME=/var/lib/caddy-config
+# Caddy's admin API (configuration, reloads, /metrics) on a socket only root
+# can use. Its default, localhost:2019, has no authentication: every local
+# user and process could read the configuration, password hashes included,
+# load another one or stop the server, which runs as root. ExecReload finds
+# the socket through this too. An `admin` option in the Caddyfile overrides it.
+Environment="CADDY_ADMIN=unix//run/caddy-masque/admin.sock|0600"
+RuntimeDirectory=caddy-masque
+RuntimeDirectoryMode=0700
 TimeoutStopSec=10s
 LimitNOFILE=1048576
 Restart=on-failure

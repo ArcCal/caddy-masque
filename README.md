@@ -5,7 +5,8 @@ The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as
 - **Standards**: IETF MASQUE IP proxying, CONNECT-IP (RFC 9484); HTTP Datagrams and Capsules (RFC 9297);
   extended CONNECT over HTTP/2 and HTTP/3 (RFC 8441, RFC 9220). HTTP/3, HTTP/2 and HTTP/1.1 are all supported.
 - **Clients unchanged**: masque-vpn's `masque-client` and MasqueVPN on the Mac connect directly, without changing a single
-  line of their configuration (over HTTP/3 with IPv6 on, older clients need the note on the MTU probe below). Password hashes made by `caddy masque-passwd` and by masque-vpn's `masque-passwd` are interchangeable.
+  line of their configuration (a client with the server's IP address in its `uri_template` needs the `:443` in the site
+  addresses shown below; over HTTP/3 with IPv6 on, older clients need the note on the MTU probe below). Password hashes made by `caddy masque-passwd` and by masque-vpn's `masque-passwd` are interchangeable.
 - **Caddy handles certificates and traffic**: certificates are obtained and renewed automatically; the VPN and the website
   share port 443 (TCP and UDP); the same Caddy can go on hosting other sites and reverse proxies as usual.
 - **Looks like just a website**: only CONNECT-IP requests with a correct user name and password become tunnels;
@@ -62,7 +63,7 @@ The resulting `caddy` is a complete Caddy (with all the standard modules) plus t
 	}
 }
 
-vpn.example.com {
+vpn.example.com, :443 {
 	masque
 	root * /var/www/site
 	file_server
@@ -114,8 +115,15 @@ services listening on all addresses (SSH, databases, admin interfaces…) would 
 and host firewall rules written only for the public network interface would not cover them. When clients really should
 reach a service on the server, add `allow_host_access` (and restrict it yourself in the host firewall by the `masque0`
 interface). With `manage_network off` no rules are installed, and this is up to you.
-Caddy's admin endpoint listens only on `localhost:2019` by default, out of the clients' reach; do not make it listen on
-all addresses.
+
+Caddy's admin API (it shows and replaces the configuration, password hashes included, and can stop the server) has no
+authentication. Caddy's default for it is `localhost:2019`, where every local user and process could use it, and the
+service runs as root. So `deploy/caddy-masque.service` moves it to a unix socket only root can use,
+`/run/caddy-masque/admin.sock` (`CADDY_ADMIN` in the unit). `systemctl reload caddy-masque` uses it; to call it by hand,
+as root: `caddy reload --config /etc/caddy/Caddyfile --address 'unix//run/caddy-masque/admin.sock'`, or
+`curl --unix-socket /run/caddy-masque/admin.sock http://localhost/config/`. An `admin` option in the Caddyfile replaces
+the socket; if you set one, keep it a unix socket only root can reach, or `admin off`, and never put it on a network
+address.
 
 ### Against password guessing and pool exhaustion
 
@@ -130,7 +138,8 @@ all addresses.
 
 ### Monitoring
 
-Caddy's `metrics` directive and admin endpoint (`curl localhost:2019/metrics`) include these metrics:
+Caddy's `metrics` directive and admin endpoint (as root:
+`curl -s --unix-socket /run/caddy-masque/admin.sock http://localhost/metrics`) include these metrics:
 `caddy_masque_sessions_active{user}`, `caddy_masque_sessions_started_total`, `caddy_masque_auth_failures_total`,
 `caddy_masque_auth_throttled_total`, `caddy_masque_packets_total{direction}`, `caddy_masque_bytes_total{direction}`,
 `caddy_masque_packets_dropped_total`. The counters are not reset when the configuration is reloaded.
@@ -145,8 +154,18 @@ original values (leaving them alone if they were already on) and removes the nft
 ### Directive `masque [PATH_TEMPLATE]`
 
 The path template defaults to `/.well-known/masque/ip/{target}/{ipproto}/`, which matches the client's default.
-If you change it, change the client's `uri_template` to match. The host name in the client's `uri_template` must match
-the site address.
+If you change it, change the client's `uri_template` to match.
+
+Caddy picks the site by the host name a request names (`:authority` or `Host`), which comes from the authority of the
+client's `uri_template`. A request for a name no site lists gets Caddy's empty response, which clients take for a
+failure ("the server's response (200 OK) is malformed"). Clients that connect by IP address put the IP there:
+masque-vpn's `masque-client` with an IP in `uri_template` and the domain in `server_name`, and MasqueVPN on the Mac
+when its "IP" field is filled in. Hence the `:443` next to the domain in the examples and in the Caddyfile
+`install-server.sh` writes: it makes the site answer HTTPS requests on port 443 for any host name as well. Caddy
+requests no certificate for it (the clients check the domain's certificate, which they ask for by name), and HTTP
+requests are still redirected to HTTPS. A Caddyfile written by an earlier `install-server.sh` lacks it: add `, :443`
+after the domain on the site's first line and `systemctl reload caddy-masque`. Listing the IP address as a site address
+works too, but Caddy then also tries to get a certificate for the IP address from the public CAs.
 The template may use the forms RFC 9484 §3 allows: simple expressions in the path and query (`{target}`,
 `{target,ipproto}`, with fixed text before or after), `{?target,ipproto}`, `{&...}`, and fixed parameters (such as `?v=1`).
 The template may contain other variables: clients define only `target` and `ipproto`, other variables are left out when
@@ -174,7 +193,7 @@ subdomains, TLS is limited to version 1.3, and the website sends the usual secur
 	}
 }
 
-example.com, *.example.com {
+example.com, *.example.com, :443 {
 	tls {
 		protocols tls1.3
 		curves x25519mlkem768 x25519
@@ -207,9 +226,9 @@ example.com, *.example.com {
   environment variable: the service starts Caddy with `--environ`, which writes the whole environment to the log.
 - **Cloudflare's proxy must be off** for the VPN host name (DNS only, the grey cloud): Cloudflare does not pass CONNECT-IP
   or UDP 443 through. The DNS challenge needs neither port 80 nor 443 to be reachable.
-- **Site addresses**: the certificate and the routes cover `example.com` and every `*.example.com`. The host name in the
-  client's `uri_template` must be one of them (for example `vpn.example.com`); a request for any other name gets Caddy's
-  empty default response, which the client rejects.
+- **Site addresses**: the certificate covers `example.com` and every `*.example.com`; the client's `uri_template` names
+  one of them (for example `vpn.example.com`), or the server's IP address, which the `:443` lets through (see "Directive
+  `masque`" above).
 - **TLS**: QUIC and masque-vpn's client use TLS 1.3 only anyway. X25519MLKEM768 is the post-quantum key exchange recent
   browsers use; X25519 stays for everything else, masque-vpn's client included. There is no `alpn` line: the HTTP/3
   listener always offers `h3` whatever it says, but limiting TCP to `h2` would lock out clients that fall back to
@@ -217,7 +236,8 @@ example.com, *.example.com {
 - **Headers**: `-Server` removes the `Server: Caddy` header, so the cover site gives less away. `X-XSS-Protection` is
   left out because browsers no longer use it. `preload` in `Strict-Transport-Security` does nothing until the domain is
   submitted to [hstspreload.org](https://hstspreload.org/); after that, every subdomain must serve HTTPS, which is hard to
-  undo. Tunnel responses go through the same `header` handler; masque-vpn's client accepts them.
+  undo. These headers are on the website's responses only: `masque` runs before `header`, so a tunnel's own response
+  (which only clients with a valid password ever get, never a browser) does not pass through it.
 
 Tested with Caddy v2.11.6 built with this module and caddy-dns/cloudflare: `caddy validate` accepts the file, and with
 Caddy's internal CA in place of Cloudflare, the website sends the headers above, TLS 1.2 is refused, and masque-vpn's
@@ -235,7 +255,8 @@ yourself: `echo PASSWORD | caddy masque-passwd --name iphone --stdin`.
 
 ## Reloading the configuration
 
-`systemctl reload caddy-masque` (that is, `caddy reload`):
+`systemctl reload caddy-masque` (that is, `caddy reload` through the service's admin socket; see "Protecting the server
+itself" for running it by hand):
 
 - Connected tunnels **stay up**, over HTTP/3, HTTP/2 and HTTP/1.1 alike;
 - Users that were removed, or whose password changed, are **disconnected at once**;
