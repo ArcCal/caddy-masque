@@ -329,7 +329,10 @@ write_server_config() {
         for u in "${extra[@]}"; do echo "        $u"; done
         echo '    }'
         echo '}'
-        echo "https://vpn.test, https://$SERVER {"
+        # As install-server.sh writes it: the domain, and ":443" for every
+        # other host name, such as the server's IP address that the clients
+        # below put in their uri_template.
+        echo "https://vpn.test, :443 {"
         echo "    tls $PKI/fullchain.pem $PKI/privkey.pem"
         echo '    masque'
         echo "    root * $SITE"
@@ -378,7 +381,10 @@ served_cert() {
 }
 
 # Caddy's home, config and data directories, inside the test's directory.
-CADDY_ENV=(env HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/xdg-config" XDG_DATA_HOME="$WORK/xdg-data")
+# The admin API on a socket only root can use, as deploy/caddy-masque.service
+# sets it; caddy reload finds it through the same variable.
+CADDY_ENV=(env HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/xdg-config" XDG_DATA_HOME="$WORK/xdg-data"
+    CADDY_ADMIN="unix//$WORK/admin.sock|0600")
 ready_count() { grep -c '"masque ready"' "$WORK/server.log" 2>/dev/null; }
 start_server() { # waits for the next "masque ready"
     local want=$(($(ready_count) + 1))
@@ -486,6 +492,12 @@ check "Caddy starts" start_server
 check "Caddy raises its open file limit" \
     awk '/Max open files/ { exit !($4 > 1024) }' "/proc/$SERVER_PID/limits"
 check "Caddy serves HTTP/3 with datagrams on :443" grep -q '"serving HTTP/3 with HTTP datagrams".*:443' "$WORK/server.log"
+check "the admin API is a unix socket only its owner can use" test "$(stat -c %a "$WORK/admin.sock" 2>/dev/null)" = 600
+check_not "and nothing listens on localhost:2019" in_ns $NS_S bash -c "ss -ltnH 'sport = :2019' | grep -q ."
+check "root reads the metrics through the socket" \
+    bash -c "ip netns exec $NS_S curl -sf --unix-socket '$WORK/admin.sock' http://localhost/metrics | grep -q caddy_masque_sessions_started_total"
+check_not "another local user cannot use it" \
+    in_ns $NS_S runuser -u nobody -- curl -sf --max-time 2 --unix-socket "$WORK/admin.sock" http://localhost/config/
 check "the server lets its own ICMP errors out of the tunnel (accept_local)" \
     test "$(in_ns $NS_S sysctl -n net.ipv4.conf.masque0.accept_local 2>/dev/null)" = 1
 start_client "$WORK/client.toml" "$WORK/client.log"
@@ -589,7 +601,7 @@ check "no leftover rules in the rejected clients' namespace" bash -c "! ip netns
 
 echo "== a second instance"
 # It cannot take the TUN device, and must not disturb the running one.
-sed 's|^https://vpn.test, https://[0-9.]* {|https://vpn.test:8443 {|; s|^{|{\n    admin off\n    http_port 8080|' \
+sed 's|^https://vpn.test, :443 {|https://vpn.test:8443 {|; s|^{|{\n    admin off\n    http_port 8080|' \
     "$WORK/Caddyfile" >"$WORK/second.Caddyfile"
 in_ns $NS_S "${CADDY_ENV[@]}" timeout 15 "$CADDY" run --config "$WORK/second.Caddyfile" --adapter caddyfile >"$WORK/second-server.log" 2>&1
 check "a start-up error ends Caddy with a non-zero status" test $? = 1
