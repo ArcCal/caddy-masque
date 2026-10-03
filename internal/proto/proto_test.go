@@ -2,6 +2,7 @@ package proto
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"net/netip"
 	"reflect"
@@ -201,6 +202,79 @@ func TestRouteAdvertisement(t *testing.T) {
 	}
 	if _, err := NewAddressRange(a("10.0.0.1"), a("::1"), 0); err == nil {
 		t.Error("mixed families")
+	}
+}
+
+func TestProtocolZeroOverlapIsFoundWhereverItIs(t *testing.T) {
+	r := func(s, e string, p uint8) AddressRange {
+		x, err := NewAddressRange(a(s), a(e), p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return x
+	}
+	all4 := r("0.0.0.0", "255.255.255.255", 0)
+	zeros := []AddressRange{r("1.0.0.0", "1.0.0.9", 0), r("1.0.0.20", "1.0.0.29", 0)}
+	for _, c := range []struct {
+		name   string
+		ranges []AddressRange
+		ok     bool
+	}{
+		{"overlapping the end of a protocol-0 range", []AddressRange{r("1.0.0.0", "1.0.0.9", 0), r("1.0.0.9", "1.0.0.20", 6)}, false},
+		{"covering a protocol-0 range whole", []AddressRange{r("1.0.0.5", "1.0.0.6", 0), r("1.0.0.0", "1.0.0.10", 17)}, false},
+		{"adjacent", []AddressRange{r("1.0.0.0", "1.0.0.4", 0), r("1.0.0.5", "1.0.0.9", 6)}, true},
+		{"between two protocol-0 ranges", []AddressRange{zeros[0], zeros[1], r("1.0.0.10", "1.0.0.19", 6)}, true},
+		{"reaching into the second protocol-0 range", []AddressRange{zeros[0], zeros[1], r("1.0.0.10", "1.0.0.20", 6)}, false},
+		{"other IP version", []AddressRange{all4, r("::", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", 6)}, true},
+		{"same IP version after another", []AddressRange{all4, r("::", "::1", 0), r("::1", "::2", 6)}, false},
+	} {
+		if err := ValidateRoutes(c.ranges); (err == nil) != c.ok {
+			t.Errorf("%s: got %v", c.name, err)
+		}
+	}
+}
+
+// One capsule at the size limit: 3 277 protocol-0 ranges, then 3 277
+// protocol-6 ones, none overlapping. Checking every pair took about 260 ms
+// per capsule; decoding and checking it now takes about a millisecond.
+func TestAFullRouteCapsuleIsCheckedQuickly(t *testing.T) {
+	capsule := func(overlap bool) []byte {
+		var v []byte
+		push := func(start, end uint32, protocol byte) {
+			v = append(v, 4)
+			v = binary.BigEndian.AppendUint32(v, start)
+			v = binary.BigEndian.AppendUint32(v, end)
+			v = append(v, protocol)
+		}
+		for i := range uint32(3277) {
+			push(0x0100_0000+2*i, 0x0100_0000+2*i, 0)
+		}
+		for i := range uint32(3277) {
+			start, end := 0x0100_0001+2*i, 0x0100_0001+2*i
+			if overlap && i == 1638 {
+				end++ // reaches into the next protocol-0 range
+			}
+			push(start, end, 6)
+		}
+		if len(v) > DefaultMaxValueLen {
+			t.Fatalf("%d bytes is over the limit", len(v))
+		}
+		return v
+	}
+	good := capsule(false)
+	started := time.Now()
+	for range 10 {
+		if _, err := decodeValue(TypeRouteAdvertisement, good); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Generous, for the race detector and slow CI machines; the quadratic
+	// check took over 2 s for these 10.
+	if d := time.Since(started); d > time.Second {
+		t.Errorf("%v for 10 capsules", d)
+	}
+	if _, err := decodeValue(TypeRouteAdvertisement, capsule(true)); err == nil {
+		t.Error("a range in the middle that reaches into a protocol-0 one was accepted")
 	}
 }
 
