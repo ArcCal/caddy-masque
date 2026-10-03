@@ -5,12 +5,16 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/caddyserver/caddy/v2"
 	caddycmd "github.com/caddyserver/caddy/v2/cmd"
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"golang.org/x/term"
 
 	"github.com/ArcCal/caddy-masque/internal/auth"
 )
@@ -36,6 +40,37 @@ the lines for the masque-vpn client configuration.
 			cmd.RunE = caddycmd.WrapCommandFuncForCobra(cmdPasswd)
 		},
 	})
+	cobra.OnFinalize(flushStartupLog)
+}
+
+// flushStartupLog writes the log entries Caddy still holds back to standard
+// error. `caddy run` keeps its log in memory until the configuration's logging
+// is set up; when reading or adapting the configuration fails (a missing file,
+// a Caddyfile error), it writes out what it held, then logs the error into the
+// same buffer, which nothing writes out again: the program exits with status 1
+// without saying why (Caddy v2.11.6 and v2.11.7). Cobra runs this when a
+// command returns; Caddy's logger is then still the buffer only in that case.
+func flushStartupLog() {
+	buffer, ok := caddy.Log().Core().(interface{ FlushTo(*zap.Logger) })
+	if !ok {
+		return
+	}
+	buffer.FlushTo(zap.New(zapcore.NewCore(stderrLogEncoder(), zapcore.Lock(os.Stderr), zapcore.DebugLevel)))
+}
+
+// stderrLogEncoder formats log entries the way Caddy's default logger does.
+func stderrLogEncoder() zapcore.Encoder {
+	cfg := zap.NewProductionEncoderConfig()
+	if !term.IsTerminal(int(os.Stderr.Fd())) {
+		return zapcore.NewJSONEncoder(cfg)
+	}
+	cfg.EncodeTime = func(ts time.Time, enc zapcore.PrimitiveArrayEncoder) {
+		enc.AppendString(ts.UTC().Format("2006/01/02 15:04:05.000"))
+	}
+	if os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "xterm-mono" {
+		cfg.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	}
+	return zapcore.NewConsoleEncoder(cfg)
 }
 
 func cmdPasswd(fl caddycmd.Flags) (int, error) {

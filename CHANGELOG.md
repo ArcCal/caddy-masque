@@ -2,6 +2,13 @@
 
 Each version is tagged with its number; CI attaches Caddy builds to its release on GitHub.
 
+## Unreleased
+
+- `caddy run`, and so the caddy-masque service, says why it stops when the configuration file is missing or cannot be
+  read or adapted (a Caddyfile error). Caddy v2.11.6 and v2.11.7 log that error where it is never written: the log ends
+  with "using config from file" and the program exits with status 1. This module now writes it out, in builds made
+  with this project's `cmd/caddy` and with xcaddy alike.
+
 ## 1.0
 
 The first stable version. The code is that of 0.99, which has every fix of the pre-production audit
