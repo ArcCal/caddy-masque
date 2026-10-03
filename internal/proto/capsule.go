@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sort"
 
 	"github.com/quic-go/quic-go/quicvarint"
 )
@@ -238,12 +239,24 @@ func ValidateRoutes(ranges []AddressRange) error {
 			return MalformedError("routes are not ordered or overlap")
 		}
 	}
-	for _, all := range ranges {
-		if all.Protocol != 0 {
-			continue
+	// A protocol-0 range must not overlap a range for a specific protocol.
+	// Checking every pair would take quadratic time, which a peer could
+	// exploit with one large capsule. Within each IP version the protocol-0
+	// ranges come first and are sorted and disjoint (checked above), so
+	// their ends ascend with their starts: of those starting at or before a
+	// range's end, only the last can reach back into it.
+	for len(ranges) > 0 {
+		n := 1
+		for n < len(ranges) && ranges[n].version() == ranges[0].version() {
+			n++
 		}
-		for _, r := range ranges {
-			if r.Protocol != 0 && r.overlaps(all) {
+		version := ranges[:n]
+		ranges = ranges[n:]
+		zeros := sort.Search(len(version), func(i int) bool { return version[i].Protocol != 0 })
+		all, specific := version[:zeros], version[zeros:]
+		for _, r := range specific {
+			before := sort.Search(len(all), func(i int) bool { return r.End.Less(all[i].Start) })
+			if before > 0 && all[before-1].overlaps(r) {
 				return MalformedError("protocol-0 route overlaps a protocol-specific route")
 			}
 		}
