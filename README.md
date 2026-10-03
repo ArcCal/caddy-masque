@@ -15,6 +15,8 @@ The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as
 
 Linux only (needs root: it creates a TUN device and sets up forwarding and NAT).
 
+Current version 1.0. The differences between versions are in [CHANGELOG.md](CHANGELOG.md).
+
 ## One-step install
 
 On Debian 12/13 or Ubuntu 22.04/24.04, with the domain already pointing at the server:
