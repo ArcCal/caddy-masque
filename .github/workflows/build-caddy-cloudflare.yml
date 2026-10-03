@@ -10,6 +10,12 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 57e6d17b0f0a3ff9c1a81ba36a8da40e0e20c1ce
+          path: source
+          persist-credentials: false
+
       - uses: actions/setup-go@v7
         with:
           go-version: '1.26.8'
@@ -37,7 +43,8 @@ jobs:
           )
           func main() { caddycmd.Main() }
           EOF
-          go get github.com/caddyserver/caddy/v2@v2.11.6 github.com/ArcCal/caddy-masque@57e6d17b0f0a3ff9c1a81ba36a8da40e0e20c1ce github.com/caddy-dns/cloudflare@a8737d095ad5a48ca031cea6ab704057dbc2d250
+          go mod edit -require=github.com/ArcCal/caddy-masque@v0.0.0 -replace=github.com/ArcCal/caddy-masque=../source
+          go get github.com/caddyserver/caddy/v2@v2.11.6 github.com/caddy-dns/cloudflare@a8737d095ad5a48ca031cea6ab704057dbc2d250
           go mod tidy
           go mod verify
           mkdir -p dist/caddy-masque-cloudflare-linux-amd64
