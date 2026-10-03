@@ -14,6 +14,13 @@ const (
 	rustPassword = "Lz4Iwq-Zj-Nypqg4TUubfWV_"
 )
 
+var src = netip.MustParseAddr("192.0.2.1")
+
+// source is the i-th of many distinct sources.
+func source(i int) netip.Addr {
+	return netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
+}
+
 func TestHashesFromMasquePasswdVerify(t *testing.T) {
 	if err := ValidateHash(rustHash); err != nil {
 		t.Fatal(err)
@@ -81,12 +88,12 @@ func TestVerify(t *testing.T) {
 	a := New()
 	a.Replace(map[string]string{"alice": rustHash})
 	ctx := context.Background()
-	u, ok, err := a.Verify(ctx, BasicAuthorization("alice", rustPassword))
+	u, ok, err := a.Verify(ctx, BasicAuthorization("alice", rustPassword), src)
 	if !ok || err != nil || u.Name != "alice" {
 		t.Fatal(u, ok, err)
 	}
 	for _, h := range []string{BasicAuthorization("alice", "nope"), BasicAuthorization("mallory", rustPassword), ""} {
-		if _, ok, _ := a.Verify(ctx, h); ok {
+		if _, ok, _ := a.Verify(ctx, h, src); ok {
 			t.Errorf("%q accepted", h)
 		}
 	}
@@ -95,7 +102,7 @@ func TestVerify(t *testing.T) {
 	if a.IsCurrent(u) {
 		t.Fatal("stale user")
 	}
-	if _, ok, _ := a.Verify(ctx, BasicAuthorization("alice", rustPassword)); ok {
+	if _, ok, _ := a.Verify(ctx, BasicAuthorization("alice", rustPassword), src); ok {
 		t.Fatal("old password")
 	}
 }
@@ -111,9 +118,9 @@ func TestFullQueueIsAnsweredAtOnce(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, a.maxWaiting)
-	for range a.maxWaiting {
+	for i := range a.maxWaiting {
 		go func() {
-			_, _, err := a.Verify(ctx, BasicAuthorization("alice", rustPassword))
+			_, _, err := a.Verify(ctx, BasicAuthorization("alice", rustPassword), source(int(i)))
 			done <- err
 		}()
 	}
@@ -124,16 +131,16 @@ func TestFullQueueIsAnsweredAtOnce(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if _, _, err := a.Verify(context.Background(), BasicAuthorization("alice", rustPassword)); !errors.Is(err, ErrBusy) {
+	if _, _, err := a.Verify(context.Background(), BasicAuthorization("alice", rustPassword), src); !errors.Is(err, ErrBusy) {
 		t.Fatal(err)
 	}
-	if _, _, err := a.Verify(context.Background(), BasicAuthorization("alice", rustPassword)); !errors.Is(err, ErrBusy) {
+	if _, _, err := a.Verify(context.Background(), BasicAuthorization("alice", rustPassword), src); !errors.Is(err, ErrBusy) {
 		t.Fatal(err)
 	}
 	if busy != 1 {
 		t.Fatal("warned", busy)
 	}
-	if _, ok, err := a.Verify(context.Background(), ""); ok || err != nil {
+	if _, ok, err := a.Verify(context.Background(), "", src); ok || err != nil {
 		t.Fatal("no credentials: answered as before")
 	}
 	// Cancelled requests leave the queue.
@@ -149,8 +156,241 @@ func TestFullQueueIsAnsweredAtOnce(t *testing.T) {
 	for range cap(a.slots) {
 		<-a.slots
 	}
-	if _, ok, err := a.Verify(context.Background(), BasicAuthorization("alice", rustPassword)); !ok || err != nil {
+	if _, ok, err := a.Verify(context.Background(), BasicAuthorization("alice", rustPassword), src); !ok || err != nil {
 		t.Fatal(ok, err)
+	}
+	waitFor(t, "every source's place given back", func() bool { return a.sourcesInUse() == 0 })
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out: " + what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (a *Authenticator) sourcesInUse() int {
+	a.sourcesMu.Lock()
+	defer a.sourcesMu.Unlock()
+	n := 0
+	for _, v := range a.sources {
+		n += v
+	}
+	return n
+}
+
+// fill takes every slot and fills the queue with made-up credentials from
+// distinct sources; the returned function empties it again.
+func fill(t *testing.T, a *Authenticator) func() {
+	t.Helper()
+	for range cap(a.slots) {
+		a.slots <- struct{}{}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	for i := range a.maxWaiting {
+		go func() {
+			a.Verify(ctx, BasicAuthorization("mallory", "guess"), source(int(i)))
+			done <- struct{}{}
+		}()
+	}
+	waitFor(t, "queue full", func() bool { return a.waiting.Load() == a.maxWaiting })
+	return func() {
+		cancel()
+		for range a.maxWaiting {
+			<-done
+		}
+		for range cap(a.slots) {
+			<-a.slots
+		}
+	}
+}
+
+func TestRememberedCredentialsGetInWhileAFloodFillsTheQueue(t *testing.T) {
+	a := New()
+	a.Replace(map[string]string{"alice": rustHash})
+	header := BasicAuthorization("alice", rustPassword)
+	if _, ok := a.Remembered(header); ok {
+		t.Fatal("remembered before any verification")
+	}
+	if _, ok, err := a.Verify(context.Background(), header, src); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	empty := fill(t, a)
+	defer empty()
+	if _, _, err := a.Verify(context.Background(), BasicAuthorization("mallory", "guess"), src); !errors.Is(err, ErrBusy) {
+		t.Fatal(err)
+	}
+	// Alice gets in at once, from any address, also through Remembered.
+	u, ok, err := a.Verify(context.Background(), header, source(1<<20))
+	if !ok || err != nil || u.Name != "alice" || !a.IsCurrent(u) {
+		t.Fatal(u, ok, err)
+	}
+	if u, ok := a.Remembered(header); !ok || u.Name != "alice" || !a.IsCurrent(u) {
+		t.Fatal(u, ok)
+	}
+	// Only her correct password is remembered.
+	wrong := BasicAuthorization("alice", "wrong")
+	if _, ok := a.Remembered(wrong); ok {
+		t.Fatal("wrong password remembered")
+	}
+	if _, _, err := a.Verify(context.Background(), wrong, src); !errors.Is(err, ErrBusy) {
+		t.Fatal(err)
+	}
+	for _, h := range []string{"", "Basic", BasicAuthorization("mallory", rustPassword)} {
+		if _, ok := a.Remembered(h); ok {
+			t.Fatalf("%q remembered", h)
+		}
+	}
+}
+
+func TestAChangedOrRemovedPasswordIsNotRemembered(t *testing.T) {
+	a := New()
+	a.Replace(map[string]string{"alice": rustHash})
+	old := BasicAuthorization("alice", rustPassword)
+	if _, ok, _ := a.Verify(context.Background(), old, src); !ok {
+		t.Fatal("old password")
+	}
+	a.Replace(map[string]string{"alice": HashPassword("new-password")})
+	if _, ok := a.Remembered(old); ok {
+		t.Fatal("changed password remembered")
+	}
+	if _, ok, _ := a.Verify(context.Background(), old, src); ok {
+		t.Fatal("changed password accepted")
+	}
+	updated := BasicAuthorization("alice", "new-password")
+	if _, ok, _ := a.Verify(context.Background(), updated, src); !ok {
+		t.Fatal("new password")
+	}
+	a.Replace(nil)
+	if _, ok := a.Remembered(updated); ok {
+		t.Fatal("removed user remembered")
+	}
+	if _, ok, _ := a.Verify(context.Background(), updated, src); ok {
+		t.Fatal("removed user accepted")
+	}
+	// The user comes back with the same hash: the old entry is valid again,
+	// as the same password would verify.
+	a.Replace(map[string]string{"alice": rustHash})
+	if _, ok := a.Remembered(old); !ok {
+		t.Fatal("same hash, same password")
+	}
+}
+
+func TestRememberedCredentialsExpire(t *testing.T) {
+	a := New()
+	a.Replace(map[string]string{"alice": rustHash, "bob": rustHash})
+	alice := BasicAuthorization("alice", rustPassword)
+	if _, ok, _ := a.Verify(context.Background(), alice, src); !ok {
+		t.Fatal("alice")
+	}
+	tag := a.tag("alice", rustPassword)
+	a.verified[tag] = remembered{rustHash, time.Now().Add(-rememberFor + time.Minute)}
+	// A use renews the entry.
+	if _, ok := a.Remembered(alice); !ok {
+		t.Fatal("not yet expired")
+	}
+	if time.Since(a.verified[tag].at) > time.Minute {
+		t.Fatal("use did not renew the entry")
+	}
+	a.verified[tag] = remembered{rustHash, time.Now().Add(-rememberFor)}
+	if _, ok := a.Remembered(alice); ok {
+		t.Fatal("expired entry used")
+	}
+	// Expired entries are dropped when another is added.
+	if _, ok, _ := a.Verify(context.Background(), BasicAuthorization("bob", rustPassword), src); !ok {
+		t.Fatal("bob")
+	}
+	if _, kept := a.verified[tag]; kept || len(a.verified) != 1 {
+		t.Fatal("expired entry kept", len(a.verified))
+	}
+}
+
+func TestOneSourceCannotFillTheQueue(t *testing.T) {
+	a := New()
+	a.Replace(map[string]string{"alice": rustHash})
+	for range cap(a.slots) {
+		a.slots <- struct{}{}
+	}
+	header := BasicAuthorization("alice", rustPassword)
+	// Two addresses of one IPv6 /64 are one source.
+	x, y := netip.MustParseAddr("2001:db8:1:2::10"), netip.MustParseAddr("2001:db8:1:2::20")
+	type result struct {
+		ok  bool
+		err error
+	}
+	verify := func(ctx context.Context, from netip.Addr) chan result {
+		c := make(chan result, 1)
+		go func() {
+			_, ok, err := a.Verify(ctx, header, from)
+			c <- result{ok, err}
+		}()
+		return c
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var queued []chan result
+	for i := range perSource {
+		queued = append(queued, verify(ctx, []netip.Addr{x, y}[i%2]))
+	}
+	waitFor(t, "all queued", func() bool { return a.waiting.Load() == perSource })
+	if _, _, err := a.Verify(context.Background(), header, y); !errors.Is(err, ErrBusy) {
+		t.Fatal("the /64 has had its share:", err)
+	}
+	// Another source still gets a place in the queue.
+	other := verify(context.Background(), netip.MustParseAddr("2001:db8:1:3::1"))
+	waitFor(t, "other queued", func() bool { return a.waiting.Load() == perSource+1 })
+	// Cancelled requests give their source's places back.
+	cancel()
+	for _, c := range queued {
+		if r := <-c; !errors.Is(r.err, context.Canceled) {
+			t.Fatal(r.err)
+		}
+	}
+	again := verify(context.Background(), x)
+	waitFor(t, "queued again", func() bool { return a.waiting.Load() == 2 })
+	for range cap(a.slots) {
+		<-a.slots
+	}
+	for _, c := range []chan result{other, again} {
+		if r := <-c; !r.ok || r.err != nil {
+			t.Fatal(r)
+		}
+	}
+	waitFor(t, "every place given back", func() bool { return a.sourcesInUse() == 0 && len(a.sources) == 0 })
+}
+
+func TestACancelledVerificationKeepsItsPlacesUntilHashingFinishes(t *testing.T) {
+	a := New()
+	a.Replace(map[string]string{"alice": rustHash})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// The slot is free, so hashing starts; the cancelled context returns
+	// at once while it runs.
+	_, _, err := a.Verify(ctx, BasicAuthorization("alice", rustPassword), src)
+	if !errors.Is(err, context.Canceled) {
+		// The result can win the race only if hashing was that fast.
+		t.Skip("hashing finished first:", err)
+	}
+	if a.sourcesInUse() != 1 || len(a.slots) != 1 {
+		t.Fatal("places given back while hashing runs", a.sourcesInUse(), len(a.slots))
+	}
+	waitFor(t, "places given back", func() bool { return a.sourcesInUse() == 0 && len(a.slots) == 0 })
+}
+
+func TestSourcesAreAddressesOrIPv6Slash64s(t *testing.T) {
+	k := func(s string) netip.Addr { return sourceKey(netip.MustParseAddr(s)) }
+	if k("192.0.2.7") != k("::ffff:192.0.2.7") || k("192.0.2.7") == k("192.0.2.8") {
+		t.Error("IPv4")
+	}
+	if k("2001:db8:1:2:aaaa::1") != k("2001:db8:1:2:bbbb::2") || k("2001:db8:1:2::1") == k("2001:db8:1:3::1") {
+		t.Error("IPv6")
+	}
+	if k("fe80::1%eth0") != k("fe80::2") {
+		t.Error("zone")
 	}
 }
 

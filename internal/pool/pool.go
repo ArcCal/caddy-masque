@@ -19,9 +19,14 @@ import (
 	"net/netip"
 )
 
-// IPv6 prefixes with at least this many host bits get random interface
-// identifiers, which essentially never repeat, instead of tracked reuse.
-const randomIIDBits = 16
+// IPv6 prefixes with at least this many host bits (a /64 or shorter) get
+// random interface identifiers, which essentially never repeat, instead of
+// tracked reuse. In a smaller prefix a random pick can be an address
+// another session used while its connection tracking entries are still
+// there (a /112 holds only 65 536 addresses), so those are tracked like IPv4
+// pools, and a reused address is cleared first. masque-vpn uses the same
+// threshold.
+const randomIIDBits = 64
 
 type entry struct {
 	host uint64

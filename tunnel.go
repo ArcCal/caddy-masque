@@ -2,8 +2,11 @@ package masque
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"reflect"
 	"sync"
@@ -14,6 +17,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
 
+	"github.com/ArcCal/caddy-masque/internal/hostnet"
 	"github.com/ArcCal/caddy-masque/internal/proto"
 )
 
@@ -225,6 +229,66 @@ func rawBody(body io.ReadCloser) io.ReadCloser {
 		}
 		return body
 	}
+}
+
+// TCP settings of the connections that carry tunnels over HTTP/1.1 and
+// HTTP/2, the same as masque-vpn's server: a client that went away without
+// closing its connection (a laptop or phone that changed networks) is
+// noticed within about 30 seconds rather than the 2.5 minutes of Caddy's
+// keepalive, so its address and its place among its user's sessions are
+// free again soon. The user timeout (Linux) ends the connection when data
+// sent stays unacknowledged that long; the keepalive probes find a client
+// that went while its tunnel was idle. They apply whatever the server's
+// keepalive options; tunnels over HTTP/3 end after the QUIC idle timeout.
+var tunnelKeepAlive = net.KeepAliveConfig{Enable: true, Idle: 10 * time.Second, Interval: 5 * time.Second, Count: 4}
+
+const tunnelUserTimeout = 30 * time.Second
+
+// tuneTunnelConn applies them to the TCP connection under c. A variable
+// for tests.
+var tuneTunnelConn = func(c net.Conn) error {
+	tc, ok := tcpConnOf(c)
+	if !ok {
+		return fmt.Errorf("no TCP connection found under %T", c)
+	}
+	if err := tc.SetKeepAliveConfig(tunnelKeepAlive); err != nil {
+		return err
+	}
+	return hostnet.SetTCPUserTimeout(tc, tunnelUserTimeout)
+}
+
+// tcpConnOf finds the TCP connection under TLS, the PROXY protocol and
+// Caddy's listener wrappers, which keep it in an embedded net.Conn.
+func tcpConnOf(c net.Conn) (*net.TCPConn, bool) {
+	for range 16 {
+		switch x := c.(type) {
+		case *net.TCPConn:
+			return x, true
+		case *tls.Conn:
+			c = x.NetConn()
+			continue
+		case interface{ Raw() net.Conn }:
+			c = x.Raw()
+			continue
+		}
+		v := reflect.ValueOf(c)
+		if v.Kind() == reflect.Pointer && !v.IsNil() {
+			v = v.Elem()
+		}
+		if v.Kind() != reflect.Struct {
+			return nil, false
+		}
+		f := v.FieldByName("Conn")
+		if !f.IsValid() || !f.CanInterface() {
+			return nil, false
+		}
+		inner, ok := f.Interface().(net.Conn)
+		if !ok || inner == nil {
+			return nil, false
+		}
+		c = inner
+	}
+	return nil, false
 }
 
 // unwrapStreamer finds the HTTP/3 stream behind Caddy's response writer

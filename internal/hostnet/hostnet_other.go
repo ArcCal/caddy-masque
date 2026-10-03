@@ -7,8 +7,10 @@ package hostnet
 
 import (
 	"errors"
+	"net"
 	"net/netip"
 	"runtime"
+	"time"
 )
 
 // NFTTable is the nftables table of forwarding and NAT.
@@ -33,10 +35,11 @@ var errLinuxOnly = errors.New("the masque app needs Linux (a TUN device, nftable
 // Open fails: the tunnel's host side exists only on Linux.
 func Open(Config) (*Network, error) { return nil, errLinuxOnly }
 
-func (*Network) Name() string              { return "" }
-func (*Network) Read([]byte) (int, error)  { return 0, errLinuxOnly }
-func (*Network) Write([]byte) (int, error) { return 0, errLinuxOnly }
-func (*Network) Close() error              { return nil }
-func (*Network) Repair() []string          { return nil }
-func SetSysctl(string, string) error       { return errLinuxOnly }
-func Forget([]netip.Prefix) (int, error)   { return 0, errLinuxOnly }
+func (*Network) Name() string                             { return "" }
+func (*Network) Read([]byte) (int, error)                 { return 0, errLinuxOnly }
+func (*Network) Write([]byte) (int, error)                { return 0, errLinuxOnly }
+func (*Network) Close() error                             { return nil }
+func (*Network) Repair() []string                         { return nil }
+func SetSysctl(string, string) error                      { return errLinuxOnly }
+func Forget([]netip.Prefix) (int, error)                  { return 0, errLinuxOnly }
+func SetTCPUserTimeout(*net.TCPConn, time.Duration) error { return errLinuxOnly }
