@@ -112,6 +112,42 @@ func TestRandomIPv6InPrefix(t *testing.T) {
 	}
 }
 
+// Below 64 host bits a random pick could land on an address another session
+// used, whose connection tracking entries are still there: such pools are
+// tracked, and every reuse is reported so the server clears them first.
+func TestIPv6PoolsSmallerThanA64TrackReuse(t *testing.T) {
+	pool := New(netip.Prefix{}, p("fd00::1/112"))
+	seen := map[netip.Addr]bool{}
+	for i := range 70000 {
+		a, used, ok := pool.Allocate(true)
+		if !ok {
+			t.Fatal("pool empty")
+		}
+		if seen[a] != used {
+			t.Fatalf("session %d got %v: used before %v, reported %v", i, a, seen[a], used)
+		}
+		seen[a] = true
+		pool.Release(a)
+	}
+	// 65 534 assignable addresses: every one was handed out once before any
+	// came back.
+	if len(seen) != 1<<16-2 {
+		t.Fatalf("%d addresses used", len(seen))
+	}
+	for _, s := range []string{"fd00::1/65", "fd00::1/96"} {
+		pool := New(netip.Prefix{}, p(s))
+		a, used, ok := pool.Allocate(true)
+		b, _, _ := pool.Allocate(true)
+		if !ok || used || a == b || !p(s).Masked().Contains(a) || a == p(s).Addr() {
+			t.Errorf("%s: %v %v %v %v", s, a, b, used, ok)
+		}
+		pool.Release(a)
+		if !pool.Claim(a) || pool.Claim(a) {
+			t.Errorf("%s: a returned address can be claimed once", s)
+		}
+	}
+}
+
 func TestSmallIPv6PrefixIsExhaustedCleanly(t *testing.T) {
 	pool := New(netip.Prefix{}, p("fd89::1/126"))
 	got := map[netip.Addr]bool{}

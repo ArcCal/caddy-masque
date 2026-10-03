@@ -13,9 +13,10 @@ import (
 // purpose, and the generated passwords cannot be guessed, but a user-chosen
 // password can, and every attempt costs the server CPU and memory.
 //
-// Clients are told apart by address: IPv4 by the whole address, IPv6 by the
-// /64. Clients behind one shared address share the budget, so a short window
-// bounds how long one of them can lock the others out.
+// Clients are told apart by source (see sourceKey). Clients behind one
+// shared address share the budget, so a short window bounds how long one of
+// them can lock the others out; credentials verified recently still get in
+// (see Authenticator.Remembered).
 type FailureLimiter struct {
 	max    int
 	window time.Duration
@@ -37,7 +38,9 @@ func NewFailureLimiter(max int, window time.Duration) *FailureLimiter {
 	return &FailureLimiter{max: max, window: window, m: map[netip.Addr]*failures{}, maxEntries: 10000}
 }
 
-func key(a netip.Addr) netip.Addr {
+// sourceKey is what counts as one client: an IPv4 address, or the /64 of
+// an IPv6 address, since one host usually has a whole /64 to choose from.
+func sourceKey(a netip.Addr) netip.Addr {
 	a = a.Unmap().WithZone("")
 	if a.Is6() {
 		p, _ := a.Prefix(64)
@@ -54,7 +57,7 @@ func (l *FailureLimiter) Blocked(a netip.Addr) bool {
 func (l *FailureLimiter) blockedAt(a netip.Addr, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	f := l.m[key(a)]
+	f := l.m[sourceKey(a)]
 	return f != nil && now.Sub(f.start) < l.window && f.n >= l.max
 }
 
@@ -64,7 +67,7 @@ func (l *FailureLimiter) Fail(a netip.Addr) { l.failAt(a, time.Now()) }
 func (l *FailureLimiter) failAt(a netip.Addr, now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	k := key(a)
+	k := sourceKey(a)
 	f := l.m[k]
 	if f != nil && now.Sub(f.start) >= l.window {
 		f = nil

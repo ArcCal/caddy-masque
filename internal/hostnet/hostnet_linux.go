@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -322,4 +323,21 @@ func Forget(prefixes []netip.Prefix) (int, error) {
 		}
 	}
 	return total, nil
+}
+
+// SetTCPUserTimeout sets TCP_USER_TIMEOUT: the kernel ends the connection
+// when data sent on it stays unacknowledged for d, and also when keepalive
+// probes go unanswered that long.
+func SetTCPUserTimeout(c *net.TCPConn, d time.Duration) error {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var serr error
+	if err := raw.Control(func(fd uintptr) {
+		serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, int(d.Milliseconds()))
+	}); err != nil {
+		return err
+	}
+	return serr
 }

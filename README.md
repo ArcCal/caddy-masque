@@ -127,14 +127,24 @@ address.
 
 ### Against password guessing and pool exhaustion
 
-- After more than 10 requests with wrong credentials within a minute from one client address (for IPv6, per /64), its
+- After 10 requests with wrong credentials within a minute from one client address (for IPv6, per /64), its
   requests that carry credentials are not checked for the next minute but are treated as ordinary web requests (like
-  requests without credentials). Users sharing an outgoing address affect one another during that minute.
+  requests without credentials). Users sharing an outgoing address affect one another during that minute, except
+  those whose credentials are remembered (below).
   Generated passwords have 144 bits and cannot be guessed; passwords of your own given to `masque-passwd --stdin` need
   at least 12 characters; make them long and random.
+- Checking a password (Argon2id) takes tens of milliseconds and megabytes of memory, so only a few checks run at once
+  and a limited number wait. One client address (for IPv6, per /64) may have at most 4 checks waiting or running;
+  beyond that, or when the queue is full, requests get 503. Credentials that were correct in the last 12 hours skip
+  the check, the queue and the limit above: the server remembers them in memory only, as an HMAC under a key made at
+  start-up, and only as long as that user's hash stays the same. So a flood of made-up credentials, even from many
+  addresses, does not keep out users who connected before; a user's first connection (after a restart, a new
+  password) can get 503 during such a flood, and masque-client tries again with backoff. masque-vpn's server does the
+  same.
 - Each user may have at most `max_sessions` tunnels at once (default 8); requests beyond that get 429. Otherwise one
   account could take the whole address pool and crowd out the other users. When a device reconnects after losing its
-  connection, the old tunnel still counts until the server notices it is gone, so do not set this to 1.
+  connection, the old tunnel still counts until the server notices it is gone (see Timeouts below: about 30 seconds
+  over HTTP/1.1 and HTTP/2, the QUIC idle timeout over HTTP/3), so do not set this to 1.
 
 ### Monitoring
 
@@ -289,7 +299,13 @@ Caddy obtains by itself need nothing.
   with H3_MESSAGE_ERROR as RFC 9114 §4.1.2 says (STOP_SENDING; the 400 still gets through). A destination that is not
   allowed (403), a DNS failure (502) and the like are refusals, not malformed requests.
 - **Timeouts**: Caddy 2.11's default read and write idle timeouts (1 minute) and `read_timeout` and `write_timeout` do not
-  apply to tunnels, which stay up however long they are idle; they apply to ordinary web requests as usual.
+  apply to tunnels, which stay up however long they are idle; they apply to ordinary web requests as usual. The TCP
+  connections of tunnels over HTTP/1.1 and HTTP/2 get the settings masque-vpn's server uses, whatever the server's
+  `keepalive_*` options: keepalive probes after 10 seconds without traffic, every 5 seconds, and on Linux a
+  `TCP_USER_TIMEOUT` of 30 seconds. So a client that is gone without closing its connection (a laptop that changed
+  networks) is noticed in about 30 seconds rather than the 2.5 minutes of Caddy's keepalive, and its address and its
+  place under `max_sessions` are free again. With a listener wrapper that hides the TCP connection, Caddy's keepalive
+  applies.
 - **Clients without HTTP/3 Datagram support**: packets are carried on the stream in DATAGRAM capsules (RFC 9297 §3.5).
 - **Exit**: when Caddy exits it ends every tunnel itself, so open tunnels do not keep it from exiting.
 - **Failed reloads**: when the new configuration fails to start, users, reachable destinations and HTTP/3 all go back to

@@ -36,6 +36,37 @@ func TestCaddyLoginThrottle(t *testing.T) {
 	}
 }
 
+// Credentials verified before still get in from a throttled address, so a
+// user behind a shared address is not locked out by someone else's
+// failures there.
+func TestCaddyRememberedLoginSkipsTheThrottle(t *testing.T) {
+	loginFailures = 3
+	t.Cleanup(func() { loginFailures = 1 << 20 })
+	e := newCaddyEnv(t)
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	tr := transports[1]
+	first := tr.dial(e, t, testPassword, anyTarget)
+	if first.status != tr.ok {
+		t.Fatal(first.status)
+	}
+	first.close()
+	waitNoSessions(t)
+	for i := 0; i < 3; i++ {
+		tr.dial(e, t, "wrong password!!", anyTarget).close()
+	}
+	got := tr.dial(e, t, testPassword, anyTarget)
+	if got.status != tr.ok {
+		t.Errorf("remembered user on a throttled address: %d %q", got.status, got.body)
+	}
+	got.close()
+	// The address is still throttled for other credentials.
+	if other := tr.dial(e, t, "wrong password!!", anyTarget); other.status != http.StatusOK || other.body != "cover page" {
+		t.Errorf("throttled client: %d %q", other.status, other.body)
+	}
+}
+
 func TestCaddyMaxSessions(t *testing.T) {
 	e := newCaddyEnv(t)
 	cfg := masqueConfig("alice")
