@@ -78,8 +78,9 @@ type App struct {
 	// address pool would lock the others out.
 	MaxSessions int `json:"max_sessions,omitempty"`
 	// Serve HTTP/3 with datagrams for the HTTPS servers (default true). When
-	// off, CONNECT-IP uses HTTP/2 and HTTP/1.1 only and Caddy keeps its own
-	// HTTP/3.
+	// off, Caddy keeps its own HTTP/3, which does not announce HTTP
+	// Datagrams, so CONNECT-IP over it carries packets in DATAGRAM capsules
+	// on the request stream (RFC 9297 §3.5), as over HTTP/2 and HTTP/1.1.
 	HTTP3 *bool `json:"http3,omitempty"`
 	// Check that a tunnel with IPv6 over QUIC datagrams carries 1280-byte
 	// packets with an ICMPv6 echo request, ending it without a reply (RFC
