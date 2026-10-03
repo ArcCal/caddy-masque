@@ -50,7 +50,13 @@ Needs Go 1.26:
 go build -o caddy ./cmd/caddy
 ```
 
-The resulting `caddy` is a complete Caddy (with all the standard modules) plus this module. xcaddy works too:
+The resulting `caddy` is a complete Caddy (with all the standard modules) plus this module. To replace an installed
+binary safely, use `sudo bash deploy/install-binary.sh ./caddy`, then restart `caddy-masque` after validation succeeds.
+The helper leaves the current binary untouched if the candidate fails validation or would remove a custom module.
+For a downloadable combined build, the **Build Caddy with MASQUE and Cloudflare** Actions workflow supports
+Linux amd64 and arm64. It builds the selected workflow ref by default; `source_ref` can select a branch, tag or
+commit. Its tests and offline Cloudflare configuration check must pass before an artifact is uploaded.
+xcaddy works too:
 `xcaddy build --with github.com/ArcCal/caddy-masque`.
 
 ## Configuration
@@ -231,11 +237,15 @@ example.com, *.example.com, :443 {
 - **Build with the DNS plugin.** `dns cloudflare` needs the [caddy-dns/cloudflare](https://github.com/caddy-dns/cloudflare)
   plugin, which `./cmd/caddy` and the one-step install leave out:
   `xcaddy build --with github.com/ArcCal/caddy-masque --with github.com/caddy-dns/cloudflare`, then install the result
-  as `/usr/local/bin/caddy`. Running `install-server.sh` again replaces it with a build without the plugin, and Caddy
-  then fails to load this Caddyfile.
-- **The API token** is a Cloudflare token with the "Edit zone DNS" permission for the domain. Put it alone in
-  `/etc/caddy/cloudflare-token` (`chmod 600`); `{file.PATH}` reads it when the configuration loads. Do not pass it in an
-  environment variable: the service starts Caddy with `--environ`, which writes the whole environment to the log.
+  as `/usr/local/bin/caddy`. The installer refuses a build that would remove an installed custom module.
+  To install a combined prebuilt binary, run
+  `sudo CADDY_BIN=/absolute/path/to/caddy bash deploy/install-server.sh vpn.example.com`.
+  It validates the candidate against the existing configuration before atomically replacing the binary,
+  sets executable permissions, and restores the old binary if installation or service startup fails.
+- **The API token** needs both **Zone Read** and **DNS Edit**, scoped to the required domain's zone.
+  Put it alone in `/etc/caddy/cloudflare-token` (`chmod 600`); `{file.PATH}` reads it when the configuration loads.
+  The service does not dump its environment. Keep token values out of the Caddyfile and logs; the upstream Cloudflare
+  plugin can include an incorrectly formatted token in its validation error, so redact errors before sharing them.
 - **Cloudflare's proxy must be off** for the VPN host name (DNS only, the grey cloud): Cloudflare does not pass CONNECT-IP
   or UDP 443 through. The DNS challenge needs neither port 80 nor 443 to be reachable.
 - **Site addresses**: the certificate covers `example.com` and every `*.example.com`; the client's `uri_template` names
@@ -333,6 +343,9 @@ Known limitations:
 ```sh
 go test -race ./...                 # unit tests and in-process integration tests (no root needed)
 sudo tests/e2e-netns.sh             # end-to-end tests: Caddy and the original masque-client in network namespaces
+go test ./internal/ip -run '^$' -fuzz '^FuzzPacketProcessing$' -fuzztime=30s
+go test ./internal/proto -run '^$' -fuzz '^FuzzCapsuleStreamChunks$' -fuzztime=30s
+go test ./internal/proto -run '^$' -fuzz '^FuzzDecodeCapsule$' -fuzztime=30s
 ```
 
 The in-process tests start a real Caddy inside the test process (with a fake TUN device) and use a small client written

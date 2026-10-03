@@ -43,6 +43,18 @@ jobs:
       - run: go vet ./...
       - name: Unit and in-process tests (with the race detector)
         run: go test -race -count=1 ./...
+      - name: Kernel networking lifecycle in an isolated namespace
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nftables
+          sudo modprobe tun
+          go test -c -o "$RUNNER_TEMP/hostnet.test" ./internal/hostnet
+          sudo unshare --net env MASQUE_TEST_HOSTNET=1 "$RUNNER_TEMP/hostnet.test" -test.v -test.run '^TestHostNetworkLifecycle$'
+      - name: Fuzz packet and capsule parsers
+        run: |
+          go test ./internal/ip -run '^$' -fuzz '^FuzzPacketProcessing$' -fuzztime=20s -parallel=2
+          go test ./internal/proto -run '^$' -fuzz '^FuzzCapsuleStreamChunks$' -fuzztime=20s -parallel=2
+          go test ./internal/proto -run '^$' -fuzz '^FuzzDecodeCapsule$' -fuzztime=20s -parallel=2
 
   e2e:
     name: end-to-end with masque-client

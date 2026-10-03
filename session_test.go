@@ -474,7 +474,9 @@ func TestClientPacketsThatAreDropped(t *testing.T) {
 	r := e.start(t, alice, true)
 	other := e.start(t, bob, true)
 	for name, payload := range map[string][]byte{
-		"spoofed IPv4 source":        append([]byte{0}, udp("10.89.0.200", "1.1.1.1", 10)...),
+		// Use an address outside the allocation pool so it can never match
+		// the randomly assigned client address.
+		"spoofed IPv4 source":        append([]byte{0}, udp("10.90.0.200", "1.1.1.1", 10)...),
 		"another client's source":    append([]byte{0}, udp(other.addr(false), "1.1.1.1", 10)...),
 		"spoofed IPv6 source":        append([]byte{0}, udp("2001:db8::1", "2606:4700::1111", 10)...),
 		"unknown context ID":         append([]byte{2}, udp(r.addr(false), "1.1.1.1", 10)...),
@@ -1026,6 +1028,30 @@ func TestReconnectingUsersGetTheirAddressesBack(t *testing.T) {
 	l.release()
 	if calls := e.forgetCalls(); len(calls) != 0 {
 		t.Errorf("connection tracking deleted for fresh or own addresses: %v", calls)
+	}
+}
+
+func TestChangedPasswordDoesNotInheritOldConnections(t *testing.T) {
+	// Reusing a name with a new password must not preserve the old user's
+	// NAT state, even within the reconnect grace period.
+	e := newTestEnv(t, &App{IPv4: "10.89.0.1/30"})
+	ctx := context.Background()
+	l := e.core.acquire(ctx, alice, true, false)
+	if l == nil {
+		t.Fatal("initial lease failed")
+	}
+	address := l.addrs[0]
+	l.release()
+	changed := auth.User{Name: alice.Name, Hash: "replacement-password-hash"}
+	e.core.setUsers(map[string]string{changed.Name: changed.Hash})
+	l = e.core.acquire(ctx, changed, true, false)
+	if l == nil {
+		t.Fatal("replacement user's lease failed")
+	}
+	defer l.release()
+	calls := e.forgetCalls()
+	if len(calls) != 1 || !slices.Equal(calls[0], []netip.Prefix{netip.PrefixFrom(address, 32)}) {
+		t.Fatalf("old password's connections survived: forget calls %v", calls)
 	}
 }
 

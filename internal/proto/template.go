@@ -410,6 +410,13 @@ func hasVariables(parts []part) bool {
 // (t={target}.example with target foo.example). Requests come before
 // authentication, so the attempts are bounded.
 func matchSegments(parts []part, s string, out map[string]string) bool {
+	// Reject an impossible literal suffix before exploring split points.
+	// Matching runs before authentication; otherwise a long request with
+	// many delimiters can repeatedly copy and decode captures that cannot
+	// possibly match the end of the template.
+	if len(parts) > 0 && parts[len(parts)-1].vars == nil && !strings.HasSuffix(s, parts[len(parts)-1].literal) {
+		return false
+	}
 	budget := maxMatchSteps
 	return matchFrom(parts, s, out, &budget)
 }
@@ -531,6 +538,9 @@ func encode(value string) string {
 // decode percent-decodes a URI component; false for malformed escapes or
 // invalid UTF-8.
 func decode(s string) (string, bool) {
+	if !strings.Contains(s, "%") {
+		return s, utf8.ValidString(s)
+	}
 	out := make([]byte, 0, len(s))
 	for i := 0; i < len(s); i++ {
 		if s[i] != '%' {

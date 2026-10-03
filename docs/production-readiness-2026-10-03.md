@@ -1,0 +1,69 @@
+# Production readiness review — 2026-10-03
+
+The review found defects in credential isolation, shutdown ordering, URI matching
+performance, and deployment tooling. This branch fixes those defects and adds
+repeatable regression and kernel lifecycle checks. Passing these checks does not
+establish that an arbitrary production host, Cloudflare token, or client will work.
+
+## Changes and reasons
+
+- Bind reconnect address reuse to the password hash as well as the username.
+  Previously, a changed password could inherit the old credential's NAT state.
+  A regression test failed before the fix and verifies connection-state cleanup.
+- Wait for in-flight host repair before closing the network. Previously, repair
+  could recreate firewall rules while shutdown removed them or restored sysctls.
+  A blocked repair test verifies shutdown ordering.
+- Reject impossible URI template suffixes early and avoid copying unescaped
+  captures. The existing bounded-matching test failed under the race detector
+  before the change; its original timing requirement is preserved.
+- Validate replacement binaries and preserve every installed custom module.
+  Installation now stages an executable on the destination filesystem and renames
+  it atomically. The one-step installer accepts `CADDY_BIN` and restores the old
+  binary when installation or service startup fails. Regression tests verify that
+  missing modules and invalid configuration leave the working binary untouched.
+- Remove the service's environment dump so environment-based DNS tokens are not
+  logged at startup. Set its home directory to the existing state directory.
+- Correct a flaky spoofing test whose hardcoded source could be randomly leased
+  to the client. Its source now lies outside the allocation pool.
+- Add packet/capsule fuzzers, an opt-in isolated Linux network lifecycle test,
+  and offline MASQUE + Cloudflare configuration provisioning. Native amd64 and
+  arm64 artifact builds run the source tests and kernel test before publication.
+  Their source ref follows the selected workflow ref instead of an old hardcoded
+  commit; the artifact records its source commit and module versions.
+
+## Local validation
+
+- Go 1.26.8; race-enabled full suite with statement coverage: 167 tests/subtests
+  passed and four privileged checks skipped locally. Root package coverage is
+  88.5%; IP, protocol, authentication, pool, and route packages exceed 92%.
+- Regression tests for shutdown, changed credentials, installation failure, and
+  spoofing; the corrected spoofing test also passed 20 consecutive race runs.
+- Three 30-second fuzz campaigns exercised approximately 2.4 million inputs
+  without a failure.
+- `go vet`, formatting, shell syntax, whitespace checks, and systemd unit
+  validation (with the executable path mapped to a local test build).
+- `govulncheck`: zero reachable vulnerabilities. One advisory occurs in a required
+  module whose affected symbols are not called by this code.
+- Offline Cloudflare configuration provisioning succeeds without real API
+  credentials or DNS writes.
+
+## Production validation still required
+
+- This workspace has no usable TUN device or privileged network namespace.
+  GitHub's native Linux runners execute the new real TUN/firewall/sysctl lifecycle
+  test; check those workflow results before installing an artifact.
+- The existing original-client end-to-end job requires the `MASQUE_VPN_TOKEN`
+  repository secret to read `ArcCal/masque-vpn`. A job that only prints the
+  missing-secret notice has not tested the client.
+- Live DNS challenge issuance and renewal require a real Cloudflare token with
+  Zone Read and DNS Edit permissions for the intended zone. The offline smoke
+  test checks module loading and provisioning, not ACME issuance.
+- Full installer rollback must also be exercised on a disposable systemd VM;
+  local tests cover the replacement helper, not a production service restart.
+- Host routes, address collisions, security groups, host firewall interactions,
+  TCP/UDP 443 reachability, and client traffic require staging checks with the
+  intended deployment topology. No live server was changed during this review.
+
+Keep the previous executable and configuration when deploying. Inspect the
+artifact's source commit and checksum, validate the candidate, then verify HTTPS,
+HTTP/3, client traffic, reload, restart, and certificate renewal in staging.

@@ -11,12 +11,19 @@
 # point at this server). The user's name and password are printed at the end
 # and kept in /root/masque-credentials.txt.
 #
-# Running it again rebuilds and restarts; the Caddyfile, the users and the
-# certificate are kept. Add users with `caddy masque-passwd` (README).
+# CADDY_BIN=/absolute/path/to/caddy uses a prebuilt binary instead of building.
+# Running it again validates before replacement and preserves custom modules;
+# the Caddyfile, users and certificates are kept. Add users with `caddy masque-passwd` (README).
 set -euo pipefail
 
 DOMAIN=${1:-}
 USER_NAME=${2:-macbook}
+# Use a prebuilt binary to retain optional modules such as Cloudflare DNS.
+CADDY_BIN=${CADDY_BIN:-}
+if [ -n "$CADDY_BIN" ]; then
+    CADDY_BIN=$(realpath -- "$CADDY_BIN")
+    [ -x "$CADDY_BIN" ] || { printf "CADDY_BIN is not executable: %s\n" "$CADDY_BIN" >&2; exit 1; }
+fi
 SRC=$(cd "$(dirname "$0")/.." && pwd)
 CONFIG=/etc/caddy/Caddyfile
 SITE=/var/www/site
@@ -62,34 +69,37 @@ if [ -n "$PUBLIC_IP" ] && [ "$RESOLVED" != "$PUBLIC_IP" ]; then
     die "$DOMAIN resolves to $RESOLVED, not to this server's $PUBLIC_IP. Fix the A record, then run this again (with Cloudflare, set the proxy status to DNS only, the grey cloud)"
 fi
 
-say "Installing the newest patch release of Go $GO_LINE (skipped if already installed)"
-export PATH=/usr/local/go/bin:$PATH
-# The official release list: the newest stable release of the line, and the
-# SHA-256 of its archive.
-GO_RELEASES=$(curl -fsSL --max-time 60 'https://go.dev/dl/?mode=json&include=all') || die "cannot get the official list of Go releases"
-GO_VERSION=$(jq -r --arg l "go$GO_LINE." 'first(.[] | select(.stable and (.version | startswith($l))) | .version) // empty' <<<"$GO_RELEASES")
-[ -n "$GO_VERSION" ] || die "the official list of Go releases has no stable release of $GO_LINE"
-GO_VERSION=${GO_VERSION#go}
-if ! go version 2>/dev/null | grep -q "go$GO_VERSION "; then
-    case "$(uname -m)" in
-        x86_64) GOARCH=amd64 ;;
-        aarch64) GOARCH=arm64 ;;
-        *) die "unsupported CPU: $(uname -m)" ;;
-    esac
-    GO_FILE="go$GO_VERSION.linux-$GOARCH.tar.gz"
-    # A directory of our own: nobody else can put a file in its place.
-    GO_TMP=$(mktemp -d)
-    curl -fsSL "https://go.dev/dl/$GO_FILE" -o "$GO_TMP/$GO_FILE" || die "downloading Go failed"
-    GO_SHA256=$(jq -r --arg f "$GO_FILE" 'first(.[].files[] | select(.filename == $f) | .sha256) // empty' <<<"$GO_RELEASES")
-    [ -n "$GO_SHA256" ] || die "the official list of Go releases has no $GO_FILE"
-    echo "$GO_SHA256  $GO_TMP/$GO_FILE" | sha256sum -c --quiet - || die "the Go archive's SHA-256 is wrong; not installed"
-    rm -rf /usr/local/go
-    tar -C /usr/local -xzf "$GO_TMP/$GO_FILE"
-    rm -rf "$GO_TMP"
-fi
-go version
+if [ -z "$CADDY_BIN" ]; then
+    say "Installing the newest patch release of Go $GO_LINE (skipped if already installed)"
+    export PATH=/usr/local/go/bin:$PATH
+    # The official release list: the newest stable release of the line, and the
+    # SHA-256 of its archive.
+    GO_RELEASES=$(curl -fsSL --max-time 60 'https://go.dev/dl/?mode=json&include=all') || die "cannot get the official list of Go releases"
+    GO_VERSION=$(jq -r --arg l "go$GO_LINE." 'first(.[] | select(.stable and (.version | startswith($l))) | .version) // empty' <<<"$GO_RELEASES")
+    [ -n "$GO_VERSION" ] || die "the official list of Go releases has no stable release of $GO_LINE"
+    GO_VERSION=${GO_VERSION#go}
+    if ! go version 2>/dev/null | grep -q "go$GO_VERSION "; then
+        case "$(uname -m)" in
+            x86_64) GOARCH=amd64 ;;
+            aarch64) GOARCH=arm64 ;;
+            *) die "unsupported CPU: $(uname -m)" ;;
+        esac
+        GO_FILE="go$GO_VERSION.linux-$GOARCH.tar.gz"
+        # A directory of our own: nobody else can put a file in its place.
+        GO_TMP=$(mktemp -d)
+        curl -fsSL "https://go.dev/dl/$GO_FILE" -o "$GO_TMP/$GO_FILE" || die "downloading Go failed"
+        GO_SHA256=$(jq -r --arg f "$GO_FILE" 'first(.[].files[] | select(.filename == $f) | .sha256) // empty' <<<"$GO_RELEASES")
+        [ -n "$GO_SHA256" ] || die "the official list of Go releases has no $GO_FILE"
+        echo "$GO_SHA256  $GO_TMP/$GO_FILE" | sha256sum -c --quiet - || die "the Go archive's SHA-256 is wrong; not installed"
+        rm -rf /usr/local/go
+        tar -C /usr/local -xzf "$GO_TMP/$GO_FILE"
+        rm -rf "$GO_TMP"
+    fi
+    go version
 
-say "Building (a few minutes the first time)"
+fi
+
+say "Preparing the Caddy binary (a source build takes a few minutes the first time)"
 # Building Caddy needs about 2 GB of memory; small servers get a temporary
 # swap file of their own, removed afterwards.
 SWAP=""
@@ -106,24 +116,45 @@ cleanup_swap() {
 # The build goes to a directory of our own (mode 700): in a shared /tmp, another
 # user could replace the file between the build and its installation as root.
 BUILD_DIR=$(mktemp -d)
+PREVIOUS_BIN=""
+BINARY_REPLACED=0
+RESTART_ATTEMPTED=0
 cleanup() {
+    local status=$?
     cleanup_swap
+    if [ "$status" -ne 0 ] && [ "$BINARY_REPLACED" = 1 ] && [ -n "$PREVIOUS_BIN" ]; then
+        echo "Installation failed; restoring the previous Caddy binary" >&2
+        if mv -f -- "$PREVIOUS_BIN" /usr/local/bin/caddy; then
+            PREVIOUS_BIN=""
+            if [ "$RESTART_ATTEMPTED" = 1 ]; then
+                systemctl restart caddy-masque || echo "The previous binary was restored, but restarting it failed; check the service log" >&2
+            fi
+        else
+            echo "Could not restore the binary; the backup is at $PREVIOUS_BIN" >&2
+            PREVIOUS_BIN=""
+        fi
+    fi
+    [ -z "$PREVIOUS_BIN" ] || rm -f -- "$PREVIOUS_BIN"
     rm -rf "$BUILD_DIR"
 }
 trap cleanup EXIT
-mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-swap_kb=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
-if [ $((mem_kb + swap_kb)) -lt 2500000 ]; then
-    echo "Little memory: adding 2 GB of temporary swap space for the build"
-    SWAP=$(mktemp /caddy-build-XXXXXX.swap) # a new file, mode 600
-    fallocate -l 2G "$SWAP" 2>/dev/null || dd if=/dev/zero of="$SWAP" bs=1M count=2048 status=none
-    mkswap -q "$SWAP"
-    swapon "$SWAP"
+CADDY="$BUILD_DIR/caddy"
+if [ -n "$CADDY_BIN" ]; then
+    install -m 755 -- "$CADDY_BIN" "$CADDY"
+else
+    mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    swap_kb=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
+    if [ $((mem_kb + swap_kb)) -lt 2500000 ]; then
+        echo "Little memory: adding 2 GB of temporary swap space for the build"
+        SWAP=$(mktemp /caddy-build-XXXXXX.swap) # a new file, mode 600
+        fallocate -l 2G "$SWAP" 2>/dev/null || dd if=/dev/zero of="$SWAP" bs=1M count=2048 status=none
+        mkswap -q "$SWAP"
+        swapon "$SWAP"
+    fi
+    (cd "$SRC" && GOTOOLCHAIN=local CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$BUILD_DIR/caddy" ./cmd/caddy)
+    cleanup_swap
 fi
-(cd "$SRC" && GOTOOLCHAIN=local CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$BUILD_DIR/caddy" ./cmd/caddy)
-cleanup_swap
-install -m 755 "$BUILD_DIR/caddy" /usr/local/bin/caddy
-caddy version
+"$CADDY" version
 
 say "Ports"
 # masque-vpn's own server, or another web server, would hold 443.
@@ -189,7 +220,7 @@ else
     if [ -d /proc/sys/net/ipv6 ] && ip -6 route show default | grep -q .; then
         IPV6_LINE="ipv6 fd89:6d61:7371::1/64"
     fi
-    read -r HASH PASSWORD < <(caddy masque-passwd --name "$USER_NAME" |
+    read -r HASH PASSWORD < <("$CADDY" masque-passwd --name "$USER_NAME" |
         awk '/^user / {h=$3} /^password =/ {gsub(/"/, "", $3); p=$3} END {print h, p}')
     if [ -z "$HASH" ] || [ -z "$PASSWORD" ]; then die "creating the user failed"; fi
     mkdir -p /etc/caddy
@@ -225,8 +256,16 @@ EOF
     chmod 600 "$CONFIG" "$CREDENTIALS"
     umask 022
 fi
-caddy validate --config "$CONFIG" >/dev/null 2>&1 ||
-    { caddy validate --config "$CONFIG" || true; die "$CONFIG has errors; see the output above"; }
+"$CADDY" validate --config "$CONFIG" >/dev/null 2>&1 ||
+    { "$CADDY" validate --config "$CONFIG" || true; die "$CONFIG has errors; see the output above"; }
+
+say "Installing the validated binary"
+if [ -e /usr/local/bin/caddy ]; then
+    PREVIOUS_BIN=$(mktemp /usr/local/bin/.caddy-backup.XXXXXX)
+    cp -p -- /usr/local/bin/caddy "$PREVIOUS_BIN"
+fi
+bash "$SRC/deploy/install-binary.sh" "$CADDY" "$CONFIG"
+BINARY_REPLACED=1
 
 say "Firewall"
 # A host firewall that drops forwarded packets makes the tunnel connect and
@@ -248,7 +287,8 @@ fi
 say "Starting the service"
 install -m 644 "$SRC/deploy/caddy-masque.service" /etc/systemd/system/caddy-masque.service
 systemctl daemon-reload
-systemctl enable --now caddy-masque
+systemctl enable caddy-masque
+RESTART_ATTEMPTED=1
 systemctl restart caddy-masque
 sleep 3
 if ! systemctl is-active --quiet caddy-masque; then

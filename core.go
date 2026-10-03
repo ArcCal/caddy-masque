@@ -154,11 +154,15 @@ type core struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+	// Network repair must finish before Close restores sysctls and deletes
+	// the firewall table. Otherwise repair can reinstall it during shutdown.
+	hostWatch sync.WaitGroup
 }
 
 type recentLease struct {
 	addrs []netip.Addr
 	at    time.Time
+	hash  string // only the same credentials may preserve connection state
 }
 
 // sessionHandle is how packets from the network reach a session.
@@ -230,7 +234,7 @@ func (c *core) start() error {
 	}
 	c.attach(n)
 	if r, ok := device(n).(interface{ Repair() []string }); ok {
-		go c.watchHost(r)
+		c.startHostWatcher(r, hostCheckInterval)
 	}
 	return nil
 }
@@ -241,12 +245,23 @@ const hostCheckInterval = 30 * time.Second
 // watchHost repairs the host configuration that something else undid, until
 // the core stops. Without it, a firewall reload that removes the NAT rules
 // leaves a tunnel that connects and carries nothing, with nothing logged.
-func (c *core) watchHost(r interface{ Repair() []string }) {
-	t := time.NewTicker(hostCheckInterval)
+func (c *core) startHostWatcher(r interface{ Repair() []string }, interval time.Duration) {
+	c.hostWatch.Add(1)
+	go func() {
+		defer c.hostWatch.Done()
+		c.watchHost(r, interval)
+	}()
+}
+
+func (c *core) watchHost(r interface{ Repair() []string }, interval time.Duration) {
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-t.C:
+			if c.ctx.Err() != nil {
+				return
+			}
 			for _, msg := range r.Repair() {
 				c.log.Warn(msg)
 			}
@@ -267,6 +282,7 @@ func (c *core) attach(d device) {
 func (c *core) Destruct() error {
 	c.cancel()
 	c.revokeAll("server stopped")
+	c.hostWatch.Wait()
 	if c.net != nil {
 		c.net.Close()
 		<-c.done
@@ -429,7 +445,7 @@ func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease 
 	c.poolMu.Lock()
 	mine := c.recent[user.Name]
 	delete(c.recent, user.Name)
-	if time.Since(mine.at) >= reconnectGrace {
+	if time.Since(mine.at) >= reconnectGrace || mine.hash != user.Hash {
 		mine.addrs = nil
 	}
 	for _, fam := range []struct{ wanted, v6 bool }{{v4, false}, {v6, true}} {
@@ -564,6 +580,6 @@ func (l *lease) release() {
 	for _, a := range l.addrs {
 		c.pool.Release(a)
 	}
-	c.recent[l.handle.user.Name] = recentLease{addrs: l.addrs, at: time.Now()}
+	c.recent[l.handle.user.Name] = recentLease{addrs: l.addrs, at: time.Now(), hash: l.handle.user.Hash}
 	c.poolMu.Unlock()
 }
