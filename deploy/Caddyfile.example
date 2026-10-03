@@ -22,7 +22,10 @@
 	}
 }
 
-vpn.example.com {
+# ":443" also takes HTTPS requests for any other host name, such as the
+# server's IP address in a client's uri_template; no certificate is
+# requested for it.
+vpn.example.com, :443 {
 	# CONNECT-IP requests with valid credentials become tunnels; every
 	# other request, and every probe, gets the website below.
 	masque

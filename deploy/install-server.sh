@@ -168,6 +168,21 @@ fi
 say "Configuration"
 if [ -f "$CONFIG" ]; then
     echo "$CONFIG already exists; kept (with its users unchanged)"
+    # The service puts Caddy's admin API on a socket only root can use
+    # (CADDY_ADMIN in deploy/caddy-masque.service); an admin option here
+    # replaces that.
+    if grep -qE '^[[:space:]]*admin([[:space:]]|$)' "$CONFIG"; then
+        echo "Note: $CONFIG sets Caddy's admin endpoint itself, so the service's root-only socket /run/caddy-masque/admin.sock is not used."
+        echo "      Unless that endpoint is a unix socket only root can reach (or off), remove the admin line: on localhost:2019"
+        echo "      every local user and process can read the configuration, password hashes included, and change it."
+    fi
+    # Earlier versions wrote the site for the domain only: clients that name
+    # the server by its IP address (the Mac app's IP field) got no tunnel.
+    if ! grep -qE '(^|[[:space:],]):443([[:space:],{]|$)' "$CONFIG"; then
+        echo "Note: no site in $CONFIG answers for other host names, so clients that connect by IP address (the Mac app's IP field)"
+        echo "      get no tunnel. Add ', :443' after the domain on the site's first line (for example: $DOMAIN, :443 {),"
+        echo "      then: systemctl reload caddy-masque"
+    fi
 else
     IPV6_LINE="# ipv6 fd89:6d61:7371::1/64"
     # Offer IPv6 in the tunnel only when this server reaches the IPv6 Internet.
@@ -191,7 +206,10 @@ else
 	}
 }
 
-$DOMAIN {
+# ":443" also answers HTTPS requests for any other host name, such as the
+# server's IP address in a client's uri_template; no certificate is
+# requested for it, clients check the certificate for $DOMAIN.
+$DOMAIN, :443 {
 	masque
 	root * $SITE
 	file_server
@@ -278,7 +296,8 @@ Without UDP 443 it still works, but only over the slower TCP.
 Useful commands:
   systemctl status caddy-masque              status
   journalctl -u caddy-masque -f -o cat       live log
-  curl -s localhost:2019/metrics | grep caddy_masque   live tunnels, traffic, failed logins (Prometheus format)
+  curl -s --unix-socket /run/caddy-masque/admin.sock http://localhost/metrics | grep caddy_masque
+                                             live tunnels, traffic, failed logins (Prometheus format)
   caddy masque-passwd --name NEW_USER        add another user (one per device),
                                              add the user line it prints to $CONFIG,
                                              then systemctl reload caddy-masque
