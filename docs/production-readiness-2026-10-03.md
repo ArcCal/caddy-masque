@@ -35,7 +35,7 @@ establish that an arbitrary production host, Cloudflare token, or client will wo
 
 - Go 1.26.8; race-enabled full suite with statement coverage: 167 tests/subtests
   passed and four privileged checks skipped locally. Root package coverage is
-  88.5%; IP, protocol, authentication, pool, and route packages exceed 92%.
+  88.7%; IP, protocol, authentication, pool, and route packages exceed 92%.
 - Regression tests for shutdown, changed credentials, installation failure, and
   spoofing; the corrected spoofing test also passed 20 consecutive race runs.
 - Three 30-second fuzz campaigns exercised approximately 2.4 million inputs
@@ -46,6 +46,9 @@ establish that an arbitrary production host, Cloudflare token, or client will wo
   module whose affected symbols are not called by this code.
 - Offline Cloudflare configuration provisioning succeeds without real API
   credentials or DNS writes.
+- The replacement helper was also exercised with real basic and combined Caddy
+  binaries: it refused removal of Cloudflare without modifying the destination,
+  then validated and installed the combined build with executable permissions.
 
 ## Production validation still required
 
@@ -58,8 +61,11 @@ establish that an arbitrary production host, Cloudflare token, or client will wo
 - Live DNS challenge issuance and renewal require a real Cloudflare token with
   Zone Read and DNS Edit permissions for the intended zone. The offline smoke
   test checks module loading and provisioning, not ACME issuance.
-- Full installer rollback must also be exercised on a disposable systemd VM;
-  local tests cover the replacement helper, not a production service restart.
+- Native artifact builds also exercise the real systemd service's start, reload,
+  restart and stop, plus a successful prebuilt install and rollback after a
+  simulated startup failure. Inspect their results; local tests alone cover the
+  replacement helper, not a service restart. Their local CA and stubbed public-IP
+  discovery do not establish public ACME or production DNS behavior.
 - Host routes, address collisions, security groups, host firewall interactions,
   TCP/UDP 443 reachability, and client traffic require staging checks with the
   intended deployment topology. No live server was changed during this review.

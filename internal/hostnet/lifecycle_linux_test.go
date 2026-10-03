@@ -74,9 +74,19 @@ func TestHostNetworkLifecycle(t *testing.T) {
 	if out, err := exec.Command("nft", "list", "table", "inet", NFTTable).CombinedOutput(); err != nil || !strings.Contains(string(out), "masquerade") || !strings.Contains(string(out), "chain input") {
 		t.Fatalf("repaired rules: %s (%v)", out, err)
 	}
-	// A blocked TUN reader must finish when the device is closed.
+	// A TUN reader must finish when the device is closed. IPv6 setup can
+	// enqueue router solicitations, so drain packets until Read fails rather
+	// than assuming that its first result was blocked before Close.
 	done := make(chan error, 1)
-	go func() { _, err := n.Read(make([]byte, 65535)); done <- err }()
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			if _, err := n.Read(buf); err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
 	if err := n.Close(); err != nil {
 		t.Fatal(err)
 	}
