@@ -9,11 +9,14 @@ package auth
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/netip"
 	"runtime"
 	"strconv"
 	"strings"
@@ -174,12 +177,23 @@ type User struct {
 	Hash string
 }
 
-// ErrBusy means too many requests wait for a password verification.
+// ErrBusy means too many requests, in all or from one source, wait for a
+// password verification.
 var ErrBusy = errors.New("too many requests waiting for password verification")
 
 // waitingPerSlot bounds the queue: a full queue is worked through in a
 // second or two.
 const waitingPerSlot = 32
+
+// perSource is how many verifications one source (see sourceKey) may have
+// waiting or running at once. Users behind one address (a shared NAT) who
+// are past this get 503 and retry; with their credentials remembered they
+// skip the queue anyway.
+const perSource = 4
+
+// rememberFor is how long verified credentials are remembered after their
+// last use.
+const rememberFor = 12 * time.Hour
 
 // Authenticator verifies credentials against the configured users.
 type Authenticator struct {
@@ -198,13 +212,38 @@ type Authenticator struct {
 	// Called (at most once a minute) when the queue is full.
 	OnBusy   func()
 	lastBusy atomic.Int64
+
+	// Credentials verified recently, so a returning user needs no Argon2
+	// verification and is never turned away while a flood of made-up
+	// credentials fills the queue. Keyed by an HMAC of name and password
+	// under cacheKey, which exists only in memory; the value is the hash
+	// the password matched and when it last did. Only correct passwords
+	// get in, so there is at most one entry per user and hash.
+	verifiedMu sync.Mutex
+	verified   map[[sha256.Size]byte]remembered
+	cacheKey   []byte
+
+	// Verifications waiting or running per source, so that one source
+	// cannot fill the queue.
+	sourcesMu sync.Mutex
+	sources   map[netip.Addr]int
+}
+
+type remembered struct {
+	hash string
+	at   time.Time
 }
 
 // New makes an authenticator with no users.
 func New() *Authenticator {
 	slots := runtime.NumCPU() * 2
+	cacheKey := make([]byte, 32)
+	if _, err := rand.Read(cacheKey); err != nil {
+		panic(err)
+	}
 	return &Authenticator{users: map[string]string{}, slots: make(chan struct{}, slots),
-		maxWaiting: int64(slots * waitingPerSlot), dummyHash: HashPassword(GeneratePassword())}
+		maxWaiting: int64(slots * waitingPerSlot), dummyHash: HashPassword(GeneratePassword()),
+		verified: map[[sha256.Size]byte]remembered{}, cacheKey: cacheKey, sources: map[netip.Addr]int{}}
 }
 
 // Replace installs a new user list (name -> hash).
@@ -226,13 +265,33 @@ func (a *Authenticator) IsCurrent(u User) bool {
 	return ok && h == u.Hash
 }
 
-// Verify checks an Authorization header value. Requests without
-// credentials are answered at once; only those that carry them pay for a
-// hash verification. It returns ok false for wrong or missing credentials,
-// and ErrBusy when too many requests already wait for a verification.
-// A cancelled context returns at once, but the verification keeps its slot
-// until the hashing it started has finished.
-func (a *Authenticator) Verify(ctx context.Context, authorization string) (User, bool, error) {
+// Remembered checks an Authorization header value against the credentials
+// verified within rememberFor, without a hash verification; a hit counts as
+// a new use. Credentials whose user has a different hash now never match.
+func (a *Authenticator) Remembered(authorization string) (User, bool) {
+	name, password, ok := ParseBasic(authorization)
+	if !ok {
+		return User{}, false
+	}
+	a.mu.RLock()
+	hash, known := a.users[name]
+	a.mu.RUnlock()
+	if !known || !a.recall(a.tag(name, password), hash) {
+		return User{}, false
+	}
+	return User{Name: name, Hash: hash}, true
+}
+
+// Verify checks an Authorization header value sent from source. Requests
+// without credentials are answered at once; only those that carry them pay
+// for a hash verification, unless the same credentials were verified
+// recently (see Remembered). It returns ok false for wrong or missing
+// credentials, and ErrBusy when too many requests, in all or from this
+// source, already wait for a verification. Requests whose source is not
+// known (an invalid address) count as one source.
+// A cancelled context returns at once, but the verification keeps its slot,
+// and its source's place, until the hashing it started has finished.
+func (a *Authenticator) Verify(ctx context.Context, authorization string, source netip.Addr) (User, bool, error) {
 	name, password, ok := ParseBasic(authorization)
 	if !ok {
 		return User{}, false, nil
@@ -240,9 +299,24 @@ func (a *Authenticator) Verify(ctx context.Context, authorization string) (User,
 	a.mu.RLock()
 	hash, known := a.users[name]
 	a.mu.RUnlock()
+	tag := a.tag(name, password)
+	if known && a.recall(tag, hash) {
+		return User{Name: name, Hash: hash}, true, nil
+	}
 	if !known {
 		hash = a.dummyHash
 	}
+	src := sourceKey(source)
+	if !a.enterSource(src) {
+		return User{}, false, ErrBusy
+	}
+	// Given back here unless the hashing goroutine has taken it over.
+	leave := true
+	defer func() {
+		if leave {
+			a.leaveSource(src)
+		}
+	}()
 	select {
 	case a.slots <- struct{}{}:
 	default:
@@ -260,8 +334,12 @@ func (a *Authenticator) Verify(ctx context.Context, authorization string) (User,
 		}
 	}
 	result := make(chan bool, 1)
+	leave = false
 	go func() {
-		defer func() { <-a.slots }()
+		defer func() {
+			<-a.slots
+			a.leaveSource(src)
+		}()
 		result <- verifyHash(password, hash)
 	}()
 	select {
@@ -270,7 +348,66 @@ func (a *Authenticator) Verify(ctx context.Context, authorization string) (User,
 		return User{}, false, ctx.Err()
 	}
 	u := User{Name: name, Hash: hash}
-	return u, ok && known && a.IsCurrent(u), nil
+	ok = ok && known && a.IsCurrent(u)
+	if ok {
+		a.remember(tag, hash)
+	}
+	return u, ok, nil
+}
+
+// tag is the cache key of a user name and password.
+func (a *Authenticator) tag(name, password string) [sha256.Size]byte {
+	m := hmac.New(sha256.New, a.cacheKey)
+	m.Write([]byte(name))
+	m.Write([]byte{0})
+	m.Write([]byte(password))
+	var t [sha256.Size]byte
+	m.Sum(t[:0])
+	return t
+}
+
+// recall reports whether the credentials of tag matched hash within
+// rememberFor, and if so counts this as a new match.
+func (a *Authenticator) recall(tag [sha256.Size]byte, hash string) bool {
+	a.verifiedMu.Lock()
+	defer a.verifiedMu.Unlock()
+	r, ok := a.verified[tag]
+	if !ok || r.hash != hash || time.Since(r.at) >= rememberFor {
+		return false
+	}
+	a.verified[tag] = remembered{hash, time.Now()}
+	return true
+}
+
+func (a *Authenticator) remember(tag [sha256.Size]byte, hash string) {
+	a.verifiedMu.Lock()
+	defer a.verifiedMu.Unlock()
+	for k, r := range a.verified {
+		if time.Since(r.at) >= rememberFor {
+			delete(a.verified, k)
+		}
+	}
+	a.verified[tag] = remembered{hash, time.Now()}
+}
+
+// enterSource takes one of a source's places among the verifications in
+// progress, if it has one left.
+func (a *Authenticator) enterSource(src netip.Addr) bool {
+	a.sourcesMu.Lock()
+	defer a.sourcesMu.Unlock()
+	if a.sources[src] >= perSource {
+		return false
+	}
+	a.sources[src]++
+	return true
+}
+
+func (a *Authenticator) leaveSource(src netip.Addr) {
+	a.sourcesMu.Lock()
+	defer a.sourcesMu.Unlock()
+	if a.sources[src]--; a.sources[src] <= 0 {
+		delete(a.sources, src)
+	}
 }
 
 func (a *Authenticator) warnBusy() {

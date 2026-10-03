@@ -127,11 +127,20 @@ address.
 
 ### Against password guessing and pool exhaustion
 
-- After more than 10 requests with wrong credentials within a minute from one client address (for IPv6, per /64), its
+- After 10 requests with wrong credentials within a minute from one client address (for IPv6, per /64), its
   requests that carry credentials are not checked for the next minute but are treated as ordinary web requests (like
-  requests without credentials). Users sharing an outgoing address affect one another during that minute.
+  requests without credentials). Users sharing an outgoing address affect one another during that minute, except
+  those whose credentials are remembered (below).
   Generated passwords have 144 bits and cannot be guessed; passwords of your own given to `masque-passwd --stdin` need
   at least 12 characters; make them long and random.
+- Checking a password (Argon2id) takes tens of milliseconds and megabytes of memory, so only a few checks run at once
+  and a limited number wait. One client address (for IPv6, per /64) may have at most 4 checks waiting or running;
+  beyond that, or when the queue is full, requests get 503. Credentials that were correct in the last 12 hours skip
+  the check, the queue and the limit above: the server remembers them in memory only, as an HMAC under a key made at
+  start-up, and only as long as that user's hash stays the same. So a flood of made-up credentials, even from many
+  addresses, does not keep out users who connected before; a user's first connection (after a restart, a new
+  password) can get 503 during such a flood, and masque-client tries again with backoff. masque-vpn's server does the
+  same.
 - Each user may have at most `max_sessions` tunnels at once (default 8); requests beyond that get 429. Otherwise one
   account could take the whole address pool and crowd out the other users. When a device reconnects after losing its
   connection, the old tunnel still counts until the server notices it is gone, so do not set this to 1.

@@ -177,30 +177,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	c := h.app.core
 	remote := r.RemoteAddr
-	// A client that keeps failing is not checked again for a while; its
-	// request goes to the site like any without credentials.
+	// Credentials verified recently get in at once. Otherwise a client that
+	// keeps failing is not checked again for a while; its request goes to
+	// the site like any without credentials.
 	client, haveClient := clientAddr(r)
-	_, _, hasCredentials := auth.ParseBasic(r.Header.Get("Authorization"))
-	if hasCredentials && haveClient && c.loginLimit.Blocked(client) {
+	authorization := r.Header.Get("Authorization")
+	_, _, hasCredentials := auth.ParseBasic(authorization)
+	user, ok := c.auth.Remembered(authorization)
+	if !ok && hasCredentials && haveClient && c.loginLimit.Blocked(client) {
 		c.counters.throttled.Add(1)
 		h.log.Debug("too many failed logins, not checking credentials", zap.String("remote", remote))
 		return next.ServeHTTP(w, r)
 	}
-	user, ok, err := c.auth.Verify(r.Context(), r.Header.Get("Authorization"))
-	if errors.Is(err, auth.ErrBusy) {
-		// Like any web server under more load than it can take; whether the
-		// credentials were valid is not known.
-		return h.reject(w, r, rejection{status: http.StatusServiceUnavailable})
-	}
-	if err != nil {
-		return nil // the request was cancelled
+	if !ok {
+		var err error
+		user, ok, err = c.auth.Verify(r.Context(), authorization, client)
+		if errors.Is(err, auth.ErrBusy) {
+			// Like any web server under more load than it can take; whether
+			// the credentials were valid is not known.
+			return h.reject(w, r, rejection{status: http.StatusServiceUnavailable})
+		}
+		if err != nil {
+			return nil // the request was cancelled
+		}
 	}
 	if !ok {
 		if haveClient && hasCredentials {
 			c.loginLimit.Fail(client)
 		}
 		c.counters.authFailures.Add(1)
-		if name, _, has := auth.ParseBasic(r.Header.Get("Authorization")); has {
+		if name, _, has := auth.ParseBasic(authorization); has {
 			if len(name) > 64 {
 				name = name[:64]
 			}
