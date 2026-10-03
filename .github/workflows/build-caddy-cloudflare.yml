@@ -102,6 +102,12 @@ jobs:
           tar -czf ${name}.tar.gz ${name}
           sha256sum ${name}.tar.gz > ${name}.tar.gz.sha256
 
+      - name: Service and installer smoke test on the disposable runner
+        env:
+          GOARCH: ${{ inputs.arch }}
+        run: |
+          sudo env MASQUE_TEST_SYSTEMD=1 bash source/tests/systemd-smoke.sh "$PWD/build/dist/caddy-masque-cloudflare-linux-$GOARCH/caddy"
+
       - name: Upload downloadable artifact
         uses: actions/upload-artifact@v7
         with:
