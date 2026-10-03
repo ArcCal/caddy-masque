@@ -2,13 +2,23 @@ name: Build Caddy with MASQUE and Cloudflare
 
 on:
   workflow_dispatch:
+    inputs:
+      arch:
+        description: Linux CPU architecture
+        type: choice
+        required: true
+        default: amd64
+        options:
+          - amd64
+          - arm64
 
 permissions:
   contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    name: Build Linux ${{ inputs.arch }}
+    runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -26,7 +36,7 @@ jobs:
         env:
           CGO_ENABLED: '0'
           GOOS: linux
-          GOARCH: amd64
+          GOARCH: ${{ inputs.arch }}
           GOTOOLCHAIN: local
         run: |
           set -euo pipefail
@@ -47,24 +57,25 @@ jobs:
           go get github.com/caddyserver/caddy/v2@v2.11.6 github.com/caddy-dns/cloudflare@a8737d095ad5a48ca031cea6ab704057dbc2d250
           go mod tidy
           go mod verify
-          mkdir -p dist/caddy-masque-cloudflare-linux-amd64
-          go build -mod=readonly -buildvcs=false -trimpath -ldflags '-s -w' -o dist/caddy-masque-cloudflare-linux-amd64/caddy .
-          binary=dist/caddy-masque-cloudflare-linux-amd64/caddy
+          mkdir -p dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}
+          go build -mod=readonly -buildvcs=false -trimpath -ldflags '-s -w' -o dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/caddy .
+          binary=dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/caddy
           "$binary" version
           "$binary" list-modules > modules.txt
           for module in masque http.handlers.masque dns.providers.cloudflare; do
             grep -Fx "$module" modules.txt
           done
-          go version -m "$binary" > dist/caddy-masque-cloudflare-linux-amd64/build-info.txt
-          cp go.mod go.sum dist/caddy-masque-cloudflare-linux-amd64/
+          go version -m "$binary" > dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/build-info.txt
+          git -C ../source rev-parse HEAD > dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/masque-source-commit.txt
+          cp go.mod go.sum dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/
           cd dist
-          tar -czf caddy-masque-cloudflare-linux-amd64.tar.gz caddy-masque-cloudflare-linux-amd64
-          sha256sum caddy-masque-cloudflare-linux-amd64.tar.gz > caddy-masque-cloudflare-linux-amd64.tar.gz.sha256
+          tar -czf caddy-masque-cloudflare-linux-${{ inputs.arch }}.tar.gz caddy-masque-cloudflare-linux-${{ inputs.arch }}
+          sha256sum caddy-masque-cloudflare-linux-${{ inputs.arch }}.tar.gz > caddy-masque-cloudflare-linux-${{ inputs.arch }}.tar.gz.sha256
 
       - name: Upload downloadable artifact
         uses: actions/upload-artifact@v7
         with:
-          name: caddy-masque-cloudflare-linux-amd64
+          name: caddy-masque-cloudflare-linux-${{ inputs.arch }}
           path: |
             build/dist/*.tar.gz
             build/dist/*.sha256
