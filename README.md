@@ -236,7 +236,8 @@ example.com, *.example.com, :443 {
 - **Headers**: `-Server` removes the `Server: Caddy` header, so the cover site gives less away. `X-XSS-Protection` is
   left out because browsers no longer use it. `preload` in `Strict-Transport-Security` does nothing until the domain is
   submitted to [hstspreload.org](https://hstspreload.org/); after that, every subdomain must serve HTTPS, which is hard to
-  undo. Tunnel responses go through the same `header` handler; masque-vpn's client accepts them.
+  undo. These headers are on the website's responses only: `masque` runs before `header`, so a tunnel's own response
+  (which only clients with a valid password ever get, never a browser) does not pass through it.
 
 Tested with Caddy v2.11.6 built with this module and caddy-dns/cloudflare: `caddy validate` accepts the file, and with
 Caddy's internal CA in place of Cloudflare, the website sends the headers above, TLS 1.2 is refused, and masque-vpn's
