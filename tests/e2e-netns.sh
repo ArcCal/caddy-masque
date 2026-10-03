@@ -753,6 +753,29 @@ check "after 70 s without traffic it still carries traffic" seen_as $SERVER 5
 check_not "without reconnecting" wait_log "$WORK/client-h2-idle.log" "tunnel up" 1 2
 stop_client
 
+echo "== an HTTP/2 client that vanishes (its network changed)"
+start_client "$WORK/client-h2.toml" "$WORK/client-h2-gone.log"
+check "tunnel up over HTTP/2" wait_log "$WORK/client-h2-gone.log" "tunnel up.*HTTP/2" 15
+check "and carries traffic" seen_as $SERVER 5
+ended=$(grep -c '"session ended"' "$WORK/server.log")
+# The router drops everything between the two: neither hears of it.
+in_ns $NS_I nft -f - <<EOF
+table inet mq-gone {
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+        ip saddr $CLIENT ip daddr $SERVER drop
+        ip saddr $SERVER ip daddr $CLIENT drop
+    }
+}
+EOF
+gone_at=$(date +%s)
+# Keepalive probes after 10 s idle, the user timeout at 30 s; Caddy's own
+# keepalive would take about 2.5 minutes.
+check "the server ends the session within 45 s" wait_log "$WORK/server.log" '"session ended"' 45 $((ended + 1))
+echo "        (after $(($(date +%s) - gone_at)) s)"
+in_ns $NS_I nft delete table inet mq-gone
+stop_client
+
 if [ -n "$NETSIM" ]; then
     echo "== a slow, lossy path: 120 ms RTT with jitter, 1% loss, HTTP/3"
     # Policy routing in the router sends the traffic between the client

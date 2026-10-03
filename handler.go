@@ -75,8 +75,19 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		return err
 	}
 	h.app = app.(*App)
+	// The connection a request came on, for the TCP settings of tunnels
+	// over HTTP/2 (see tunnelKeepAlive); Caddy's way to get it is a hook
+	// registered while provisioning.
+	if srv, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok {
+		srv.RegisterConnContext(func(ctx context.Context, c net.Conn) context.Context {
+			return context.WithValue(ctx, connKey{}, c)
+		})
+	}
 	return nil
 }
+
+// connKey is the context key of the connection a request came on.
+type connKey struct{}
 
 // request describes a CONNECT-IP request whatever the HTTP version.
 type request struct {
@@ -386,6 +397,7 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 			return nil, err
 		}
 		_ = conn.SetDeadline(time.Time{})
+		h.tuneConn(conn)
 		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\nCapsule-Protocol: ?1\r\n\r\n")
 		if err := brw.Flush(); err != nil {
 			conn.Close()
@@ -442,6 +454,8 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 	}
 	_ = rc.SetReadDeadline(time.Time{})
 	_ = rc.SetWriteDeadline(time.Time{})
+	conn, _ := r.Context().Value(connKey{}).(net.Conn)
+	h.tuneConn(conn)
 	body := rawBody(r.Body)
 	// A write deadline in the past resets the stream (and unblocks a write
 	// waiting for flow control); Go's HTTP/2 server has no other way to
@@ -458,6 +472,19 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 		},
 		forceFn: reset,
 	}, nil
+}
+
+// tuneConn gives the connection of a tunnel over TCP the settings of
+// tunnelKeepAlive. Over HTTP/2 the connection's other streams get them
+// too, also after the tunnel ends, which does them no harm.
+func (h *Handler) tuneConn(c net.Conn) {
+	if c == nil {
+		h.log.Debug("connection of the tunnel unknown: Caddy's keepalive settings apply")
+		return
+	}
+	if err := tuneTunnelConn(c); err != nil {
+		h.log.Debug("could not shorten the TCP timeouts of the tunnel", zap.Error(err))
+	}
 }
 
 // bufferedOf returns what the HTTP server read past the request headers.
