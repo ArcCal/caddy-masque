@@ -1,0 +1,44 @@
+--- a/http2/server.go
++++ b/http2/server.go
+@@ -2695,6 +2695,16 @@
+ 	}
+ }
+ 
++// ResetStream terminates this stream with the specified HTTP/2 error code.
++// It uses the server's frame queue, preserving serialization with other streams.
++func (w *responseWriter) ResetStream(code uint32) error {
++	st := w.rws.stream
++	return st.sc.writeFrameFromHandler(FrameWriteRequest{
++		write:  StreamError{StreamID: st.id, Code: ErrCode(code)},
++		stream: st,
++	})
++}
++
+ func (w *responseWriter) SetReadDeadline(deadline time.Time) error {
+ 	st := w.rws.stream
+ 	if !deadline.IsZero() && deadline.Before(time.Now()) {
+--- a/http2/reset.go
++++ b/http2/reset.go
+@@ -0,0 +1,22 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license in LICENSE.
++
++package http2
++
++import "net/http"
++
++// ResetStream terminates an HTTP/2 response stream using code. It unwraps
++// middleware response writers and returns http.ErrNotSupported on other
++// transports. Callers must stop using the writer after this call.
++func ResetStream(w http.ResponseWriter, code ErrCode) error {
++	for {
++		if r, ok := w.(interface{ ResetStream(uint32) error }); ok {
++			return r.ResetStream(uint32(code))
++		}
++		if u, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
++			w = u.Unwrap()
++			continue
++		}
++		return http.ErrNotSupported
++	}
++}

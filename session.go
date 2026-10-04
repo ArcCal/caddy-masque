@@ -472,6 +472,17 @@ func (s *session) clientPacket(payload []byte) error {
 	if s.isProbeReply(pkt, h) {
 		return nil
 	}
+	// RFC 9484 §7.2 permits peers without our address to probe ff02::1.
+	// Answer on this tunnel using a unicast source (RFC 4443 §4.2), and
+	// never forward link-local multicast into the host's network.
+	if h.Dst == netip.MustParseAddr("ff02::1") {
+		if echo, ok := ip.Echo(pkt, h); ok && echo.Type == ip.EchoRequestV6 && s.icmpAllow() {
+			if gateway := s.core.gateway(true); gateway.IsValid() {
+				return s.sendToClient(append([]byte{0}, ip.EchoV6(ip.EchoReplyV6, gateway, h.Src, echo.ID, echo.Seq, echo.Data)...))
+			}
+		}
+		return nil
+	}
 	if h.Fragment && s.scope.protocol != 0 {
 		// A later IPv6 fragment may not show its upper-layer protocol: it
 		// is the first fragment's (RFC 9484 §4.8). Unknown, it is dropped.

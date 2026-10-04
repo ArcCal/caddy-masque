@@ -2,6 +2,15 @@
 
 Each version is tagged with its number; CI attaches Caddy builds to its release on GitHub.
 
+## Unreleased
+
+- The default capsule decoding limit includes the full IPv6 header and an eight-byte context ID.
+- Capsule parsing gains segmentation fuzzing. End-to-end CI uses the optimized Rust client and explicitly supplies the network simulator, whose bandwidth limiter works without kernel traffic-shaping modules and is checked before testing transfers.
+
+- **Malformed HTTP/2 requests and capsules reset their stream with `PROTOCOL_ERROR`.** A pinned `golang.org/x/net` patch exposes the reset API through Caddy's existing HTTP/2 server. Other streams remain usable; HTTP/3, HTTP/2 and HTTP/1.1 remain supported. Custom builds must include the replacement documented in [third_party/README.md](third_party/README.md).
+- **IPv6 all-nodes MTU probes receive a local unicast reply.** A peer can verify the 1280-byte tunnel MTU without knowing the server's address; multicast packets are never forwarded into the host network.
+- **The service no longer logs its entire environment at startup.** This keeps environment-based DNS API credentials out of the journal.
+
 ## 1.0
 
 The first stable version. The code is that of 0.99, which has every fix of the pre-production audit

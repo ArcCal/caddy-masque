@@ -16,6 +16,19 @@ import (
 
 func encoded(t uint64, value []byte) []byte { return AppendCapsule(nil, t, value) }
 
+func TestMaximumIPv6PacketAndContextFitDefaultLimit(t *testing.T) {
+	d := NewDecoder(DefaultMaxValueLen)
+	value := bytes.Repeat([]byte{0}, 65535+40+8)
+	d.Push(encoded(TypeDatagram, value))
+	c, err := d.Next()
+	if err != nil || !bytes.Equal(c.Value, value) {
+		t.Fatalf("maximum IPv6 datagram was not retained: length=%d, err=%v", len(c.Value), err)
+	}
+	if err := d.Finish(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCapsulesSplitAtEveryByte(t *testing.T) {
 	wire := append(encoded(0x01, []byte("hello")), encoded(0x12345678, bytes.Repeat([]byte{0xaa}, 300))...)
 	d := NewDecoder(DefaultMaxValueLen)

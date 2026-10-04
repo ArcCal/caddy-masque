@@ -16,6 +16,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
+	"golang.org/x/net/http2"
 
 	"github.com/ArcCal/caddy-masque/internal/auth"
 	"github.com/ArcCal/caddy-masque/internal/proto"
@@ -148,9 +149,7 @@ type rejection struct {
 
 // malformed answers a malformed request: 400, then for HTTP/3 the stream
 // error H3_MESSAGE_ERROR (RFC 9114 §4.1.2), sent with STOP_SENDING so that
-// the response still arrives. The HTTP/2 server gives handlers no way to
-// reset a stream with PROTOCOL_ERROR (RFC 9113 §8.1.1); the response alone
-// tells the client the request failed (RFC 9484 §4.5).
+// the response still arrives. HTTP/2 uses PROTOCOL_ERROR (RFC 9113 §8.1.1).
 var malformed = rejection{status: http.StatusBadRequest, malformed: true}
 
 func (h *Handler) reject(w http.ResponseWriter, r *http.Request, rej rejection) error {
@@ -158,6 +157,11 @@ func (h *Handler) reject(w http.ResponseWriter, r *http.Request, rej rejection) 
 		w.Header().Set("Proxy-Status", "caddy-masque; error="+rej.proxyError)
 	}
 	w.WriteHeader(rej.status)
+	if rej.malformed && r.ProtoMajor == 2 {
+		// Flush the optional 400 before the mandatory stream error.
+		_ = http.NewResponseController(w).Flush()
+		return http2.ResetStream(w, http2.ErrCodeProtocol)
+	}
 	if rej.malformed && r.ProtoMajor == 3 {
 		_ = http.NewResponseController(w).Flush()
 		if s, ok := unwrapStreamer(w); ok {
@@ -457,16 +461,15 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 	conn, _ := r.Context().Value(connKey{}).(net.Conn)
 	h.tuneConn(conn)
 	body := rawBody(r.Body)
-	// A write deadline in the past resets the stream (and unblocks a write
-	// waiting for flow control); Go's HTTP/2 server has no other way to
-	// reset it from a handler.
+	// Forced shutdown wakes blocked writers; malformed capsules instead use
+	// the precise stream error required by RFC 9297 §3.3 / RFC 9113 §8.1.1.
 	reset := func() { _ = rc.SetWriteDeadline(time.Now()) }
 	return &streamTunnel{
 		reader:        newCapsuleReader(body),
 		capsuleWriter: capsuleWriter{w: raw, flush: rc.Flush},
 		stopFn: func(abort bool) {
 			if abort {
-				reset()
+				_ = http2.ResetStream(raw, http2.ErrCodeProtocol)
 			}
 			_ = body.Close()
 		},

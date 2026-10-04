@@ -10,13 +10,15 @@
 //
 //	netsim -tun dly0 -params FILE
 //
-// The parameters file holds "delay=60ms", "jitter=5ms" and "loss=10" (per
-// mille) lines and is read again whenever it changes.
+// The parameters file holds "delay=60ms", "jitter=5ms", "loss=10" (per
+// mille) and optional "rate=4000000" (bits/second, aggregate) lines and is
+// read again whenever it changes. Rate zero disables the bandwidth limit.
 package main
 
 import (
 	"bufio"
 	"flag"
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"os"
@@ -32,6 +34,7 @@ import (
 type params struct {
 	delay, jitter time.Duration
 	lossPerMille  int
+	rate          int64
 }
 
 var current atomic.Pointer[params]
@@ -66,10 +69,15 @@ func readParams(path string) (*params, error) {
 			p.jitter, err = time.ParseDuration(v)
 		case "loss":
 			p.lossPerMille, err = strconv.Atoi(v)
+		case "rate":
+			p.rate, err = strconv.ParseInt(v, 10, 64)
 		}
 		if err != nil {
 			return nil, err
 		}
+	}
+	if p.rate < 0 || p.rate > 1_000_000_000_000 {
+		return nil, fmt.Errorf("rate must be between 0 and 1000000000000 bits/second")
 	}
 	return p, sc.Err()
 }
@@ -81,7 +89,7 @@ func watchParams(path string) {
 			if p, err := readParams(path); err == nil {
 				current.Store(p)
 				last = st.ModTime()
-				log.Printf("delay %v jitter %v loss %d/1000", p.delay, p.jitter, p.lossPerMille)
+				log.Printf("delay %v jitter %v loss %d/1000 rate %dbit/s", p.delay, p.jitter, p.lossPerMille, p.rate)
 			}
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -106,7 +114,7 @@ func openTUN(name string) (*os.File, error) {
 
 func main() {
 	tun := flag.String("tun", "dly0", "TUN device to create")
-	paramsPath := flag.String("params", "", "file with delay=, jitter= and loss= lines")
+	paramsPath := flag.String("params", "", "file with delay=, jitter=, loss= and rate= lines")
 	flag.Parse()
 	current.Store(&params{})
 	if *paramsPath != "" {
@@ -140,13 +148,10 @@ func main() {
 		if p.lossPerMille > 0 && rand.IntN(1000) < p.lossPerMille {
 			continue
 		}
-		due := time.Now().Add(p.wait())
-		if due.Before(lastDue) {
-			due = lastDue
-		}
-		lastDue = due
+		due := packetDue(time.Now(), lastDue, n, p)
 		select {
 		case queue <- delayed{due: due, pkt: append([]byte(nil), buf[:n]...)}:
+			lastDue = due
 		default: // the link's queue is full: dropped
 		}
 	}
@@ -155,4 +160,21 @@ func main() {
 type delayed struct {
 	due time.Time
 	pkt []byte
+}
+
+func packetDue(now, last time.Time, size int, p *params) time.Time {
+	due := now.Add(p.wait())
+	if p.rate > 0 {
+		// Round up so even small packets consume bandwidth. A single queue
+		// bounds the aggregate rate across both directions of the test link.
+		bitsNS := int64(size) * 8 * int64(time.Second)
+		if last.Before(now) {
+			last = now
+		}
+		last = last.Add(time.Duration((bitsNS + p.rate - 1) / p.rate))
+	}
+	if last.After(due) {
+		return last
+	}
+	return due
 }
