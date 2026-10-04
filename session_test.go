@@ -630,8 +630,13 @@ func TestNetworkPacketsReachTheirClient(t *testing.T) {
 			}
 		}
 		other.tun.quiet(t)
-		// Nobody's address: dropped.
-		e.dev.fromHost <- udp("1.1.1.1", "10.89.0.250", 10)
+		// Choose a genuinely unassigned address inside the pool. A fixed
+		// address can belong to either randomly allocated client.
+		unassigned := netip.MustParseAddr("10.89.0.2")
+		for unassigned.String() == r.addr(false) || unassigned.String() == other.addr(false) {
+			unassigned = unassigned.Next()
+		}
+		e.dev.fromHost <- udp("1.1.1.1", unassigned.String(), 10)
 		r.tun.quiet(t)
 		other.tun.quiet(t)
 	}

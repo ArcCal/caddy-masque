@@ -23,8 +23,15 @@ establish that an arbitrary production host, Cloudflare token, or client will wo
   missing modules and invalid configuration leave the working binary untouched.
 - Remove the service's environment dump so environment-based DNS tokens are not
   logged at startup. Set its home directory to the existing state directory.
-- Correct a flaky spoofing test whose hardcoded source could be randomly leased
-  to the client. Its source now lies outside the allocation pool.
+- Correct two flaky address tests: a spoofed source could be randomly leased
+  to the client, and an allegedly unassigned destination could belong to either
+  client. Spoofing now uses an address outside the pool; the unknown-destination
+  check selects an address that neither client owns inside the pool.
+- Read the configured tunnel interface before replacing the binary. UFW
+  forwarding and iptables advice now use that interface, instead of always
+  naming `masque0`. The service/installer test asserts the expected UFW command
+  for a custom interface using a command spy; real UFW policy interaction still
+  needs validation in the intended deployment topology.
 - Add packet/capsule fuzzers, an opt-in isolated Linux network lifecycle test,
   and offline MASQUE + Cloudflare configuration provisioning. Native amd64 and
   arm64 artifact builds run the source tests and kernel test before publication.
