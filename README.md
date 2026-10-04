@@ -329,6 +329,11 @@ Known limitations:
   HTTP/3, they just are not advertised.
 - The HTTP/3 the VPN takes over does not accept 0-RTT (replay risk), and does not apply Caddy's `packet_conn_wrappers`
   (such as the PROXY protocol over UDP).
+- An HTTP Datagram on an HTTP/3 request that defines none (a GET for the website, say) should abort that request with
+  H3_DATAGRAM_ERROR (RFC 9297 §2); here it is dropped instead and the request carries on. quic-go offers handlers no
+  way to watch a request's datagrams without taking over its stream. At most 32 such datagrams per request are held
+  until it ends, so this costs no unbounded memory. Malformed datagrams (too short, or a Quarter Stream ID above
+  2⁶⁰−1) do close the connection with H3_DATAGRAM_ERROR, as RFC 9297 §2.1 requires.
 
 HTTP/2 malformed requests and capsules use PROTOCOL_ERROR as required by
 RFC 9113 §8.1.1 and RFC 9297 §3.3. The pinned dependency patch supplies the
