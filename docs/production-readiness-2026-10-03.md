@@ -76,22 +76,29 @@ HTTP/3, client traffic, reload, restart, and certificate renewal in staging.
 
 ## Verified GitHub results — 2026-10-04 (Asia/Shanghai)
 
-The tested source commit is `94cac78a857573a0361570b43a711969f544a8b4`.
+The tested source commit is `7d7faa2a23b0eb70e96027c0c74eb6ad76edda04`.
 
-- [CI](https://github.com/ArcCal/caddy-masque/actions/runs/37151699361) passed
+- [CI](https://github.com/ArcCal/caddy-masque/actions/runs/37166031150) passed
   the race-enabled suite, isolated kernel lifecycle test, bounded fuzz campaigns,
   and Linux amd64/arm64 and macOS arm64 builds. The original-client end-to-end
   step was skipped for the missing secret and is excluded from this claim.
-- [Vulnerability scan](https://github.com/ArcCal/caddy-masque/actions/runs/37151699314)
+- [Vulnerability scan](https://github.com/ArcCal/caddy-masque/actions/runs/37166031139)
   passed. The combined build was also scanned locally with zero reachable
   vulnerabilities.
 - Native combined builds passed on
-  [Linux amd64](https://github.com/ArcCal/caddy-masque/actions/runs/37151734667) and
-  [Linux arm64](https://github.com/ArcCal/caddy-masque/actions/runs/37151736419).
+  [Linux amd64](https://github.com/ArcCal/caddy-masque/actions/runs/37166073230) and
+  [Linux arm64](https://github.com/ArcCal/caddy-masque/actions/runs/37166074710).
   Each passed real TUN/firewall/forwarding setup, repair and cleanup, offline
   Cloudflare provisioning, real systemd start/reload/restart/stop, successful
   prebuilt installation, and restoration of the working binary after a simulated
   service startup failure.
+- All three Linux test runs also passed `TestCaddyRealKernelTraffic`: real UDP
+  packets traversed Caddy, TUN, IPv4/IPv6 NAT, and a separate origin namespace,
+  and replies returned to the assigned addresses. The origin verified the
+  server's WAN source address. HTTP/3, HTTP/2, HTTP/1.1, and an independent
+  `connect-ip-go` client each passed both address families without a Rust-client
+  secret. The local suite with these new opt-in tests also passed; its normal run
+  skips the privileged test and subprocess helper.
 - Both downloadable archives were fetched and their SHA-256 checksums verified.
   ELF inspection confirms static x86-64 and aarch64 binaries, and both record
   the tested source commit. The amd64 artifact's three custom modules are
@@ -100,6 +107,7 @@ The tested source commit is `94cac78a857573a0361570b43a711969f544a8b4`.
 - Builds contain Caddy 2.11.6, Cloudflare provider 0.2.4, and Go 1.26.8. Artifact
   retention is 30 days; rebuilding the workflow creates a fresh download.
 
-These results close the privileged kernel and systemd rollback testing gaps.
-Original-client interoperability, live DNS issuance/renewal, and validation of
+These results close the real kernel traffic, NAT, independent-client
+interoperability, and systemd rollback testing gaps. Original Rust-client
+interoperability, live DNS issuance/renewal, and validation of
 the intended host topology remain prerequisites for a production deployment.

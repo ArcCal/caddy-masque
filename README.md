@@ -352,6 +352,16 @@ The in-process tests start a real Caddy inside the test process (with a fake TUN
 in Go to do CONNECT-IP over HTTP/3, HTTP/2 and HTTP/1.1: sending and receiving packets, refusals that look like the
 website, reloads (including failed ones), removed users, new blocks, idle timeouts and more.
 
+CI and the native combined-build workflows also run a self-contained kernel test: real TUN, IPv4/IPv6 NAT and return
+traffic over HTTP/3, HTTP/2, HTTP/1.1 and the independent `connect-ip-go` client. The origin reports the source address
+it sees. This test uses isolated namespaces and needs no private-repository secret. To run it on a disposable Linux VM
+with TUN, IPv6, iproute2 and nftables available:
+
+```sh
+go test -race -c -o /tmp/caddy-kernel.test .
+sudo unshare --net env MASQUE_TEST_KERNEL=1 /tmp/caddy-kernel.test -test.v -test.run '^TestCaddyRealKernelTraffic$' -test.timeout=60s
+```
+
 The end-to-end tests need the masque-vpn client (by default `../masque-vpn/target/debug/masque-client`, or set with
 `CLIENT_BIN=`) and cover: the three transports, falling back to TCP when UDP is blocked, scoped requests (including
 domain names the server resolves), reloading certificates and users, server crashes and restarts, client-to-client
