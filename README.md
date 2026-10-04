@@ -4,7 +4,7 @@ The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as
 
 - **Standards**: IETF MASQUE IP proxying, CONNECT-IP (RFC 9484); HTTP Datagrams and Capsules (RFC 9297);
   extended CONNECT over HTTP/2 and HTTP/3 (RFC 8441, RFC 9220). HTTP/3, HTTP/2 and HTTP/1.1 are all supported.
-- **Clients unchanged**: masque-vpn's `masque-client` and MasqueVPN on the Mac connect directly, without changing a single
+- **Clients unchanged**: masque-vpn's `masque-client` and IETF Masque on macOS 27 arm64 connect directly, without changing a single
   line of their configuration (a client with the server's IP address in its `uri_template` needs the `:443` in the site
   addresses shown below; over HTTP/3 with IPv6 on, older clients need the note on the MTU probe below). Password hashes made by `caddy masque-passwd` and by masque-vpn's `masque-passwd` are interchangeable.
 - **Caddy handles certificates and traffic**: certificates are obtained and renewed automatically; the VPN and the website
@@ -13,9 +13,10 @@ The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as
   every other request (including ones with a wrong password, and probes) goes to the website, and the response is
   exactly what an ordinary Caddy website gives.
 
-Linux only (needs root: it creates a TUN device and sets up forwarding and NAT).
+Linux x86_64 and arm64 only (needs root: it creates a TUN device and sets up forwarding and NAT).
 
 Current version 1.0. The differences between versions are in [CHANGELOG.md](CHANGELOG.md).
+Current review results and native-validation requirements are in [the October 4 production review](docs/review-2026-10-04-production.md).
 
 ## One-step install
 

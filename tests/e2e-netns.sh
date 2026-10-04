@@ -952,11 +952,13 @@ EOF
 # Its own directory, readable by the unprivileged user that runs it.
 mkdir -p "$WORK/socks"
 chmod 711 "$WORK"
+# The source/build path can be private; do not weaken it to run this test.
+install -m 755 "$CLIENT_BIN" "$WORK/socks/masque-client"
 client_config "$WORK/socks/client.toml" laptop "$LAPTOP_PW" 'mode = "socks"' "dns = [\"$TARGET\"]" \
     '[socks]' 'listen = ["127.0.0.1:1080"]'
 chown -R 65534:65534 "$WORK/socks"
 ip netns exec $NS_C setpriv --reuid=65534 --regid=65534 --clear-groups env RUST_LOG=info \
-    "$CLIENT_BIN" -c "$WORK/socks/client.toml" >"$WORK/client-socks.log" 2>&1 &
+    "$WORK/socks/masque-client" -c "$WORK/socks/client.toml" >"$WORK/client-socks.log" 2>&1 &
 CLIENT_PID=$!
 check "the SOCKS client runs without root" wait_log "$WORK/client-socks.log" "tunnel up" 15
 check "and listens on 127.0.0.1:1080" grep -q "SOCKS5 proxy on 127.0.0.1:1080" "$WORK/client-socks.log"

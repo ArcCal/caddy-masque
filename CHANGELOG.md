@@ -4,6 +4,10 @@ Each version is tagged with its number; CI attaches Caddy builds to its release 
 
 ## Unreleased
 
+- Reachable dependency vulnerability scanning is now part of the required release test job.
+
+- Release artifacts support Linux x86_64 and arm64 only. Optimized-client end-to-end tests run on both native architectures and are required for release uploads; missing cross-repository access now blocks publication rather than silently skipping those tests.
+
 - The default capsule decoding limit includes the full IPv6 header and an eight-byte context ID.
 - Capsule parsing gains segmentation fuzzing. End-to-end CI uses the optimized Rust client and explicitly supplies the network simulator, whose bandwidth limiter works without kernel traffic-shaping modules and is checked before testing transfers.
 
