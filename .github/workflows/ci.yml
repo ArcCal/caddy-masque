@@ -1,11 +1,12 @@
 # Tests every push to main and every pull request, and builds Caddy with
-# the module for Linux on x86_64 and arm64 and macOS on Apple silicon. For a
+# the module for Linux on x86_64 and arm64 only. For a
 # published GitHub Release,
 # the builds are attached to it.
 #
 # The end-to-end test needs masque-vpn's client, from the private
 # ArcCal/masque-vpn repository: it runs when the repository secret
-# MASQUE_VPN_TOKEN holds a token that can read it, and is skipped otherwise.
+# MASQUE_VPN_TOKEN holds a token that can read it. A release fails without
+# that access; non-release runs report a skip when the secret is unavailable.
 name: ci
 
 on:
@@ -23,8 +24,13 @@ permissions:
 
 jobs:
   test:
-    name: test
-    runs-on: ubuntu-24.04
+    name: test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -43,6 +49,8 @@ jobs:
       - name: gofmt
         run: test -z "$(git ls-files '*.go' ':!third_party/**' | xargs gofmt -l | tee /dev/stderr)"
       - run: go vet ./...
+      - name: Reachable dependency vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
       - name: Unit and in-process tests (with the race detector)
         run: go test -race -count=1 ./...
       - name: Capsule stream segmentation fuzzing
@@ -52,11 +60,21 @@ jobs:
         run: go test -race ./http2 ./http2/hpack
 
   e2e:
-    name: end-to-end with masque-client
-    runs-on: ubuntu-24.04
+    name: end-to-end with masque-client (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     env:
       HAVE_CLIENT: ${{ secrets.MASQUE_VPN_TOKEN != '' }}
     steps:
+      - name: Require cross-repository access for a release
+        if: github.event_name == 'release' && env.HAVE_CLIENT != 'true'
+        run: |
+          echo "::error::MASQUE_VPN_TOKEN must grant read access to ArcCal/masque-vpn before publishing"
+          exit 1
       - name: Skipped without MASQUE_VPN_TOKEN
         if: env.HAVE_CLIENT != 'true'
         run: echo "::notice::the end-to-end test needs the MASQUE_VPN_TOKEN secret to fetch masque-vpn's client"
@@ -79,7 +97,7 @@ jobs:
           # standard library security fixes (go.mod says 1.26.0, the first release).
           go-version: "1.26"
           check-latest: true
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         if: env.HAVE_CLIENT == 'true'
       - uses: Swatinem/rust-cache@v2
         if: env.HAVE_CLIENT == 'true'
@@ -107,7 +125,6 @@ jobs:
         include:
           - { os: linux, arch: amd64 }
           - { os: linux, arch: arm64 }
-          - { os: darwin, arch: arm64 }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -141,12 +158,13 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+          if-no-files-found: error
           retention-days: 30
 
   release:
     name: attach to the release
     if: github.event_name == 'release'
-    needs: [test, build]
+    needs: [test, e2e, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -165,4 +183,4 @@ jobs:
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --repo "$GITHUB_REPOSITORY"
