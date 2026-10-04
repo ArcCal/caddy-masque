@@ -55,6 +55,8 @@ jobs:
           sudo modprobe tun
           go test -c -o "$RUNNER_TEMP/hostnet.test" ./internal/hostnet
           sudo unshare --net env MASQUE_TEST_HOSTNET=1 "$RUNNER_TEMP/hostnet.test" -test.v -test.run '^TestHostNetworkLifecycle$'
+          go test -race -c -o "$RUNNER_TEMP/caddy-kernel.test" .
+          sudo unshare --net env MASQUE_TEST_KERNEL=1 "$RUNNER_TEMP/caddy-kernel.test" -test.v -test.run '^TestCaddyRealKernelTraffic$' -test.timeout=60s
 
       - name: Build pinned modules
         shell: bash
