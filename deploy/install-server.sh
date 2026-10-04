@@ -120,7 +120,7 @@ if [ $((mem_kb + swap_kb)) -lt 2500000 ]; then
     mkswap -q "$SWAP"
     swapon "$SWAP"
 fi
-(cd "$SRC" && GOTOOLCHAIN=local CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$BUILD_DIR/caddy" ./cmd/caddy)
+(cd "$SRC" && GOTOOLCHAIN=local CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags "-s -w" -o "$BUILD_DIR/caddy" ./cmd/caddy)
 cleanup_swap
 install -m 755 "$BUILD_DIR/caddy" /usr/local/bin/caddy
 caddy version

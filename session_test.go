@@ -469,6 +469,28 @@ func TestClientPacketsReachTheNetwork(t *testing.T) {
 	}
 }
 
+func TestAllNodesMTUProbeIsAnsweredInsideTheTunnel(t *testing.T) {
+	e := newTestEnv(t, dualStack())
+	r := e.start(t, alice, true)
+	from := netip.MustParseAddr(r.addr(true))
+	data := make([]byte, ip.IPv6MinMTU-48)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	request := ip.EchoV6(ip.EchoRequestV6, from, netip.MustParseAddr("ff02::1"), 123, 7, data)
+	r.tun.datagrams <- append([]byte{0}, request...)
+	reply := r.tun.nextPacket(t)
+	h, ok := ip.Parse(reply)
+	if !ok || h.Src != e.core.gateway(true) || h.Dst != from || h.TotalLen != ip.IPv6MinMTU {
+		t.Fatalf("invalid all-nodes reply: %+v", h)
+	}
+	echo, ok := ip.Echo(reply, h)
+	if !ok || echo.Type != ip.EchoReplyV6 || echo.ID != 123 || echo.Seq != 7 || !slices.Equal(echo.Data, data) {
+		t.Fatalf("invalid echoed data: %+v", echo)
+	}
+	noHostPacket(t, e.dev)
+}
+
 func TestClientPacketsThatAreDropped(t *testing.T) {
 	e := newTestEnv(t, dualStack())
 	r := e.start(t, alice, true)
