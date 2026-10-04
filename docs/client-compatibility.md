@@ -2,7 +2,7 @@
 
 目标客户端：[ArcCal/masque-vpn](https://github.com/ArcCal/masque-vpn) 的真实 `masque-client`，以及使用其核心的 MasqueVPN macOS 应用。2026-10-04 起，服务端改动同时以 **IETF 规范、安全与可靠性、目标客户端兼容性** 为验收条件。
 
-兼容性需要固定并记录版本、配置与测试结果；“完美兼容”是目标，不能作为未经验证的保证。默认覆盖当前 `main` 的明确提交、最新稳定发行版和用户实际部署版本；在取得客户端源码和版本信息后补齐提交号。历史版本逐项记录支持范围，不承诺所有历史构建都具备后来新增的协议能力。
+兼容性需要固定并记录版本、配置与测试结果；“完美兼容”是目标，不能作为未经验证的保证。默认覆盖当前 `main` 的明确提交、最新稳定发行版和用户实际部署版本；当前 main 的固定提交已记录如下；稳定发行版和用户实际部署版本尚待确认。历史版本逐项记录支持范围，不承诺所有历史构建都具备后来新增的协议能力。
 
 ## 兼容原则
 
@@ -31,7 +31,7 @@
 
 ## 已知的版本敏感点
 
-服务端 README 记录，`masque-vpn#14` 起客户端在各模式回应 IPv6 MTU 探测；更早的 SOCKS 或 `ipv6=false` 构建可能不能回应。本次未读取客户端仓库，**该记录尚未由客户端源码重新确认**。取得访问后应核对实际提交与应用所嵌入的核心版本，再分别验证。
+服务端 README 记录，`masque-vpn#14` 起客户端在各模式回应 IPv6 MTU 探测；更早的 SOCKS 或 `ipv6=false` 构建可能不能回应。已读取的客户端提交 `ba82e36164a69c01a2a366153550aee2821c41b7` 在未使用 IPv6 地址时仍保留 peer 地址并回应 Echo；本轮真实 H3/SOCKS/`ipv6=false` 用例通过 10 秒探测窗口后仍可收发。此结论仅适用于所测提交，尚未确认 macOS 应用内嵌版本或所有旧构建。
 
 仅知道“直连、没有 HTTP 代理”不足以凭空宣称 MTU 保证。若使用 `mtu_probe off`，必须另有经过验证的 RFC 9484 §7.2 保证；不要为旧客户端无条件关闭探测。选择标准可靠 Capsule 承载或受支持传输也须通过真实互操作测试，且不关闭其他报文保护。HTTP/2 当前的规范错误码缺口仍须按审计 S1 修复，不能因为旧客户端能容忍就视为合规。
 
@@ -41,14 +41,38 @@
 - `.github/workflows/ci.yml` 的 Rust e2e job 在缺少 `MASQUE_VPN_TOKEN` 时只显示 notice，整体可以显示成功。**该状态不能用于通过客户端兼容性门槛。**发布/晋级门槛必须要求真实 e2e 执行并通过；缺少凭据、零用例或跳过必测组合应视为未验收。
 - 当前 Rust e2e 工作流构建 `./cmd/caddy`，不含 Cloudflare。验收组合发行版时，应使用已记录源码及校验和的组合二进制运行同一数据通路测试。
 - macOS 应用的 TUN/SOCKS、系统防火墙、睡眠唤醒和网络切换需要 macOS 端验证，Linux 命名空间不能证明这些平台行为。
-- 原 e2e 脚本会操作固定 `mq-*` 网络命名空间，只能在一次性测试机器运行，先解决审计 S10 的隔离问题；不要直接在生产宿主执行。
+- e2e 脚本已改为唯一命名空间/临时 veth 名，拒绝冲突并只清理本次创建的命名空间；冲突拒绝路径经命令 spy 验证。完整脚本仍仅允许在一次性特权测试机器运行。
 
 每次兼容性验收记录：服务端完整 SHA、Caddy/Cloudflare/Go 版本、客户端完整 SHA/发行版、macOS 应用版本与内嵌核心版本、架构、模式/传输/IPv6/MTU 配置、实际运行/通过/失败/跳过数量和日志。失败归属先由相同输入在两端复现确定，再分别修改服务端或客户端；不以新增宽松处理替代符合规范的修复。
 
 ## 当前状态（2026-10-04）
 
-已将客户端兼容性纳入共同验收目标，并核对服务端的现有测试和版本说明。当前无法读取 `ArcCal/masque-vpn`：Git 无法取得认证，GitHub API 返回 401，仓库页面与 raw README 返回 404；环境中未配置伴随客户端仓库。因此未完成客户端源码审查、Rust 编译或真实客户端端到端验证，也未确认当前客户端提交。
+通过保持代理和 TLS 校验的普通 GitHub HTTPS API 请求，已读取私有仓库 main 并下载固定提交：**`ba82e36164a69c01a2a366153550aee2821c41b7`**。源码置于服务器仓库外，使用原 Cargo.lock 和其固定的 hyperium/h3 提交，Rust 1.99.0 `cargo build --locked --bin masque-client` 成功；`cargo test --locked --workspace` **200 个测试通过、0 个失败**。没有提取代理认证，也没有改动客户端源码。此前 Git/gh 的认证失败不应扩大为所有 HTTPS 读取路径不可用。
 
-需要在云环境中添加 `ArcCal/masque-vpn` 并授予读取权限。GitHub Actions 真实客户端测试还需要仓库侧的 `MASQUE_VPN_TOKEN`，只授予读取客户端仓库的权限；不要在聊天中发送 token，也不能把环境代理凭据提取或复制为 Actions secret。
+服务端 **`d414d2a07eb5e9d305fbf7d82fc46efe8302dd18`** 的 `TestInteropMasqueVPNClient` 启动这个真实二进制，通过独立进程的 SOCKS5 UDP ASSOCIATE 发送/接收 IP 报文。六种组合全部通过：
 
-目前服务端规范与规模审计结论继续有效，见 [安全与 IETF 审计](security-ietf-audit-2026-10-04.md)。取得访问并完成真实互操作测试前，不宣称目标客户端“完美兼容”。
+| HTTP 传输 | 客户端 IPv6 关闭 | 客户端 IPv6 开启 |
+| --- | --- | --- |
+| HTTP/3 | IPv4 UDP 双向通过；等待超过 10 秒探测期限后再次通过 | IPv4/IPv6 UDP 双向通过 |
+| HTTP/2 | IPv4 UDP 双向通过 | IPv4/IPv6 UDP 双向通过 |
+| HTTP/1.1 | IPv4 UDP 双向通过 | IPv4/IPv6 UDP 双向通过 |
+
+测试使用 IP URI authority、域名 SNI、有效的私有 CA/独立终端证书，证书验证保持开启。最初失败是原 Go 测试夹具把 CA 用作服务器证书，Rust TLS 正确返回 `CaUsedAsEndEntity`；修正夹具证书链后重测通过，未放宽客户端 TLS 或服务器协议检查。
+
+**证据边界：**服务端为真实 Caddy 的 in-process 实例，TUN/目标 UDP 回包由夹具模拟，客户端使用真实协议栈。没有运行真实 macOS 应用、客户端 TUN/gateway 模式、SOCKS TCP/DNS 的跨项目验收，也没有使用带 Cloudflare 的下载 Artifact 完成这套真实客户端测试。Rust 自身的 in-process 测试覆盖不能替代这些组合。
+
+复现：
+
+```sh
+# 在 companion 客户端仓库，使用受支持的 Rust 工具链
+cargo build --locked --bin masque-client
+cargo test --locked --workspace
+
+# 在服务端仓库，用客户端二进制的绝对路径
+MASQUE_TEST_CLIENT=/absolute/path/to/masque-client \
+  go test -race -count=1 -v . -run '^TestInteropMasqueVPNClient$'
+```
+
+真实互通测试已加入原 e2e Actions job；它仍需要仓库侧 `MASQUE_VPN_TOKEN` 才能获取私有客户端，缺少 secret 时未运行。只授予读取 companion 仓库的权限，在支持的设置中输入；不得在聊天发送或把环境代理凭据复制为 secret。当前本地读取与测试已完成，不再把云环境添加客户端仓库当作读取的必需前提。
+
+规范与规模门槛见 [安全与 IETF 审计](security-ietf-audit-2026-10-04.md)。当前结果确认所测 CLI/模式/传输范围内兼容，不构成“所有版本/所有模式完美兼容”或生产验收。

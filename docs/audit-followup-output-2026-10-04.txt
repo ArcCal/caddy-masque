@@ -1,0 +1,109 @@
+Implementation: d414d2a07eb5e9d305fbf7d82fc46efe8302dd18
+Client: ba82e36164a69c01a2a366153550aee2821c41b7
+Go: 1.26.8; Rust: 1.99.0
+
+Diagnostic run: PASS reports completed measurements, not standards compliance.
+=== RUN   TestAuditConfigurationValidation
+    audit_config_test.go:15: URI template "https://server/path#fragment/{target}/{ipproto}/": validation error=invalid URI template: variables are only allowed in the path or query
+    audit_config_test.go:15: URI template "1https://server/path/{target}/{ipproto}/": validation error=invalid URI template: missing or invalid scheme
+    audit_config_test.go:19: IPv4 gateway "10.89.0.255/24": validation error=masque: "10.89.0.255/24" uses the IPv4 broadcast address
+    audit_config_test.go:19: IPv4 gateway "10.89.0.1/31": validation error=masque: "10.89.0.1/31" has no usable client pool; prefix length must be at most /30
+    audit_config_test.go:19: IPv4 gateway "169.254.89.1/24": validation error=masque: "169.254.89.1/24" must use a unicast tunnel address (private/ULA addresses are supported)
+--- PASS: TestAuditConfigurationValidation (0.00s)
+=== RUN   TestAuditHTTP2MalformedErrorCode
+=== RUN   TestAuditHTTP2MalformedErrorCode/malformed_target
+    audit_h2_test.go:78: response status=400 EndStream=true
+    audit_h2_test.go:99: RST_STREAM=NO_ERROR, RFC 9113 §8.1.1 requires PROTOCOL_ERROR
+=== RUN   TestAuditHTTP2MalformedErrorCode/malformed_capsule
+    audit_h2_test.go:78: response status=200 EndStream=false
+    audit_h2_test.go:99: RST_STREAM=INTERNAL_ERROR, RFC 9113 §8.1.1 requires PROTOCOL_ERROR
+--- PASS: TestAuditHTTP2MalformedErrorCode (0.23s)
+    --- PASS: TestAuditHTTP2MalformedErrorCode/malformed_target (0.17s)
+    --- PASS: TestAuditHTTP2MalformedErrorCode/malformed_capsule (0.06s)
+=== RUN   TestAuditSessionCapacity
+    audit_scale_test.go:14: queue entry=56 bytes; idle queue=56 KiB plus capsule read buffer=32 KiB per session
+    audit_scale_test.go:29: active addresses=100: session-limit check 20ns per login (100 checks)
+    audit_scale_test.go:29: active addresses=10000: session-limit check 24ns per login (100 checks)
+    audit_scale_test.go:29: active addresses=100000: session-limit check 13ns per login (100 checks)
+--- PASS: TestAuditSessionCapacity (0.05s)
+PASS
+ok  	github.com/ArcCal/caddy-masque	0.330s
+=== RUN   TestAuditAuthenticationBudget
+    audit_auth_test.go:10: NumCPU=5 GOMAXPROCS=4 CPU slots=8 aggregate Argon2 budget=128 MiB
+    audit_auth_test.go:17: configured 1 GiB hash rejected under default budget: argon2 memory 1048576 KiB exceeds authentication budget 131072 KiB
+--- PASS: TestAuditAuthenticationBudget (0.04s)
+PASS
+ok  	github.com/ArcCal/caddy-masque/internal/auth	0.046s
+
+Real unmodified client, server fake TUN:
+=== RUN   TestInteropMasqueVPNClient
+=== RUN   TestInteropMasqueVPNClient/h3/ipv6=false
+=== RUN   TestInteropMasqueVPNClient/h3/ipv6=true
+=== RUN   TestInteropMasqueVPNClient/h2/ipv6=false
+=== RUN   TestInteropMasqueVPNClient/h2/ipv6=true
+=== RUN   TestInteropMasqueVPNClient/http/1.1/ipv6=false
+=== RUN   TestInteropMasqueVPNClient/http/1.1/ipv6=true
+--- PASS: TestInteropMasqueVPNClient (12.34s)
+    --- PASS: TestInteropMasqueVPNClient/h3/ipv6=false (11.40s)
+    --- PASS: TestInteropMasqueVPNClient/h3/ipv6=true (0.30s)
+    --- PASS: TestInteropMasqueVPNClient/h2/ipv6=false (0.17s)
+    --- PASS: TestInteropMasqueVPNClient/h2/ipv6=true (0.16s)
+    --- PASS: TestInteropMasqueVPNClient/http/1.1/ipv6=false (0.15s)
+    --- PASS: TestInteropMasqueVPNClient/http/1.1/ipv6=true (0.15s)
+PASS
+ok  	github.com/ArcCal/caddy-masque	13.506s
+
+Rust locked workspace test summaries:
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 136 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.25s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.52s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Full local race suite: 204 tests/subtests passed, 6 skipped, 0 failed.
+Resource admission/queue race repetition: 10 runs passed.
+Authentication budget/cancellation race repetition: 10 runs passed.
+
+Actions run 37173519441: Build Linux arm64/5_Kernel networking lifecycle in an isolated namespace.txt
+2026-10-04T03:19:46.1399488Z --- PASS: TestHostNetworkLifecycle (0.09s)
+2026-10-04T03:19:46.1400677Z PASS
+2026-10-04T03:19:50.3092460Z --- PASS: TestCaddyRealKernelTraffic (1.25s)
+2026-10-04T03:19:50.3093755Z     --- PASS: TestCaddyRealKernelTraffic/HTTP/3 (0.31s)
+2026-10-04T03:19:50.3094434Z     --- PASS: TestCaddyRealKernelTraffic/HTTP/2 (0.01s)
+2026-10-04T03:19:50.3095321Z     --- PASS: TestCaddyRealKernelTraffic/HTTP/1.1 (0.01s)
+2026-10-04T03:19:50.3096130Z     --- PASS: TestCaddyRealKernelTraffic/independent_connect-ip-go_client (0.01s)
+2026-10-04T03:19:50.3097160Z PASS
+
+Actions run 37173506367: test/8_Kernel networking lifecycle in an isolated namespace.txt
+2026-10-04T03:20:41.2736739Z --- PASS: TestHostNetworkLifecycle (0.10s)
+2026-10-04T03:20:41.2737513Z PASS
+2026-10-04T03:20:45.9604759Z --- PASS: TestCaddyRealKernelTraffic (0.57s)
+2026-10-04T03:20:45.9606650Z     --- PASS: TestCaddyRealKernelTraffic/HTTP/3 (0.09s)
+2026-10-04T03:20:45.9608210Z     --- PASS: TestCaddyRealKernelTraffic/HTTP/2 (0.01s)
+2026-10-04T03:20:45.9608960Z     --- PASS: TestCaddyRealKernelTraffic/HTTP/1.1 (0.01s)
+2026-10-04T03:20:45.9609557Z     --- PASS: TestCaddyRealKernelTraffic/independent_connect-ip-go_client (0.01s)
+2026-10-04T03:20:45.9610225Z PASS
+
+Actions run 37173506345: govulncheck/4_Run go run golang.org_x_vuln_cmd_govulncheck@latest ._....txt
+2026-10-04T03:15:12.0434748Z No vulnerabilities found.
+2026-10-04T03:15:12.0435554Z Your code is affected by 0 vulnerabilities.
+2026-10-04T03:15:12.0436408Z This scan also found 0 vulnerabilities in packages you import and 1
+2026-10-04T03:15:12.0437751Z vulnerability in modules you require, but your code doesn't appear to call these
+2026-10-04T03:15:12.0441333Z vulnerabilities.
+
+Actions run 37173520546: Build Linux amd64/5_Kernel networking lifecycle in an isolated namespace.txt
+2026-10-04T03:21:50.0681217Z --- PASS: TestHostNetworkLifecycle (0.11s)
+2026-10-04T03:21:50.0682154Z PASS
+2026-10-04T03:21:54.9406185Z --- PASS: TestCaddyRealKernelTraffic (0.56s)
+2026-10-04T03:21:54.9407722Z     --- PASS: TestCaddyRealKernelTraffic/HTTP/3 (0.09s)
+2026-10-04T03:21:54.9408671Z     --- PASS: TestCaddyRealKernelTraffic/HTTP/2 (0.01s)
+2026-10-04T03:21:54.9409753Z     --- PASS: TestCaddyRealKernelTraffic/HTTP/1.1 (0.01s)
+2026-10-04T03:21:54.9410728Z     --- PASS: TestCaddyRealKernelTraffic/independent_connect-ip-go_client (0.01s)
+2026-10-04T03:21:54.9411423Z PASS
+
+ARM64 archive SHA-256: 4917e1aba08669e703d242537cfb3debf463aa3cb74b9a07ef544edcb2fb3a13
+AMD64 archive SHA-256: 980b5127b91383b02560790876784361da242aca027d2f756eba1a3277019d85
+Static architectures and source commit verified.

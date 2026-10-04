@@ -145,7 +145,7 @@ network starts, and isolates the blocked-writer tests' Caddy fixtures.
   startup rollback. Both downloaded SHA-256 checksums, static ELF architectures
   and recorded source commits were verified. The amd64 executable lists all
   three expected custom modules; arm64 checks them on its native runner.
-- Download current combined artifacts:
+- Download earlier baseline combined artifacts:
   [Linux arm64](https://github.com/ArcCal/caddy-masque/actions/runs/37169055101/artifacts/11290294711),
   [Linux amd64](https://github.com/ArcCal/caddy-masque/actions/runs/37169056521/artifacts/11289883856).
   Each contains Caddy 2.11.6, Cloudflare provider 0.2.4 and Go 1.26.8; retention is
@@ -157,8 +157,74 @@ network starts, and isolates the blocked-writer tests' Caddy fixtures.
   while falling back to module metadata. See the security audit for its limits;
   the artifact has not been declared free of all vulnerability advisories.
 
-The [security and IETF audit](security-ietf-audit-2026-10-04.md) records remaining
-HTTP/2 error-code and URI validation gaps, authentication/queue/conntrack capacity
-risks and the unverified TTL delegation boundary. Those findings remain open
-despite the successful builds. This revision is a tested candidate, not a strict
+The [security and IETF audit](security-ietf-audit-2026-10-04.md) records the confirmed HTTP/2 error-code gap, conntrack and remaining capacity
+risks, and the unverified TTL delegation boundary. URI validation and basic
+authentication/session/queue budgets were subsequently fixed below; successful
+builds do not close the remaining gates. This revision is a tested candidate, not a strict
 IETF or large-production sign-off.
+
+
+## Resource budgets and real-client follow-up — 2026-10-04
+
+Implementation: `d414d2a07eb5e9d305fbf7d82fc46efe8302dd18`.
+
+- Reject template variables in fragments and invalid URI schemes; preserve fixed
+  fragments outside the HTTP request target and encoded `%23` path literals.
+- Add aggregate Argon2 memory reservations (default 128 MiB), quota-aware CPU
+  admission and a five-second admission deadline. Configured hashes must fit;
+  cancelled requests retain hashing resources until computation finishes.
+- Add global session admission (default 1024) and queued-payload memory (default
+  64 MiB), O(1) per-user limit checks and idempotent lease cleanup. Pending/revoked
+  sessions count until cleanup; enqueue/cleanup races cannot leak reservations.
+  These budgets exclude transport state, GC and in-flight writes, and are not RSS
+  or bandwidth-fairness guarantees. Default IPv4 pool capacity is still about 253.
+- Preserve dotted TUN/WAN names in sysctl paths and test PMTU/RA settings and
+  restoration in the opt-in lifecycle test. Reject unusable gateway/pool settings
+  and invalid Linux interface names during provisioning.
+- Count full-queue/global-payload-budget drops. Give the privileged e2e script
+  unique namespaces and temporary host interfaces, refuse existing topology and
+  clean up only created namespaces. A command spy confirms refusal before any
+  network mutation; the whole Rust kernel script remains unexecuted here.
+- Build unmodified companion commit `ba82e36164a69c01a2a366153550aee2821c41b7`
+  with Cargo.lock and Rust 1.99.0: 200 workspace tests pass. Real CLI SOCKS UDP
+  exchange passes HTTP/3, HTTP/2 and HTTP/1.1 with IPv6 both enabled and disabled,
+  including continued traffic beyond the H3 MTU-probe deadline. The server uses
+  a fake TUN; macOS GUI, client TUN/gateway and real combined-Artifact compatibility
+  remain separate gates. The fixture uses a proper CA/leaf certificate chain and
+  keeps rustls certificate validation enabled.
+- Local Go 1.26.8 full race suite with the real client enabled: 204 tests/subtests
+  pass, six skips, zero failures. Resource/queue and authentication/cancellation
+  cases each pass ten repeated race runs. `go vet`, module verification, format,
+  shell syntax and whitespace checks pass.
+- The new [source vulnerability workflow](https://github.com/ArcCal/caddy-masque/actions/runs/37173506345)
+  passes. The known required-module advisory/scanner limitations remain documented.
+
+See [current audit](security-ietf-audit-2026-10-04.md), [client version/matrix](client-compatibility.md)
+and [follow-up diagnostic output](audit-followup-output-2026-10-04.txt).
+S1 HTTP/2 stream errors are still reproduced; conntrack scaling, complete TTL
+semantics, live DNS renewal and intended-platform/load validation remain open.
+The PR remains draft and has not been merged or deployed to production.
+
+
+Latest implementation CI: [37173506367](https://github.com/ArcCal/caddy-masque/actions/runs/37173506367)
+passes source/race/vet, both isolated kernel checks and three 20-second parser
+fuzz campaigns. Its private Rust-client job still skips; local original-client
+results above are independent evidence.
+
+Native [Linux arm64 combined build](https://github.com/ArcCal/caddy-masque/actions/runs/37173519441)
+passes source checks, the dotted-interface sysctl/RA lifecycle, actual IPv4/IPv6
+TUN/NAT return traffic, all three HTTP transports and independent client, offline
+Cloudflare provisioning, and the candidate executable's systemd/install rollback.
+[Download Artifact](https://github.com/ArcCal/caddy-masque/actions/runs/37173519441/artifacts/11292746630).
+Its static aarch64 architecture and full source commit were verified after download;
+archive SHA-256: `4917e1aba08669e703d242537cfb3debf463aa3cb74b9a07ef544edcb2fb3a13`.
+Caddy 2.11.6, Cloudflare provider 0.2.4, Go 1.26.8; 30-day retention. Kernel wire
+checks run the source test binary; combined executable service/provisioning checks
+do not establish a full original-client/combined-Artifact data path.
+
+
+Native [Linux amd64 combined build](https://github.com/ArcCal/caddy-masque/actions/runs/37173520546)
+passes the same checks. [Download Artifact](https://github.com/ArcCal/caddy-masque/actions/runs/37173520546/artifacts/11292397751).
+Its SHA-256 (`980b5127b91383b02560790876784361da242aca027d2f756eba1a3277019d85`), static x86-64 architecture,
+source commit and module registration were independently verified after download.
+Both candidates contain the same pinned Caddy/Cloudflare/Go versions and source.
