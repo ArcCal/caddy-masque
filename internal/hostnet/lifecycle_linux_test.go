@@ -73,6 +73,25 @@ func TestHostNetworkLifecycle(t *testing.T) {
 			t.Fatalf("%s = %s", key, got)
 		}
 	}
+	// A competing process/configuration must fail before creating a device
+	// or changing this instance's table and forwarding settings.
+	if other, err := Open(Config{Interface: "mq.other", IPv4: netip.MustParsePrefix("10.90.0.1/29"), MTU: 1400, Manage: true}); err == nil {
+		_ = other.Close()
+		t.Fatal("second network manager acquired the same namespace")
+	}
+	if exec.Command("ip", "link", "show", "dev", "mq.other").Run() == nil {
+		t.Fatal("rejected manager created a TUN")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(exe, "-test.run=^TestNetworkOwnershipHelper$", "--", "/run/caddy-masque", "acquire").CombinedOutput(); err == nil {
+		t.Fatalf("another process acquired the active namespace: %s", out)
+	}
+	if out, err := exec.Command("unshare", "--net", exe, "-test.run=^TestNetworkOwnershipHelper$", "--", "/run/caddy-masque", "acquire").CombinedOutput(); err != nil {
+		t.Fatalf("independent namespace was blocked by parent lock: %v: %s", err, out)
+	}
 	if out, err := exec.Command("ip", "-o", "addr", "show", "dev", n.Name()).CombinedOutput(); err != nil || !strings.Contains(string(out), "10.89.0.1/29") || !strings.Contains(string(out), "fd89::1/64") {
 		t.Fatalf("tunnel addresses: %s (%v)", out, err)
 	}
@@ -89,6 +108,26 @@ func TestHostNetworkLifecycle(t *testing.T) {
 	}
 	if out, err := exec.Command("nft", "list", "table", "inet", NFTTable).CombinedOutput(); err != nil || !strings.Contains(string(out), "masquerade") || !strings.Contains(string(out), "chain input") {
 		t.Fatalf("repaired rules: %s (%v)", out, err)
+	}
+	if repairs := n.Repair(); len(repairs) != 0 {
+		t.Fatalf("healthy rules changed: %v", repairs)
+	}
+	for _, chain := range []string{"input", "forward", "postrouting"} {
+		if err := run(nil, "nft", "flush", "chain", "inet", NFTTable, chain); err != nil {
+			t.Fatal(err)
+		}
+		if repairs := n.Repair(); len(repairs) != 1 {
+			t.Fatalf("did not repair empty %s chain: %v", chain, repairs)
+		}
+		if repairs := n.Repair(); len(repairs) != 0 {
+			t.Fatalf("repaired %s is unstable: %v", chain, repairs)
+		}
+	}
+	if err := run(nil, "nft", "add", "rule", "inet", NFTTable, "forward", "accept"); err != nil {
+		t.Fatal(err)
+	}
+	if repairs := n.Repair(); len(repairs) != 1 {
+		t.Fatalf("did not remove foreign rule: %v", repairs)
 	}
 	// A TUN reader must finish when the device is closed. IPv6 setup can
 	// enqueue router solicitations, so drain packets until Read fails rather

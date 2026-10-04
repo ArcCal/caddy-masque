@@ -5,15 +5,14 @@
 package hostnet
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -46,24 +45,35 @@ type Network struct {
 	nft  bool
 	name string
 	// Sysctls this process changed, with their earlier values, for Close.
-	changed []sysctl
+	changed       []sysctl
+	owner         *os.File
+	rulesSnapshot []byte
+	closeOnce     sync.Once
+	closeErr      error
 }
 
-type sysctl struct{ key, old string }
+type sysctl struct{ key, old, want string }
 
 // Open creates the TUN device and configures the host. Close undoes it.
 func Open(cfg Config) (*Network, error) {
 	if cfg.Log == nil {
 		cfg.Log = func(string) {}
 	}
+	n := &Network{cfg: cfg}
+	if cfg.Manage {
+		owner, err := acquireNetworkOwner("/run/caddy-masque")
+		if err != nil {
+			return nil, err
+		}
+		n.owner = owner
+	}
 	tun, name, err := openTUN(cfg.Interface)
 	if err != nil {
-		return nil, fmt.Errorf("creating TUN device %s (needs CAP_NET_ADMIN; fails if another instance uses it): %w", cfg.Interface, err)
+		return nil, errors.Join(fmt.Errorf("creating TUN device %s (needs CAP_NET_ADMIN; fails if another instance uses it): %w", cfg.Interface, err), n.Close())
 	}
-	n := &Network{cfg: cfg, tun: tun, name: name}
+	n.tun, n.name = tun, name
 	if err := n.setup(); err != nil {
-		n.Close()
-		return nil, err
+		return nil, errors.Join(err, n.Close())
 	}
 	return n, nil
 }
@@ -133,41 +143,43 @@ func (n *Network) setup() error {
 
 func (n *Network) installRules() error {
 	ruleset := Ruleset(n.name, n.cfg.IPv4, n.cfg.IPv6, n.cfg.HostAccess)
+	// A timeout can lose the acknowledgement after the kernel commits.
+	// Cleanup must account for that uncertain outcome as well.
+	n.nft = true
 	if err := run([]byte(ruleset), "nft", "-f", "-"); err != nil {
 		return fmt.Errorf("installing nftables NAT rules: %w", err)
 	}
-	n.nft = true
+	snapshot, err := readFirewallSnapshot()
+	if err != nil {
+		return fmt.Errorf("verifying installed nftables rules: %w", err)
+	}
+	n.rulesSnapshot = snapshot
 	return nil
 }
 
 // changeSysctl sets a sysctl and remembers its value for Close.
 func (n *Network) changeSysctl(key, value string) error {
 	old, err := os.ReadFile(sysctlPath(key))
+	if err != nil {
+		return fmt.Errorf("reading %s before changing it: %w", key, err)
+	}
 	if err := SetSysctl(key, value); err != nil {
 		return err
 	}
-	if v := strings.TrimSpace(string(old)); err == nil && v != value {
-		n.changed = append(n.changed, sysctl{key, v})
+	if v := strings.TrimSpace(string(old)); v != value {
+		n.changed = append(n.changed, sysctl{key, v, value})
 	}
 	return nil
 }
 
 // Repair puts back what something else undid in the host's configuration
-// since Open: the nftables table (a firewall that reloads with `nft flush
-// ruleset` removes it, and the tunnel then carries no traffic) and IP
-// forwarding. It returns what it repaired.
+// since Open: the nftables table, including changed or missing rules, and
+// IP forwarding. It reports both repairs and inspection failures.
 func (n *Network) Repair() []string {
 	if !n.cfg.Manage {
 		return nil
 	}
-	var fixed []string
-	if err := run(nil, "nft", "list", "table", "inet", NFTTable); err != nil {
-		if err := n.installRules(); err != nil {
-			fixed = append(fixed, "the nftables rules are gone and could not be installed again: "+err.Error())
-		} else {
-			fixed = append(fixed, "the nftables rules were removed by something else; installed them again")
-		}
-	}
+	fixed := n.repairFirewall()
 	keys := []string{"net.ipv4.ip_forward"}
 	if n.cfg.IPv6.IsValid() {
 		keys = append(keys, "net.ipv6.conf.all.forwarding")
@@ -257,16 +269,46 @@ func (n *Network) Write(b []byte) (int, error) { return n.tun.Write(b) }
 // Close removes the device (it disappears with its file descriptor), the
 // NAT rules, and the sysctl changes (forwarding) made for them.
 func (n *Network) Close() error {
-	if n.nft {
-		_ = run(nil, "nft", "delete", "table", "inet", NFTTable)
-		n.nft = false
+	n.closeOnce.Do(func() {
+		var errs []error
+		if n.nft {
+			if err := run(nil, "nft", "delete", "table", "inet", NFTTable); err != nil {
+				if absent, checkErr := firewallTableAbsent(); checkErr != nil || !absent {
+					errs = append(errs, errors.Join(err, checkErr))
+				}
+			}
+		}
+		for i := len(n.changed) - 1; i >= 0; i-- {
+			if err := n.changed[i].restore(sysctlPath(n.changed[i].key)); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if n.tun != nil {
+			errs = append(errs, n.tun.Close())
+		}
+		// Release ownership last, even if cleanup failed. A successor can
+		// then replace stale rules without racing this instance's cleanup.
+		if n.owner != nil {
+			errs = append(errs, n.owner.Close())
+		}
+		n.closeErr = errors.Join(errs...)
+	})
+	return n.closeErr
+}
+
+func (s sysctl) restore(path string) error {
+	current, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading %s during cleanup: %w", s.key, err)
 	}
-	// Forwarding was off before: the host is not a router any more.
-	for i := len(n.changed) - 1; i >= 0; i-- {
-		_ = SetSysctl(n.changed[i].key, n.changed[i].old)
+	// Respect a later administrator change rather than overwriting it.
+	if strings.TrimSpace(string(current)) != s.want {
+		return nil
 	}
-	n.changed = nil
-	return n.tun.Close()
+	if err := os.WriteFile(path, []byte(s.old), 0); err != nil {
+		return fmt.Errorf("restoring %s=%s: %w", s.key, s.old, err)
+	}
+	return nil
 }
 
 // sysctlPath accepts a conventional dotted key or an explicit slash path.
@@ -285,18 +327,6 @@ func SetSysctl(key, value string) error {
 	path := sysctlPath(key)
 	if err := os.WriteFile(path, []byte(value), 0); err != nil {
 		return fmt.Errorf("setting %s=%s: %w", key, value, err)
-	}
-	return nil
-}
-
-func run(stdin []byte, name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	if stdin != nil {
-		cmd.Stdin = bytes.NewReader(stdin)
-	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

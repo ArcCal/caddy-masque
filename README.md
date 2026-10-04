@@ -182,7 +182,24 @@ Caddy's `metrics` directive and admin endpoint (as root:
 Every 30 seconds the service checks forwarding and NAT: when a host firewall reload (such as `nft flush ruleset` or a
 firewalld reload) has removed the nftables table, or another program has turned off `ip_forward`, the service puts them
 back and logs a warning. When the service exits normally, it sets the forwarding switches it changed back to their
-original values (leaving them alone if they were already on) and removes the nftables table.
+original values when they still match the values it installed, and removes the nftables table.
+
+With automatic network management, only one caddy-masque manager can run in a
+network namespace. It holds a process lock under `/run/caddy-masque` before
+creating the TUN or changing forwarding/firewall state; a competing instance
+fails without modifying the active instance. The directory must be owned by the
+service user and not writable by other users. The supplied systemd unit creates
+it with mode 0700. Separate network namespaces have independent locks. Containers
+sharing a network namespace must also share this runtime directory (for example,
+with a bind mount); private directories cannot coordinate their locks. Keep the
+directory and lock files in place while a manager is running. This coordinates
+caddy-masque instances; other firewall managers still need compatible policies.
+
+The watcher also repairs changes to chain policies and rule contents in its
+reserved `inet caddy-masque` table. An inspection failure is logged and is not
+treated as proof that the table disappeared. Network tools have a five-second
+deadline and a 64 KiB output limit. Shutdown reports cleanup errors; the service
+allows 45 seconds for a repair already in progress and cleanup to finish.
 
 ### Directive `masque [PATH_TEMPLATE]`
 

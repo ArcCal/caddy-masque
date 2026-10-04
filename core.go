@@ -375,8 +375,12 @@ func (c *core) Destruct() error {
 	c.revokeAll("server stopped")
 	c.hostWatch.Wait()
 	if c.net != nil {
-		c.net.Close()
+		err := c.net.Close()
 		<-c.done
+		if err != nil {
+			c.log.Error("network cleanup failed", zap.Error(err))
+			return err
+		}
 	}
 	return nil
 }

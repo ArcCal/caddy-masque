@@ -29,7 +29,7 @@ Environment=HOME=/var/lib/caddy
 Environment="CADDY_ADMIN=unix//run/caddy-masque/admin.sock|0600"
 RuntimeDirectory=caddy-masque
 RuntimeDirectoryMode=0700
-TimeoutStopSec=10s
+TimeoutStopSec=45s
 LimitNOFILE=1048576
 Restart=on-failure
 RestartSec=5
