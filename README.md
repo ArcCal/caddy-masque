@@ -20,6 +20,8 @@ Current version 1.0. The differences between versions are in [CHANGELOG.md](CHAN
 The [2026-10-04 security and IETF audit](docs/security-ietf-audit-2026-10-04.md) records
 confirmed HTTP/2 error-code and URI-template validation gaps, capacity risks, and
 the remaining validation required for strict standards conformance and large deployments.
+Changes must also satisfy the [masque-vpn client compatibility requirements](docs/client-compatibility.md),
+using the real Rust client and macOS application; successful simulated-client tests are not that sign-off.
 
 ## One-step install
 

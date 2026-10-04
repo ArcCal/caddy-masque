@@ -8,6 +8,8 @@
 
 修复必须保留 RFC 定义的消息、地址、路由和错误语义。不能把“客户端仍能连接”“返回 400”或“测试全绿”等同于符合规范；不能靠关闭报文检查、跳过 conntrack 清理、补偿性修改 TTL 或自定义 Capsule 来掩盖问题。
 
+用户进一步明确，保持与 [ArcCal/masque-vpn](https://github.com/ArcCal/masque-vpn) 真实客户端兼容也是目标。后续改动须同时通过规范、安全可靠性和 [目标客户端兼容性验收](client-compatibility.md)；既不能为旧行为牺牲 RFC 要求，也不能只验证模拟客户端就宣称完成真实兼容。本次环境无法读取客户端源码，兼容性仍未重新验收。
+
 ## 范围与证据边界
 
 实现基线：[`3d7537ee375953d3ec5d9f1d3be67e4b20b056e7`](https://github.com/ArcCal/caddy-masque/commit/3d7537ee375953d3ec5d9f1d3be67e4b20b056e7)，`production-readiness` 分支。包含此前生产改进和本次接口重载修复；文档与诊断脚本的后续提交不会改变该实现。
