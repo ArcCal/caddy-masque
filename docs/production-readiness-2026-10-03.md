@@ -5,6 +5,11 @@ performance, and deployment tooling. This branch fixes those defects and adds
 repeatable regression and kernel lifecycle checks. Passing these checks does not
 establish that an arbitrary production host, Cloudflare token, or client will work.
 
+The subsequent [security and IETF audit](security-ietf-audit-2026-10-04.md)
+identifies confirmed standards gaps and unresolved capacity risks. Its verdict
+governs strict standards conformance and large-deployment readiness; the passing
+checks recorded below do not close those findings.
+
 ## Changes and reasons
 
 - Bind reconnect address reuse to the password hash as well as the username.
@@ -118,3 +123,42 @@ These results close the real kernel traffic, NAT, independent-client
 interoperability, and systemd rollback testing gaps. Original Rust-client
 interoperability, live DNS issuance/renewal, and validation of
 the intended host topology remain prerequisites for a production deployment.
+
+## Updated verification — 2026-10-04 (UTC)
+
+Implementation commit: `3d7537ee375953d3ec5d9f1d3be67e4b20b056e7`.
+It additionally rejects incompatible interface changes before any second host
+network starts, and isolates the blocked-writer tests' Caddy fixtures.
+
+- Local full race run: 172 tests/subtests passed, six skipped, zero failed.
+  Three interface/reload regressions passed ten race repetitions; two blocked
+  writer regressions passed twenty race repetitions.
+- [CI](https://github.com/ArcCal/caddy-masque/actions/runs/37168812585) and
+  [source vulnerability scan](https://github.com/ArcCal/caddy-masque/actions/runs/37168812583)
+  passed. The original Rust client remains skipped for the missing secret.
+- Native combined builds for
+  [arm64](https://github.com/ArcCal/caddy-masque/actions/runs/37169055101) and
+  [amd64](https://github.com/ArcCal/caddy-masque/actions/runs/37169056521)
+  passed source race/vet checks, isolated real TUN/firewall/forwarding lifecycle,
+  IPv4/IPv6 NAT and return traffic over HTTP/3, HTTP/2, HTTP/1.1 and the independent
+  client, offline Cloudflare provisioning, real systemd lifecycle and installer
+  startup rollback. Both downloaded SHA-256 checksums, static ELF architectures
+  and recorded source commits were verified. The amd64 executable lists all
+  three expected custom modules; arm64 checks them on its native runner.
+- Download current combined artifacts:
+  [Linux arm64](https://github.com/ArcCal/caddy-masque/actions/runs/37169055101/artifacts/11290294711),
+  [Linux amd64](https://github.com/ArcCal/caddy-masque/actions/runs/37169056521/artifacts/11289883856).
+  Each contains Caddy 2.11.6, Cloudflare provider 0.2.4 and Go 1.26.8; retention is
+  30 days. The artifact source is the implementation commit above, rather than
+  the later documentation/diagnostic commit.
+- Source-mode scans of this repository and the combined program report zero
+  reachable vulnerabilities and one required-module advisory, GO-2026-5932.
+  A binary-mode scan of the stripped arm64 artifact flags that same advisory
+  while falling back to module metadata. See the security audit for its limits;
+  the artifact has not been declared free of all vulnerability advisories.
+
+The [security and IETF audit](security-ietf-audit-2026-10-04.md) records remaining
+HTTP/2 error-code and URI validation gaps, authentication/queue/conntrack capacity
+risks and the unverified TTL delegation boundary. Those findings remain open
+despite the successful builds. This revision is a tested candidate, not a strict
+IETF or large-production sign-off.

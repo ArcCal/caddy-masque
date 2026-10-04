@@ -17,6 +17,10 @@ Linux only (needs root: it creates a TUN device and sets up forwarding and NAT).
 
 Current version 1.0. The differences between versions are in [CHANGELOG.md](CHANGELOG.md).
 
+The [2026-10-04 security and IETF audit](docs/security-ietf-audit-2026-10-04.md) records
+confirmed HTTP/2 error-code and URI-template validation gaps, capacity risks, and
+the remaining validation required for strict standards conformance and large deployments.
+
 ## One-step install
 
 On Debian 12/13 or Ubuntu 22.04/24.04, with the domain already pointing at the server:
@@ -334,9 +338,9 @@ Known limitations:
   error code; the only stream reset a handler can cause is INTERNAL_ERROR. So malformed requests get only a 400, and
   malformed capsules end the tunnel with INTERNAL_ERROR. Clients that follow RFC 9484 still treat this as a failure
   (§4.5: any non-successful response is a failure), but the meaning of the error code still does not conform to RFC 9113.
-  This cannot be fixed in this module: patching `x/net/http2` would affect only this repository's `cmd/caddy`, while
-  builds made with xcaddy would stay as they are, and the same version would behave differently depending on how it was
-  built. It has to wait for Go to provide a way for handlers to reset a stream with a given error code.
+  A fix needs an explicit HTTP/2 stream-reset API or a maintained adapter/patch applied consistently to standard,
+  xcaddy and combined builds. Patching only this repository's `cmd/caddy` would leave xcaddy builds unchanged and make
+  protocol behavior depend on the build method. See the audit for frame-level reproduction and acceptance criteria.
 
 ## Tests
 

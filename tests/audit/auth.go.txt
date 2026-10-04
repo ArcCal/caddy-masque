@@ -1,0 +1,15 @@
+package auth
+
+import (
+	"runtime"
+	"testing"
+)
+
+func TestAuditAuthenticationBudget(t *testing.T) {
+	a := New()
+	t.Logf("NumCPU=%d GOMAXPROCS=%d slots=%d default hash memory upper concurrency=%d MiB", runtime.NumCPU(), runtime.GOMAXPROCS(0), cap(a.slots), cap(a.slots)*defaultMemory/1024)
+	if err := ValidateHash("$argon2id$v=19$m=1048576,t=64,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY"); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("configured 1 GiB/64-pass hashes accepted: concurrency permits %d GiB", cap(a.slots))
+}

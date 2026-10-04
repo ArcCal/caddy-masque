@@ -1,0 +1,30 @@
+package masque
+
+import (
+	"github.com/ArcCal/caddy-masque/internal/auth"
+	"net/netip"
+	"runtime"
+	"strconv"
+	"testing"
+	"time"
+	"unsafe"
+)
+
+func TestAuditSessionCapacity(t *testing.T) {
+	t.Logf("queue entry=%d bytes; idle queue=%d KiB plus capsule read buffer=32 KiB per session", unsafe.Sizeof(queued{}), queueLen*int(unsafe.Sizeof(queued{}))/1024)
+	for _, n := range []int{100, 10000, 100000} {
+		c := &core{sessions: map[netip.Addr]*sessionHandle{}}
+		c.maxSessions.Store(8)
+		for i := 0; i < n; i++ {
+			p := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
+			c.sessions[p] = &sessionHandle{id: uint64(i), user: auth.User{Name: strconv.Itoa(i)}}
+		}
+		start := time.Now()
+		var result bool
+		for i := 0; i < 100; i++ {
+			result = c.atSessionLimit(auth.User{Name: "new-user"})
+		}
+		runtime.KeepAlive(result)
+		t.Logf("active addresses=%d: session-limit check %v per login (100 checks)", n, time.Since(start)/100)
+	}
+}

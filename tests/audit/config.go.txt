@@ -1,0 +1,21 @@
+package masque
+
+import (
+	"testing"
+
+	"github.com/ArcCal/caddy-masque/internal/proto"
+)
+
+func TestAuditConfigurationValidation(t *testing.T) {
+	for _, raw := range []string{
+		"https://server/path#fragment/{target}/{ipproto}/",
+		"1https://server/path/{target}/{ipproto}/",
+	} {
+		_, err := proto.ParseTemplate(raw)
+		t.Logf("URI template %q: validation error=%v", raw, err)
+	}
+	for _, gateway := range []string{"10.89.0.255/24", "10.89.0.1/31", "169.254.89.1/24"} {
+		err := (&App{IPv4: gateway}).parse()
+		t.Logf("IPv4 gateway %q: validation error=%v", gateway, err)
+	}
+}

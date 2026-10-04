@@ -1,0 +1,105 @@
+package masque
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"net"
+	"net/http"
+	"testing"
+	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+)
+
+func TestAuditHTTP2MalformedErrorCode(t *testing.T) {
+	for _, malformedCapsule := range []bool{false, true} {
+		t.Run(map[bool]string{false: "malformed target", true: "malformed capsule"}[malformedCapsule], func(t *testing.T) {
+			e := newCaddyEnv(t)
+			if err := e.load(masqueConfig("alice")); err != nil {
+				t.Fatal(err)
+			}
+			conn, err := e.dialTCP(context.Background(), e.tlsConfig("h2"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := conn.Write([]byte(http2.ClientPreface)); err != nil {
+				t.Fatal(err)
+			}
+			f := http2.NewFramer(conn, conn)
+			f.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+			if err := f.WriteSettings(); err != nil {
+				t.Fatal(err)
+			}
+			for {
+				frame, err := f.ReadFrame()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if s, ok := frame.(*http2.SettingsFrame); ok && !s.IsAck() {
+					if err := f.WriteSettingsAck(); err != nil {
+						t.Fatal(err)
+					}
+					break
+				}
+			}
+			path := "/.well-known/masque/ip/*/256/"
+			if malformedCapsule {
+				path = anyTarget
+			}
+			var block bytes.Buffer
+			enc := hpack.NewEncoder(&block)
+			for _, p := range [][2]string{{":method", http.MethodConnect}, {":protocol", "connect-ip"}, {":scheme", "https"}, {":authority", "vpn.test"}, {":path", path}, {"authorization", authorization(testPassword)}} {
+				if err := enc.WriteField(hpack.HeaderField{Name: p[0], Value: p[1]}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := f.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: block.Bytes(), EndHeaders: true}); err != nil {
+				t.Fatal(err)
+			}
+			sent, cleanEnd := false, false
+			for {
+				frame, err := f.ReadFrame()
+				if err != nil {
+					var timeout net.Error
+					if cleanEnd && errors.As(err, &timeout) && timeout.Timeout() {
+						t.Log("no stream reset observed within 500 ms after response end")
+						return
+					}
+					t.Fatal(err)
+				}
+				switch x := frame.(type) {
+				case *http2.MetaHeadersFrame:
+					t.Logf("response status=%s EndStream=%v", x.PseudoValue("status"), x.StreamEnded())
+					if x.StreamEnded() {
+						cleanEnd = true
+						if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if malformedCapsule && !sent {
+						if err := f.WriteData(1, false, []byte{2, 0}); err != nil {
+							t.Fatal(err)
+						}
+						sent = true
+					}
+				case *http2.DataFrame:
+					if x.StreamEnded() {
+						cleanEnd = true
+						if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+							t.Fatal(err)
+						}
+					}
+				case *http2.RSTStreamFrame:
+					t.Logf("RST_STREAM=%s, RFC 9113 §8.1.1 requires PROTOCOL_ERROR", x.ErrCode)
+					return
+				}
+			}
+		})
+	}
+}

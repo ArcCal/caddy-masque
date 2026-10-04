@@ -1,0 +1,32 @@
+Diagnostic run: PASS reports completed measurements, not standards compliance.
+=== RUN   TestAuditConfigurationValidation
+    audit_config_test.go:15: URI template "https://server/path#fragment/{target}/{ipproto}/": validation error=<nil>
+    audit_config_test.go:15: URI template "1https://server/path/{target}/{ipproto}/": validation error=<nil>
+    audit_config_test.go:19: IPv4 gateway "10.89.0.255/24": validation error=<nil>
+    audit_config_test.go:19: IPv4 gateway "10.89.0.1/31": validation error=<nil>
+    audit_config_test.go:19: IPv4 gateway "169.254.89.1/24": validation error=<nil>
+--- PASS: TestAuditConfigurationValidation (0.00s)
+=== RUN   TestAuditHTTP2MalformedErrorCode
+=== RUN   TestAuditHTTP2MalformedErrorCode/malformed_target
+    audit_h2_test.go:78: response status=400 EndStream=true
+    audit_h2_test.go:99: RST_STREAM=NO_ERROR, RFC 9113 §8.1.1 requires PROTOCOL_ERROR
+=== RUN   TestAuditHTTP2MalformedErrorCode/malformed_capsule
+    audit_h2_test.go:78: response status=200 EndStream=false
+    audit_h2_test.go:99: RST_STREAM=INTERNAL_ERROR, RFC 9113 §8.1.1 requires PROTOCOL_ERROR
+--- PASS: TestAuditHTTP2MalformedErrorCode (0.18s)
+    --- PASS: TestAuditHTTP2MalformedErrorCode/malformed_target (0.13s)
+    --- PASS: TestAuditHTTP2MalformedErrorCode/malformed_capsule (0.05s)
+=== RUN   TestAuditSessionCapacity
+    audit_scale_test.go:14: queue entry=48 bytes; idle queue=48 KiB plus capsule read buffer=32 KiB per session
+    audit_scale_test.go:28: active addresses=100: session-limit check 779ns per login (100 checks)
+    audit_scale_test.go:28: active addresses=10000: session-limit check 100.828µs per login (100 checks)
+    audit_scale_test.go:28: active addresses=100000: session-limit check 1.560498ms per login (100 checks)
+--- PASS: TestAuditSessionCapacity (0.19s)
+PASS
+ok  	github.com/ArcCal/caddy-masque	0.431s
+=== RUN   TestAuditAuthenticationBudget
+    audit_auth_test.go:10: NumCPU=5 GOMAXPROCS=4 slots=10 default hash memory upper concurrency=190 MiB
+    audit_auth_test.go:14: configured 1 GiB/64-pass hashes accepted: concurrency permits 10 GiB
+--- PASS: TestAuditAuthenticationBudget (0.05s)
+PASS
+ok  	github.com/ArcCal/caddy-masque/internal/auth	0.050s
