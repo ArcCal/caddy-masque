@@ -60,10 +60,13 @@ website
 [[ $(cat /proc/sys/net/ipv4/ip_forward) == 1 ]]
 nft list table inet caddy-masque >/dev/null
 [[ $(stat -c %a /run/caddy-masque/admin.sock) == 600 ]]
+[[ $(systemctl show -p RuntimeDirectoryPreserve --value caddy-masque) == yes ]]
+runtime_identity=$(stat -c '%d:%i' /run/caddy-masque)
 systemctl reload caddy-masque
 website
 systemctl restart caddy-masque
 website
+[[ $(stat -c '%d:%i' /run/caddy-masque) == "$runtime_identity" ]]
 
 # Exercise the installer with its real filesystem paths and service calls.
 # Stub only public-IP discovery and DNS, avoiding public ACME or DNS writes.
@@ -111,6 +114,8 @@ grep -q 'restoring the previous Caddy binary' "$WORK/rollback.log"
 systemctl is-active --quiet caddy-masque
 website
 systemctl stop caddy-masque
+[[ -d /run/caddy-masque ]]
+[[ $(stat -c '%d:%i' /run/caddy-masque) == "$runtime_identity" ]]
 [[ $(cat /proc/sys/net/ipv4/ip_forward) == "$FORWARDING" ]]
 if nft list table inet caddy-masque >/dev/null 2>&1; then
     echo 'firewall table survived service stop' >&2

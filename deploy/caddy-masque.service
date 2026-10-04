@@ -29,6 +29,10 @@ Environment=HOME=/var/lib/caddy
 Environment="CADDY_ADMIN=unix//run/caddy-masque/admin.sock|0600"
 RuntimeDirectory=caddy-masque
 RuntimeDirectoryMode=0700
+# A successor can acquire the ownership lock immediately after Caddy exits.
+# Removing/recreating its inode would let another manager acquire a new lock.
+# /run is cleared at boot, after all old processes have gone.
+RuntimeDirectoryPreserve=yes
 TimeoutStopSec=45s
 LimitNOFILE=1048576
 Restart=on-failure

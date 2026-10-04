@@ -189,7 +189,8 @@ network namespace. It holds a process lock under `/run/caddy-masque` before
 creating the TUN or changing forwarding/firewall state; a competing instance
 fails without modifying the active instance. The directory must be owned by the
 service user and not writable by other users. The supplied systemd unit creates
-it with mode 0700. Separate network namespaces have independent locks. Containers
+it with mode 0700 and preserves it across stop/restart to keep the lock inode
+stable during a takeover. Separate network namespaces have independent locks. Containers
 sharing a network namespace must also share this runtime directory (for example,
 with a bind mount); private directories cannot coordinate their locks. Keep the
 directory and lock files in place while a manager is running. This coordinates
