@@ -50,8 +50,18 @@ Needs Go 1.26:
 go build -o caddy ./cmd/caddy
 ```
 
-The resulting `caddy` is a complete Caddy (with all the standard modules) plus this module. xcaddy works too:
-`xcaddy build --with github.com/ArcCal/caddy-masque`.
+The resulting `caddy` includes all standard Caddy modules and MASQUE. Builds use
+Go 1.26 and the pinned HTTP/2 reset API patch in `third_party/xnet`. From this
+checkout, xcaddy uses the same dependency:
+
+```sh
+xcaddy build v2.11.6 --with github.com/ArcCal/caddy-masque=. \
+  --replace golang.org/x/net=./third_party/xnet
+```
+
+Go does not inherit dependency replacements. Custom main modules must also
+replace `golang.org/x/net` with this tree; omitting it fails the build. See
+[the patch and its verification](third_party/README.md).
 
 ## Configuration
 
@@ -230,12 +240,11 @@ example.com, *.example.com, :443 {
 
 - **Build with the DNS plugin.** `dns cloudflare` needs the [caddy-dns/cloudflare](https://github.com/caddy-dns/cloudflare)
   plugin, which `./cmd/caddy` and the one-step install leave out:
-  `xcaddy build --with github.com/ArcCal/caddy-masque --with github.com/caddy-dns/cloudflare`, then install the result
+  `xcaddy build v2.11.6 --with github.com/ArcCal/caddy-masque=. --with github.com/caddy-dns/cloudflare --replace golang.org/x/net=./third_party/xnet` (from this checkout), then install the result
   as `/usr/local/bin/caddy`. Running `install-server.sh` again replaces it with a build without the plugin, and Caddy
   then fails to load this Caddyfile.
 - **The API token** is a Cloudflare token with the "Edit zone DNS" permission for the domain. Put it alone in
-  `/etc/caddy/cloudflare-token` (`chmod 600`); `{file.PATH}` reads it when the configuration loads. Do not pass it in an
-  environment variable: the service starts Caddy with `--environ`, which writes the whole environment to the log.
+  `/etc/caddy/cloudflare-token` (`chmod 600`); `{file.PATH}` reads it when the configuration loads. The service does not dump its environment; a protected file also avoids exposing the token through environment inspection.
 - **Cloudflare's proxy must be off** for the VPN host name (DNS only, the grey cloud): Cloudflare does not pass CONNECT-IP
   or UDP 443 through. The DNS challenge needs neither port 80 nor 443 to be reachable.
 - **Site addresses**: the certificate covers `example.com` and every `*.example.com`; the client's `uri_template` names
@@ -319,14 +328,13 @@ Known limitations:
   HTTP/3, they just are not advertised.
 - The HTTP/3 the VPN takes over does not accept 0-RTT (replay risk), and does not apply Caddy's `packet_conn_wrappers`
   (such as the PROXY protocol over UDP).
-- Over HTTP/2, RFC 9113 §8.1.1 requires malformed requests (and malformed capsules, RFC 9297 §3.3) to be treated as
-  stream errors of type PROTOCOL_ERROR. The Go HTTP/2 server Caddy uses (`x/net/http2`) does not let handlers choose the
-  error code; the only stream reset a handler can cause is INTERNAL_ERROR. So malformed requests get only a 400, and
-  malformed capsules end the tunnel with INTERNAL_ERROR. Clients that follow RFC 9484 still treat this as a failure
-  (§4.5: any non-successful response is a failure), but the meaning of the error code still does not conform to RFC 9113.
-  This cannot be fixed in this module: patching `x/net/http2` would affect only this repository's `cmd/caddy`, while
-  builds made with xcaddy would stay as they are, and the same version would behave differently depending on how it was
-  built. It has to wait for Go to provide a way for handlers to reset a stream with a given error code.
+
+HTTP/2 malformed requests and capsules use PROTOCOL_ERROR as required by
+RFC 9113 §8.1.1 and RFC 9297 §3.3. The pinned dependency patch supplies the
+reset API; frame-level tests also verify that other streams remain usable.
+All three transports remain supported. IPv6 all-nodes MTU probes are answered
+inside their authenticated tunnel and are never forwarded into the host network.
+See [the latest interoperability validation](docs/interop-2026-10-04.md).
 
 ## Tests
 
@@ -346,11 +354,19 @@ traffic, SOCKS mode, LAN gateway mode, clearing connection tracking when address
 checksums (300 MB download and 100 MB upload over HTTP/3, 100 MB / 50 MB each over HTTP/2 and HTTP/1.1), bad networks
 (see below), a narrow path with an MTU of 1300, and more.
 
+For release validation, set `CLIENT_BIN` to `masque-vpn/target/release/masque-client` built with
+`cargo build --locked --release`. Build `tests/netsim` with Go and pass its path as `NETSIM` explicitly, including
+when using sudo. CI uses this configuration so optimized-client regressions and adverse-network checks are exercised.
+
 ### Behaviour on bad networks
 
 When the kernel has no netem, the tests use `tests/netsim` to make a slow link in the router (a user-space netem on a TUN
-device: per-packet delay and jitter, random loss, packet order kept), rate-limited with tbf: 120 ms RTT, 1% and 5% loss,
-4 Mbit/s bandwidth, and 20-second and 70-second outages. Results:
+device: per-packet delay and jitter, random loss, packet order kept). Its software limiter verifies 4 Mbit/s aggregate
+bandwidth without requiring kernel qdiscs. The tests also exercise 120 ms RTT, 1% and 5% loss, and 20-second and
+70-second outages. UDP capacity measurements use 1200-byte application payloads to fit the guaranteed 1280-byte
+CONNECT-IP path while QUIC discovers its MTU, and require actual receiver data. Results vary with the build and host;
+the following throughput figures are previous measurements, with current validation in
+[the interoperability report](docs/interop-2026-10-04.md):
 
 - The tunnel sends and receives normally under all these conditions, and the checksums match; after a 20-second outage
   the QUIC connection recovers by itself without reconnecting; a 70-second outage is longer than the idle timeout, the

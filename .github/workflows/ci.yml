@@ -38,11 +38,18 @@ jobs:
           check-latest: true
       - name: Dependencies match go.sum
         run: go mod verify
+      - name: Verify pinned HTTP/2 reset patch
+        run: python3 tests/verify-http2-fork.py
       - name: gofmt
-        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+        run: test -z "$(git ls-files '*.go' ':!third_party/**' | xargs gofmt -l | tee /dev/stderr)"
       - run: go vet ./...
       - name: Unit and in-process tests (with the race detector)
         run: go test -race -count=1 ./...
+      - name: Capsule stream segmentation fuzzing
+        run: go test ./internal/proto -run '^$' -fuzz '^FuzzCapsuleStream$' -fuzztime=30s -parallel=2
+      - name: Upstream HTTP/2 and HPACK tests for the patched dependency
+        working-directory: third_party/xnet
+        run: go test -race ./http2 ./http2/hpack
 
   e2e:
     name: end-to-end with masque-client
@@ -81,14 +88,15 @@ jobs:
       - name: Build
         if: env.HAVE_CLIENT == 'true'
         run: |
-          go build -o caddy ./cmd/caddy
-          cargo build --manifest-path masque-vpn/Cargo.toml --bin masque-client
+          CGO_ENABLED=0 go build -trimpath -o caddy ./cmd/caddy
+          CGO_ENABLED=0 go build -o netsim ./tests/netsim
+          cargo build --locked --release --manifest-path masque-vpn/Cargo.toml --bin masque-client
       - name: End-to-end test in network namespaces
         if: env.HAVE_CLIENT == 'true'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q iperf3 nftables
-          sudo CADDY="$PWD/caddy" CLIENT_BIN="$PWD/masque-vpn/target/debug/masque-client" tests/e2e-netns.sh
+          sudo CADDY="$PWD/caddy" CLIENT_BIN="$PWD/masque-vpn/target/release/masque-client" NETSIM="$PWD/netsim" tests/e2e-netns.sh
 
   build:
     name: build ${{ matrix.os }}-${{ matrix.arch }}

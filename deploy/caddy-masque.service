@@ -13,7 +13,7 @@ Type=notify
 # CAP_NET_ADMIN (the TUN device, addresses, nftables, connection tracking,
 # sysctls), CAP_NET_BIND_SERVICE (ports 80 and 443) and CAP_DAC_READ_SEARCH
 # (reading site and certificate files owned by other users).
-ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecStart=/usr/local/bin/caddy run --config /etc/caddy/Caddyfile
 # Applies a changed Caddyfile (users, blocked destinations, sites) without
 # dropping tunnels; --force also re-reads certificate files that changed.
 ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
