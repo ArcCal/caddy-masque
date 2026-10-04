@@ -85,10 +85,21 @@ if [[ $1 == run ]]; then exit 42; fi
 exec /usr/local/bin/caddy-smoke-good "$@"
 EOF
 chmod 755 "$WORK/bin/curl" "$WORK/bin/dig" "$WORK/startup-failure"
+export MASQUE_TEST_UFW_LOG="$WORK/ufw.log"
+cat > "$WORK/bin/ufw" <<'EOF'
+#!/usr/bin/env bash
+if [[ $1 == status ]]; then
+    printf 'Status: active\n'
+else
+    printf '%s\n' "$*" >> "$MASQUE_TEST_UFW_LOG"
+fi
+EOF
+chmod 755 "$WORK/bin/ufw"
 if ! PATH="$WORK/bin:$PATH" CADDY_BIN="$CANDIDATE" bash "$SOURCE/deploy/install-server.sh" localhost > "$WORK/install.log" 2>&1; then
     tail -40 "$WORK/install.log" >&2
     exit 1
 fi
+grep -qxF 'route allow in on masque-smoke' "$MASQUE_TEST_UFW_LOG"
 website
 before=$(sha256sum /usr/local/bin/caddy)
 if PATH="$WORK/bin:$PATH" CADDY_BIN="$WORK/startup-failure" bash "$SOURCE/deploy/install-server.sh" localhost > "$WORK/rollback.log" 2>&1; then
@@ -109,4 +120,4 @@ if ip link show masque-smoke >/dev/null 2>&1; then
     echo 'TUN device survived service stop' >&2
     exit 1
 fi
-echo 'Real systemd start/reload/restart/stop and installer startup rollback passed'
+echo 'Real systemd lifecycle, installer startup rollback, and custom-interface UFW command passed'

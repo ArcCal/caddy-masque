@@ -269,14 +269,15 @@ BINARY_REPLACED=1
 
 say "Firewall"
 # A host firewall that drops forwarded packets makes the tunnel connect and
-# carry nothing; open it for the tunnel's interface (the name in the default
-# configuration).
+# carry nothing; open it for the interface selected by the validated config.
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    TUN_INTERFACE=$("$CADDY" adapt --config "$CONFIG" --adapter caddyfile | jq -er '.apps.masque.interface // "masque0"') ||
+        die "cannot read the tunnel interface from the validated configuration"
     ufw allow 80/tcp >/dev/null
     ufw allow 443/tcp >/dev/null
     ufw allow 443/udp >/dev/null
-    ufw route allow in on masque0 >/dev/null
-    echo "ufw is running: opened TCP 80, TCP 443 and UDP 443, and allowed forwarding from masque0"
+    ufw route allow in on "$TUN_INTERFACE" >/dev/null
+    echo "ufw is running: opened TCP 80, TCP 443 and UDP 443, and allowed forwarding from $TUN_INTERFACE"
 elif command -v iptables >/dev/null && iptables -S FORWARD 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then
     echo "Warning: the iptables FORWARD default policy is DROP (most likely set by Docker), so tunnel traffic will be dropped."
     echo "         Allow it with: iptables -I DOCKER-USER -i masque0 -j ACCEPT (without Docker: iptables -I FORWARD -i masque0 -j ACCEPT), and make the rule persist across reboots"
