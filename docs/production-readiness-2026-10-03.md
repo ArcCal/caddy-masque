@@ -73,3 +73,33 @@ establish that an arbitrary production host, Cloudflare token, or client will wo
 Keep the previous executable and configuration when deploying. Inspect the
 artifact's source commit and checksum, validate the candidate, then verify HTTPS,
 HTTP/3, client traffic, reload, restart, and certificate renewal in staging.
+
+## Verified GitHub results — 2026-10-04 (Asia/Shanghai)
+
+The tested source commit is `94cac78a857573a0361570b43a711969f544a8b4`.
+
+- [CI](https://github.com/ArcCal/caddy-masque/actions/runs/37151699361) passed
+  the race-enabled suite, isolated kernel lifecycle test, bounded fuzz campaigns,
+  and Linux amd64/arm64 and macOS arm64 builds. The original-client end-to-end
+  step was skipped for the missing secret and is excluded from this claim.
+- [Vulnerability scan](https://github.com/ArcCal/caddy-masque/actions/runs/37151699314)
+  passed. The combined build was also scanned locally with zero reachable
+  vulnerabilities.
+- Native combined builds passed on
+  [Linux amd64](https://github.com/ArcCal/caddy-masque/actions/runs/37151734667) and
+  [Linux arm64](https://github.com/ArcCal/caddy-masque/actions/runs/37151736419).
+  Each passed real TUN/firewall/forwarding setup, repair and cleanup, offline
+  Cloudflare provisioning, real systemd start/reload/restart/stop, successful
+  prebuilt installation, and restoration of the working binary after a simulated
+  service startup failure.
+- Both downloadable archives were fetched and their SHA-256 checksums verified.
+  ELF inspection confirms static x86-64 and aarch64 binaries, and both record
+  the tested source commit. The amd64 artifact's three custom modules are
+  `masque`, `http.handlers.masque`, and `dns.providers.cloudflare`; the arm64
+  artifact passed the same executable module checks on its native runner.
+- Builds contain Caddy 2.11.6, Cloudflare provider 0.2.4, and Go 1.26.8. Artifact
+  retention is 30 days; rebuilding the workflow creates a fresh download.
+
+These results close the privileged kernel and systemd rollback testing gaps.
+Original-client interoperability, live DNS issuance/renewal, and validation of
+the intended host topology remain prerequisites for a production deployment.
