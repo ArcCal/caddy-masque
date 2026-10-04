@@ -171,4 +171,5 @@ jobs:
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          CADDY_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload --clobber --repo "$GITHUB_REPOSITORY" -- "$CADDY_RELEASE_TAG" dist/*
