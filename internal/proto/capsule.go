@@ -46,7 +46,7 @@ func AppendCapsule(out []byte, capsuleType uint64, value []byte) []byte {
 
 // DefaultMaxValueLen is the largest capsule value a decoder buffers by
 // default: enough for a DATAGRAM capsule with a maximum-size IP packet.
-const DefaultMaxValueLen = 65535 + 8
+const DefaultMaxValueLen = 65535 + 40 + 8
 
 // Decoder reassembles capsules from a byte stream that may split them at
 // any point.

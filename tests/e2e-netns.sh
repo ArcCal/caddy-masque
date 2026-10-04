@@ -440,12 +440,17 @@ check_transfer() { # <description> download_ok|upload_ok <bytes> [timeout]
     if "$fn" "$@" >/dev/null 2>&1; then ok "$d: $SPEED Mbit/s"; else bad "$d"; fi
 }
 # udp_capacity <label>: what a 20 Mbit/s UDP stream through the tunnel gets
-# through, with the tunnel's own loss (no TCP inside to adapt).
+# through, with the tunnel's own loss (no TCP inside to adapt). A 1200-byte
+# payload fits CONNECT-IP's guaranteed 1280-byte path, even while QUIC PMTU
+# discovery is settling. Oversized-packet/PTB behavior has separate tests.
 udp_capacity() {
-    if in_ns $NS_C iperf3 -c $TARGET -u -b 20M -t 5 -J >"$WORK/iperf-udp.json" 2>&1; then
+    if in_ns $NS_C iperf3 -c $TARGET -u -l 1200 -b 20M -t 5 -J >"$WORK/iperf-udp.json" 2>&1; then
         local r
-        r=$(python3 -c "import json;d=json.load(open('$WORK/iperf-udp.json'))['end']['sum'];print('%.1f Mbit/s delivered, %.1f%% lost' % (d['bits_per_second']/1e6*(1-d['lost_percent']/100), d['lost_percent']))")
-        ok "UDP through the tunnel, 20 Mbit/s offered ($1): $r"
+        if r=$(python3 -c "import json;d=json.load(open('$WORK/iperf-udp.json'))['end']['sum_received'];assert d['bytes'] > 0 and d['bits_per_second'] > 0;print('%.1f Mbit/s received, %.1f%% lost' % (d['bits_per_second']/1e6, d['lost_percent']))"); then
+            ok "UDP through the tunnel, 20 Mbit/s offered ($1): $r"
+        else
+            bad "UDP receiver got no data ($1)"
+        fi
     else
         bad "UDP through the tunnel ($1)"
     fi
@@ -524,6 +529,22 @@ if in_ns $NS_C iperf3 -c $TARGET -t 5 -J >"$WORK/iperf.json" 2>&1; then
 else
     bad "iperf3 through the tunnel"
 fi
+
+echo "== DHCP option 121 cannot bypass the full tunnel"
+in_ns $NS_C ip route add 0.0.0.0/1 via 203.0.113.1 dev c-wan proto dhcp
+in_ns $NS_C ip route add 128.0.0.0/1 via 203.0.113.1 dev c-wan proto dhcp
+check "public IPv4 still uses the VPN with DHCP routes" seen_as $SERVER 5
+check "the directly connected LAN stays reachable" in_ns $NS_C ping -c1 -W2 203.0.113.1
+if [ "$HAVE_V6" = 1 ]; then
+    in_ns $NS_C ip -6 route add ::/1 via 2001:db8:c::1 dev c-wan
+    in_ns $NS_C ip -6 route add 8000::/1 via 2001:db8:c::1 dev c-wan
+    check "public IPv6 still uses the VPN with injected routes" seen_as6 $SERVER6 5
+    check "the IPv6 LAN stays reachable" in_ns $NS_C ping -6 -c1 -W2 2001:db8:c::1
+    in_ns $NS_C ip -6 route del ::/1
+    in_ns $NS_C ip -6 route del 8000::/1
+fi
+in_ns $NS_C ip route del 0.0.0.0/1
+in_ns $NS_C ip route del 128.0.0.0/1
 
 echo "== large transfers over HTTP/3, checksummed"
 check_transfer "download 300 MB" download_ok 300000000 180
@@ -781,7 +802,7 @@ if [ -n "$NETSIM" ]; then
     # Policy routing in the router sends the traffic between the client
     # and the server through netsim's TUN device, which delays every
     # packet and drops some; what comes back out of the device is routed
-    # normally. tbf limits the rate.
+    # normally. The simulator also limits bandwidth without kernel qdiscs.
     printf 'delay=60ms\njitter=5ms\nloss=10\n' >"$WORK/netsim.params"
     ip netns exec $NS_I "$NETSIM" -tun dly0 -params "$WORK/netsim.params" >"$WORK/netsim.log" 2>&1 &
     NETSIM_PID=$!
@@ -796,15 +817,16 @@ if [ -n "$NETSIM" ]; then
         printf 'delay=%s\njitter=%s\nloss=%s\n' "$1" "$2" "$3" >"$WORK/netsim.params"
         sleep 0.4
     }
-    set_rate() { # <rate>|off, toward the client and toward the server
-        local dev
-        for dev in br-cli i-srv; do
-            if [ "$1" = off ]; then
-                in_ns $NS_I tc qdisc del dev $dev root 2>/dev/null
-            else
-                in_ns $NS_I tc qdisc replace dev $dev root tbf rate "$1" burst 32kb latency 200ms
-            fi
-        done
+    set_rate() { # <integer>mbit|off, aggregate test-link bandwidth
+        local rate=0 value=${1%mbit}
+        if [ "$1" != off ]; then
+            [[ "$1" == *mbit && "$value" =~ ^[0-9]+$ ]] || return 1
+            rate=$((value * 1000000))
+        fi
+        sed '/^rate=/d' "$WORK/netsim.params" >"$WORK/netsim.params.new"
+        printf 'rate=%s\n' "$rate" >>"$WORK/netsim.params.new"
+        mv "$WORK/netsim.params.new" "$WORK/netsim.params"
+        wait_log "$WORK/netsim.log" "rate ${rate}bit/s" 5
     }
     outage_on() { # the server's uplink drops everything
         in_ns $NS_S nft -f - <<'EOF'
@@ -829,7 +851,7 @@ EOF
     set_path 60ms 5ms 50
     check_transfer "download 2 MB with 5% loss" download_ok 2000000 180
     set_path 60ms 5ms 5
-    set_rate 4mbit
+    check "the simulator applies the 4 Mbit/s aggregate limit" set_rate 4mbit
     check_transfer "download 3 MB at 4 Mbit/s" download_ok 3000000 90
     tunnel_curl --max-time 60 -o /dev/null "http://$TARGET:8080/data/6000000" &
     BG_PID=$!
@@ -837,7 +859,7 @@ EOF
     rtt=$(tunnel_rtt)
     wait $BG_PID 2>/dev/null
     check "ping stays usable during a download at 4 Mbit/s (${rtt:-?} ms)" test -n "$rtt" -a "${rtt:-9999}" -lt 1500
-    set_rate off
+    check "the simulator removes the bandwidth limit" set_rate off
     check_not "no reconnect so far" wait_log "$WORK/client-slow.log" "tunnel up" 1 2
 
     echo "== a 20-second outage (QUIC keeps the connection)"
