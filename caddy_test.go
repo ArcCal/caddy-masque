@@ -788,6 +788,38 @@ func TestCaddyReloads(t *testing.T) {
 	waitNoSessions(t)
 }
 
+// One process owns one host-network configuration and one nftables table.
+// A different interface must be rejected during provisioning, before it can
+// replace the shared firewall or be affected by the old core's shutdown.
+func TestCaddyRejectsInterfaceChangeBeforeOpeningNetwork(t *testing.T) {
+	e := newCaddyEnv(t)
+	if err := e.load(masqueConfig("alice")); err != nil {
+		t.Fatal(err)
+	}
+	c := e.dialH2(t, testPassword, anyTarget)
+	defer c.close()
+	v4, _ := opening(t, c)
+	previousOpen := openDevice
+	defer func() { openDevice = previousOpen }()
+	opened := false
+	openDevice = func(hostnet.Config) (device, error) {
+		opened = true
+		return nil, errors.New("unexpected attempt to open a replacement network")
+	}
+	changed := masqueConfig("alice")
+	changed["interface"] = "replacement0"
+	if err := e.load(changed); err == nil || !strings.Contains(err.Error(), "restart") {
+		t.Errorf("interface change must require restart: %v", err)
+	}
+	if opened {
+		t.Error("interface change reached host-network startup")
+	}
+	e.dev.fromHost <- udp("1.1.1.1", v4.String(), 10)
+	if _, err := c.recv(); err != nil {
+		t.Fatalf("original tunnel stopped after rejected reload: %v", err)
+	}
+}
+
 func TestCaddyWithoutHTTP3(t *testing.T) {
 	e := newCaddyEnv(t)
 	cfg := masqueConfig("alice")
@@ -867,34 +899,34 @@ func blockWriter(t *testing.T, e *caddyEnv, v4 netip.Addr) bool {
 }
 
 func TestCaddyEndsBlockedTunnels(t *testing.T) {
-	e := newCaddyEnv(t)
-	if err := e.load(masqueConfig("alice")); err != nil {
-		t.Fatal(err)
-	}
 	for _, tr := range transports {
-		c := tr.dial(e, t, testPassword, anyTarget)
-		v4, _ := opening(t, c)
-		if !blockWriter(t, e, v4) && tr.name != "HTTP/3" {
-			t.Fatalf("%s: the writer never blocked", tr.name)
+		if tr.name == "HTTP/3" {
+			continue // QUIC datagrams have no stream flow control to block.
 		}
-		if err := e.load(masqueConfig("bob")); err != nil {
-			t.Fatal(err)
-		}
-		waitNoSessions(t)
-		c.close()
-		if err := e.load(masqueConfig("alice")); err != nil {
-			t.Fatal(err)
-		}
+		t.Run(tr.name, func(t *testing.T) {
+			// Each case owns its server: opening the next case must not
+			// race the previous case's listener replacement on reload.
+			e := newCaddyEnv(t)
+			if err := e.load(masqueConfig("alice")); err != nil {
+				t.Fatal(err)
+			}
+			c := tr.dial(e, t, testPassword, anyTarget)
+			defer c.close()
+			v4, _ := opening(t, c)
+			if !blockWriter(t, e, v4) {
+				t.Fatal("the writer never blocked")
+			}
+			if err := e.load(masqueConfig("bob")); err != nil {
+				t.Fatal(err)
+			}
+			waitNoSessions(t)
+		})
 	}
 }
 
 // A new route advertisement to a client that stopped reading blocks too;
 // removing the user still ends the tunnel.
 func TestCaddyEndsTunnelsBlockedOnNewRoutes(t *testing.T) {
-	e := newCaddyEnv(t)
-	if err := e.load(masqueConfig("alice")); err != nil {
-		t.Fatal(err)
-	}
 	withMoreRoutes := func(users ...string) map[string]any {
 		cfg := masqueConfig(users...)
 		cfg["blocked_destinations"] = []string{}
@@ -904,25 +936,27 @@ func TestCaddyEndsTunnelsBlockedOnNewRoutes(t *testing.T) {
 		if tr.name == "HTTP/3" {
 			continue // its packets do not fill the stream
 		}
-		c := tr.dial(e, t, testPassword, anyTarget)
-		v4, _ := opening(t, c)
-		if !blockWriter(t, e, v4) {
-			t.Fatalf("%s: the writer never blocked", tr.name)
-		}
-		if err := e.load(withMoreRoutes("alice")); err != nil {
-			t.Fatal(err)
-		}
-		// Time for the session to take up the new routes before the
-		// removal, which it would otherwise see first half the time.
-		time.Sleep(300 * time.Millisecond)
-		if err := e.load(withMoreRoutes("bob")); err != nil {
-			t.Fatal(err)
-		}
-		waitNoSessions(t)
-		c.close()
-		if err := e.load(masqueConfig("alice")); err != nil {
-			t.Fatal(err)
-		}
+		t.Run(tr.name, func(t *testing.T) {
+			e := newCaddyEnv(t)
+			if err := e.load(masqueConfig("alice")); err != nil {
+				t.Fatal(err)
+			}
+			c := tr.dial(e, t, testPassword, anyTarget)
+			defer c.close()
+			v4, _ := opening(t, c)
+			if !blockWriter(t, e, v4) {
+				t.Fatal("the writer never blocked")
+			}
+			if err := e.load(withMoreRoutes("alice")); err != nil {
+				t.Fatal(err)
+			}
+			// Let the session take up the new routes before revocation.
+			time.Sleep(300 * time.Millisecond)
+			if err := e.load(withMoreRoutes("bob")); err != nil {
+				t.Fatal(err)
+			}
+			waitNoSessions(t)
+		})
 	}
 }
 

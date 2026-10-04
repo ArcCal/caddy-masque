@@ -144,7 +144,10 @@ func (a *App) Provision(ctx caddy.Context) error {
 			return err
 		}
 	}
-	a.coreKey = "masque-core/" + a.cfg.iface
+	// Caddy has one masque app per configuration, and hostnet owns one
+	// nftables table per process. Share the core across every reload so an
+	// interface change is checked before starting another host network.
+	a.coreKey = "masque-core"
 	val, _, err := cores.LoadOrNew(a.coreKey, func() (caddy.Destructor, error) {
 		return newCore(a.cfg, a.log)
 	})
