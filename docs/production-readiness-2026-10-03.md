@@ -158,7 +158,7 @@ network starts, and isolates the blocked-writer tests' Caddy fixtures.
   the artifact has not been declared free of all vulnerability advisories.
 
 The [security and IETF audit](security-ietf-audit-2026-10-04.md) records the confirmed HTTP/2 error-code gap, conntrack and remaining capacity
-risks, and the unverified TTL delegation boundary. URI validation and basic
+risks, and the initially unverified TTL delegation boundary, subsequently tested below. URI validation and basic
 authentication/session/queue budgets were subsequently fixed below; successful
 builds do not close the remaining gates. This revision is a tested candidate, not a strict
 IETF or large-production sign-off.
@@ -228,3 +228,25 @@ passes the same checks. [Download Artifact](https://github.com/ArcCal/caddy-masq
 Its SHA-256 (`980b5127b91383b02560790876784361da242aca027d2f756eba1a3277019d85`), static x86-64 architecture,
 source commit and module registration were independently verified after download.
 Both candidates contain the same pinned Caddy/Cloudflare/Go versions and source.
+
+
+## Network ownership, rule integrity and Linux hop behavior — 2026-10-04
+
+Candidate: `2455ab70af40af6c8f364bc270265e97de27a3d6`.
+
+The [network follow-up](network-hardening-2026-10-04.md) records namespace locks,
+secure lock paths, stable runtime directory identity, nftables rule fingerprints,
+bounded commands and reported cleanup errors. Real Linux IPv4/IPv6 tests verified
+hop limits 1/64/255 in both directions, ICMP Time Exceeded and local Echo behavior
+over all three HTTP transports. No TTL compensation or wire-format change was made.
+
+Local full race testing passed 225 tests/subtests with the six real Rust CLI
+combinations; eight privileged/tool/helper cases skipped. Final CI and native
+arm64/amd64 combined builds passed kernel, fuzz, offline provider, actual service
+and rollback checks. Both artifact checksums, static architectures and source SHA
+were independently verified; current downloads are linked in the follow-up.
+
+These close the tested basic ownership/rule-integrity and Linux hop-boundary gaps.
+HTTP/2 stream errors, large conntrack tables and real constrained capacity, upstream
+token-error disclosure, live DNS issuance/renewal, macOS/complete Rust modes and
+actual Rust/combined-artifact interoperability still prevent production sign-off.

@@ -1,0 +1,260 @@
+Network hardening follow-up: measured evidence, not production or IETF certification.
+Go sources match e649126e66d07016e4eac0716367cb1006af489b; candidate 2455ab70af40af6c8f364bc270265e97de27a3d6 adds service directory preservation.
+Local full race run: {'pass': 225, 'skip': 8}
+Skipped local tests:
+github.com/ArcCal/caddy-masque/internal/hostnet TestRuleset/v4
+github.com/ArcCal/caddy-masque/internal/hostnet TestRuleset/dual_stack
+github.com/ArcCal/caddy-masque/internal/hostnet TestRuleset/host_access
+github.com/ArcCal/caddy-masque/internal/hostnet TestHostNetworkLifecycle
+github.com/ArcCal/caddy-masque/internal/hostnet TestNetworkOwnershipHelper
+github.com/ArcCal/caddy-masque/internal/hostnet TestHostCommandHelper
+github.com/ArcCal/caddy-masque TestCaddyRealKernelTraffic
+github.com/ArcCal/caddy-masque TestKernelUDPOrigin
+Actual companion CLI cases:
+TestInteropMasqueVPNClient/h3/ipv6=false: passed
+TestInteropMasqueVPNClient/h3/ipv6=true: passed
+TestInteropMasqueVPNClient/h2/ipv6=false: passed
+TestInteropMasqueVPNClient/h2/ipv6=true: passed
+TestInteropMasqueVPNClient/http/1.1/ipv6=false: passed
+TestInteropMasqueVPNClient/http/1.1/ipv6=true: passed
+TestInteropMasqueVPNClient: passed
+
+Host-network repeated tests:
+ok  	github.com/ArcCal/caddy-masque/internal/hostnet	4.477s
+
+
+Frame/config/resource diagnostic (PASS means completed measurement):
+Diagnostic run: PASS reports completed measurements, not standards compliance.
+=== RUN   TestAuditConfigurationValidation
+    audit_config_test.go:15: URI template "https://server/path#fragment/{target}/{ipproto}/": validation error=invalid URI template: variables are only allowed in the path or query
+    audit_config_test.go:15: URI template "1https://server/path/{target}/{ipproto}/": validation error=invalid URI template: missing or invalid scheme
+    audit_config_test.go:19: IPv4 gateway "10.89.0.255/24": validation error=masque: "10.89.0.255/24" uses the IPv4 broadcast address
+    audit_config_test.go:19: IPv4 gateway "10.89.0.1/31": validation error=masque: "10.89.0.1/31" has no usable client pool; prefix length must be at most /30
+    audit_config_test.go:19: IPv4 gateway "169.254.89.1/24": validation error=masque: "169.254.89.1/24" must use a unicast tunnel address (private/ULA addresses are supported)
+--- PASS: TestAuditConfigurationValidation (0.00s)
+=== RUN   TestAuditHTTP2MalformedErrorCode
+=== RUN   TestAuditHTTP2MalformedErrorCode/malformed_target
+    audit_h2_test.go:78: response status=400 EndStream=true
+    audit_h2_test.go:99: RST_STREAM=NO_ERROR, RFC 9113 §8.1.1 requires PROTOCOL_ERROR
+=== RUN   TestAuditHTTP2MalformedErrorCode/malformed_capsule
+    audit_h2_test.go:78: response status=200 EndStream=false
+    audit_h2_test.go:99: RST_STREAM=INTERNAL_ERROR, RFC 9113 §8.1.1 requires PROTOCOL_ERROR
+--- PASS: TestAuditHTTP2MalformedErrorCode (0.22s)
+    --- PASS: TestAuditHTTP2MalformedErrorCode/malformed_target (0.16s)
+    --- PASS: TestAuditHTTP2MalformedErrorCode/malformed_capsule (0.05s)
+=== RUN   TestAuditSessionCapacity
+    audit_scale_test.go:14: queue entry=56 bytes; idle queue=56 KiB plus capsule read buffer=32 KiB per session
+    audit_scale_test.go:29: active addresses=100: session-limit check 10ns per login (100 checks)
+    audit_scale_test.go:29: active addresses=10000: session-limit check 10ns per login (100 checks)
+    audit_scale_test.go:29: active addresses=100000: session-limit check 13ns per login (100 checks)
+--- PASS: TestAuditSessionCapacity (0.04s)
+PASS
+ok  	github.com/ArcCal/caddy-masque	0.311s
+=== RUN   TestAuditAuthenticationBudget
+    audit_auth_test.go:10: NumCPU=5 GOMAXPROCS=4 CPU slots=8 aggregate Argon2 budget=128 MiB
+    audit_auth_test.go:17: configured 1 GiB hash rejected under default budget: argon2 memory 1048576 KiB exceeds authentication budget 131072 KiB
+--- PASS: TestAuditAuthenticationBudget (0.08s)
+PASS
+ok  	github.com/ArcCal/caddy-masque/internal/auth	0.091s
+
+
+Implementation CI 37176808547 isolated kernel measurements:
+=== RUN   TestHostNetworkLifecycle
+--- PASS: TestHostNetworkLifecycle (0.14s)
+=== RUN   TestCaddyRealKernelTraffic
+=== RUN   TestCaddyRealKernelTraffic/HTTP/3
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+=== RUN   TestCaddyRealKernelTraffic/HTTP/2
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+=== RUN   TestCaddyRealKernelTraffic/HTTP/1.1
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+=== RUN   TestCaddyRealKernelTraffic/independent_connect-ip-go_client
+    kernel_e2e_linux_test.go:228: 192.0.2.80: outbound 64 -> origin 62; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 192.0.2.80: outbound 255 -> origin 253; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 2001:db8:80::80: outbound 64 -> origin 62; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 2001:db8:80::80: outbound 255 -> origin 253; return 64 -> client 63
+--- PASS: TestCaddyRealKernelTraffic (0.39s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/3 (0.06s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/2 (0.01s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/1.1 (0.01s)
+    --- PASS: TestCaddyRealKernelTraffic/independent_connect-ip-go_client (0.01s)
+
+Candidate source vulnerability scan 37176965624 (source mode):
+﻿2026-10-04T04:25:55.9644652Z ##[group]Run go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+2026-10-04T04:25:55.9645248Z [36;1mgo run golang.org/x/vuln/cmd/govulncheck@latest ./...[0m
+2026-10-04T04:25:55.9957009Z shell: /usr/bin/bash -e {0}
+2026-10-04T04:25:55.9957496Z env:
+2026-10-04T04:25:55.9957822Z   GOTOOLCHAIN: local
+2026-10-04T04:25:55.9958173Z ##[endgroup]
+2026-10-04T04:26:06.1212229Z === Symbol Results ===
+2026-10-04T04:26:06.1212679Z 
+2026-10-04T04:26:06.1234892Z No vulnerabilities found.
+2026-10-04T04:26:06.1244618Z 
+2026-10-04T04:26:06.1245535Z Your code is affected by 0 vulnerabilities.
+2026-10-04T04:26:06.1246268Z This scan also found 0 vulnerabilities in packages you import and 1
+2026-10-04T04:26:06.1247134Z vulnerability in modules you require, but your code doesn't appear to call these
+2026-10-04T04:26:06.1247815Z vulnerabilities.
+2026-10-04T04:26:06.1248210Z Use '-show verbose' for more details.
+
+
+Final candidate run 37176965685: completed success, source 2455ab70af40af6c8f364bc270265e97de27a3d6
+end-to-end with masque-client/2_Skipped without MASQUE_VPN_TOKEN.txt
+##[group]Run echo "::notice::the end-to-end test needs the MASQUE_VPN_TOKEN secret to fetch masque-vpn's client"
+[36;1mecho "::notice::the end-to-end test needs the MASQUE_VPN_TOKEN secret to fetch masque-vpn's client"[0m
+##[notice]the end-to-end test needs the MASQUE_VPN_TOKEN secret to fetch masque-vpn's client
+test/9_Fuzz packet and capsule parsers.txt
+fuzz: elapsed: 0s, gathering baseline coverage: 0/4 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 4/4 completed, now fuzzing with 2 workers
+fuzz: elapsed: 3s, execs: 151218 (50400/sec), new interesting: 34 (total: 38)
+fuzz: elapsed: 6s, execs: 248766 (32512/sec), new interesting: 40 (total: 44)
+fuzz: elapsed: 9s, execs: 350895 (34051/sec), new interesting: 41 (total: 45)
+fuzz: elapsed: 12s, execs: 449064 (32716/sec), new interesting: 45 (total: 49)
+fuzz: elapsed: 15s, execs: 486887 (12606/sec), new interesting: 45 (total: 49)
+fuzz: elapsed: 18s, execs: 486887 (0/sec), new interesting: 45 (total: 49)
+fuzz: elapsed: 21s, execs: 486887 (0/sec), new interesting: 45 (total: 49)
+fuzz: elapsed: 21s, execs: 486887 (0/sec), new interesting: 45 (total: 49)
+PASS
+fuzz: elapsed: 0s, gathering baseline coverage: 0/3 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 3/3 completed, now fuzzing with 2 workers
+fuzz: elapsed: 3s, execs: 147764 (49242/sec), new interesting: 22 (total: 25)
+fuzz: elapsed: 6s, execs: 217477 (23241/sec), new interesting: 28 (total: 31)
+fuzz: elapsed: 9s, execs: 217477 (0/sec), new interesting: 28 (total: 31)
+fuzz: elapsed: 12s, execs: 217477 (0/sec), new interesting: 28 (total: 31)
+fuzz: elapsed: 15s, execs: 564634 (115784/sec), new interesting: 30 (total: 33)
+fuzz: elapsed: 18s, execs: 615259 (16872/sec), new interesting: 32 (total: 35)
+fuzz: elapsed: 21s, execs: 675840 (20202/sec), new interesting: 32 (total: 35)
+fuzz: elapsed: 21s, execs: 675840 (0/sec), new interesting: 32 (total: 35)
+PASS
+fuzz: elapsed: 0s, gathering baseline coverage: 0/3 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 3/3 completed, now fuzzing with 2 workers
+fuzz: elapsed: 3s, execs: 134449 (44814/sec), new interesting: 28 (total: 31)
+fuzz: elapsed: 6s, execs: 269738 (45084/sec), new interesting: 34 (total: 37)
+fuzz: elapsed: 9s, execs: 400360 (43546/sec), new interesting: 34 (total: 37)
+fuzz: elapsed: 12s, execs: 537733 (45792/sec), new interesting: 36 (total: 39)
+fuzz: elapsed: 15s, execs: 672651 (44977/sec), new interesting: 36 (total: 39)
+fuzz: elapsed: 18s, execs: 807506 (44952/sec), new interesting: 37 (total: 40)
+fuzz: elapsed: 20s, execs: 899283 (44348/sec), new interesting: 37 (total: 40)
+PASS
+test/8_Kernel networking lifecycle in an isolated namespace.txt
+--- PASS: TestHostNetworkLifecycle (0.16s)
+PASS
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:228: 192.0.2.80: outbound 64 -> origin 62; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 192.0.2.80: outbound 255 -> origin 253; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 2001:db8:80::80: outbound 64 -> origin 62; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 2001:db8:80::80: outbound 255 -> origin 253; return 64 -> client 63
+--- PASS: TestCaddyRealKernelTraffic (0.50s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/3 (0.08s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/2 (0.01s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/1.1 (0.01s)
+    --- PASS: TestCaddyRealKernelTraffic/independent_connect-ip-go_client (0.01s)
+PASS
+
+Final candidate run 37176981769: completed success, source 2455ab70af40af6c8f364bc270265e97de27a3d6
+Build Linux arm64/7_Service and installer smoke test on the disposable runner.txt
+Real systemd lifecycle, installer startup rollback, and custom-interface UFW command passed
+Build Linux arm64/5_Kernel networking lifecycle in an isolated namespace.txt
+--- PASS: TestHostNetworkLifecycle (0.15s)
+PASS
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:228: 192.0.2.80: outbound 64 -> origin 62; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 192.0.2.80: outbound 255 -> origin 253; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 2001:db8:80::80: outbound 64 -> origin 62; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 2001:db8:80::80: outbound 255 -> origin 253; return 64 -> client 63
+--- PASS: TestCaddyRealKernelTraffic (1.26s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/3 (0.31s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/2 (0.01s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/1.1 (0.01s)
+    --- PASS: TestCaddyRealKernelTraffic/independent_connect-ip-go_client (0.01s)
+PASS
+
+Final candidate run 37176982669: completed success, source 2455ab70af40af6c8f364bc270265e97de27a3d6
+Build Linux amd64/7_Service and installer smoke test on the disposable runner.txt
+Real systemd lifecycle, installer startup rollback, and custom-interface UFW command passed
+Build Linux amd64/5_Kernel networking lifecycle in an isolated namespace.txt
+--- PASS: TestHostNetworkLifecycle (0.20s)
+PASS
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 192.0.2.80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 64 -> origin 63; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: outbound 255 -> origin 254; return 64 -> client 63
+    kernel_e2e_linux_test.go:209: 2001:db8:80::80: hop=1 forwarded packet returned ICMP Time Exceeded; local echo reply kept hop=64
+    kernel_e2e_linux_test.go:228: 192.0.2.80: outbound 64 -> origin 62; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 192.0.2.80: outbound 255 -> origin 253; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 2001:db8:80::80: outbound 64 -> origin 62; return 64 -> client 63
+    kernel_e2e_linux_test.go:228: 2001:db8:80::80: outbound 255 -> origin 253; return 64 -> client 63
+--- PASS: TestCaddyRealKernelTraffic (0.61s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/3 (0.09s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/2 (0.01s)
+    --- PASS: TestCaddyRealKernelTraffic/HTTP/1.1 (0.01s)
+    --- PASS: TestCaddyRealKernelTraffic/independent_connect-ip-go_client (0.01s)
+PASS
+
+Downloaded artifacts independently verified:
+{"arch": "arm64", "run": 37176981769, "artifact": 11293153543, "sha256": "30a64f391df6203b4e39c3cf6424e64127317b336fae074adacc7adb516d6bd0", "source": "2455ab70af40af6c8f364bc270265e97de27a3d6"}
+{"arch": "amd64", "run": 37176982669, "artifact": 11293379328, "sha256": "26fa4596066c0fbde47b96ea0bdcb332d95d45038154e50574c6ab11dcc6a755", "source": "2455ab70af40af6c8f364bc270265e97de27a3d6"}
+Static ELF architectures: aarch64 and x86-64; both source records match the candidate.
+Caddy 2.11.6, Cloudflare 0.2.4, Go 1.26.8; three custom modules verified.
+Actual amd64 artifact additionally passed local offline Cloudflare provisioning.

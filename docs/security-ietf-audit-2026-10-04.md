@@ -4,7 +4,7 @@
 
 **当前实现不能被认定为完全符合 IETF 规范，也尚不足以签字确认适合大规模生产部署。**
 
-核心隧道、身份隔离、报文解析和默认访问控制已有较好的保护。本次没有发现可复现的未经认证接管隧道或跨用户读取报文的路径；这不是“没有漏洞”的证明。HTTP/2 错误处理仍与规范要求不符。后续修复已补 URI 组件校验、认证内存预算、全局会话和队列预算；conntrack 大表成本、真实容量及 TTL/Hop Limit 的内核委托边界仍待验收。
+核心隧道、身份隔离、报文解析和默认访问控制已有较好的保护。本次没有发现可复现的未经认证接管隧道或跨用户读取报文的路径；这不是“没有漏洞”的证明。HTTP/2 错误处理仍与规范要求不符。后续修复已补 URI 组件校验、认证内存预算、全局会话和队列预算；Linux TTL/Hop Limit 的基本委托边界已通过真实内核检查。conntrack 大表成本、真实容量及实际部署拓扑仍待验收。
 
 修复必须保留 RFC 定义的消息、地址、路由和错误语义。不能把“客户端仍能连接”“返回 400”或“测试全绿”等同于符合规范；不能靠关闭报文检查、跳过 conntrack 清理、补偿性修改 TTL 或自定义 Capsule 来掩盖问题。
 
@@ -106,27 +106,35 @@
 
 真实命名空间生命周期测试使用 `mq.test` TUN 和 `wan.100` veth，断言 TUN `accept_local=1`、启用 IPv6 forwarding 时 WAN `accept_ra=2`，关闭后恢复原值。普通本地 suite 因无特权跳过该用例；原生 arm64 组合构建和 amd64 CI 已真正运行并通过该用例。配置阶段另拒绝 `/`、`:`、空白、NUL、`.`/`..` 等无效 Linux 名称，合法 `vpn.0` 保持可用。
 
-### S7 — TTL/Hop Limit 的内核委托边界未完成验证
+### S7 — Linux TTL/Hop Limit 的基本委托边界已验证
 
-**P1：规范验收的待验证项；不是已经证明的 MUST 违规。**
+**原 P1 待验证项：标准 Linux 路由路径已验证；复杂路径与真实目标客户端仍需验收。不是已证明的 MUST 违规。**
 
 [RFC 9484 §7.2](https://www.rfc-editor.org/rfc/rfc9484.html#section-7.2) 说明跨链路转发在 encapsulation 时递减 TTL/Hop Limit，在 decapsulation 时不递减；该节也明确指出，依赖外部软件路由的实现可能不直接承担这些路由要求。
 
-本实现把客户端报文原样写入 TUN，由 Linux 转发和递减 TTL；反向报文在内核路由到 TUN 后封装。现有 fake-TUN 测试要求原样报文，真实内核测试验证了 NAT 和双向 UDP，但没有断言 TTL/Hop Limit、TTL=1、255、traceroute 或 ICMP Time Exceeded 的行为。
+本实现把客户端报文原样写入 TUN，由 Linux 转发和递减 TTL；反向报文在内核路由到 TUN 后封装。HTTP 隧道/TUN 适配层不额外修改跳数，Linux 是外部 IP 路由器。fake-TUN 原样报文断言保留，没有加入补偿性 TTL 修改。
 
-需要先明确“HTTP 隧道链路、共享 TUN 和内核路由器”分别承担什么角色，在 TUN/WAN 两侧抓取 IPv4、IPv6 报文，验证两个方向和本地产生/本地终止报文是否只发生应有的路由跳数。**不能直接给收到的 TTL 加 1**：这会在 255、校验和、本地目的地和超时报文处引入新的错误。尚未完成这项验证前，不签署完整 §7.2 符合性结论。
+实现 `e649126e66d07016e4eac0716367cb1006af489b` 的 [原生 CI](https://github.com/ArcCal/caddy-masque/actions/runs/37176808547) 已通过新增内核测试。三种 HTTP 传输、IPv4/IPv6 中，origin 用 socket ancillary data 实测客户端 64 → 63、255 → 254；origin 明确设置回包 64，客户端收到 63。跳数 1 发往远端返回 ICMP Time Exceeded，引用的源/目的地正确；跳数 1 发往本地网关得到 Echo Reply，回包保持 64。独立 `connect-ip-go` 客户端自身先递减一次，故 origin 实测 62/253；测试明确区分这个额外客户端路由跳数。
 
-### S8 — 宿主网络所有权和部署边界需要收紧
+这些结果确认所测 Linux/TUN/WAN 路径没有重复递减、255 回绕或本地目的地误递减。`manage_network off` 或其他外部路由软件必须独立保证同样的行为；低 MTU、中间代理、多跳拓扑、真实 Rust TUN/macOS 仍需要部署验证。**不能直接给收到的 TTL 加 1**，也不能据上述边界测试签署完整 §7.2 或所有 RFC 符合性结论。
 
-**P2：运维隔离与故障恢复；源码确认。**
+### S8 — 已加固宿主网络所有权与规则恢复，部署组合仍待验收
 
-同一进程接口变更已修复，但两个独立 Caddy 进程若使用不同 TUN，仍会共享固定 `inet caddy-masque` nftables 表和宿主 sysctl；不应视为可安全独立运行。建议每网络命名空间只运行一个网络管理实例，或重新设计表名、sysctl 所有权和生命周期管理。
+**P2：基础所有权、规则漂移和命令/清理问题已修复；外部网络管理器组合仍开放。**
 
-`manage_network off` 会把防火墙、NAT、forwarding 的责任交给管理员，模块不会安装默认宿主保护 input 链；`allow_host_access` 的默认值不能代替外部防火墙。`Repair` 每 30 秒检查表是否存在，不检查表内规则是否被部分清空；外部命令没有执行超时，清理时部分错误被忽略。应补规则完整性检查、外部命令期限和故障指标，并验证与 UFW、Docker、firewalld 的真实组合。当前已经验证的修复/清理顺序不能证明这些组合均可靠。
+自动网络管理在创建 TUN、改变 sysctl/nftables 前取得按 network namespace inode 命名的非阻塞 `flock`，持续持有到清理完成。竞争者提前失败，崩溃后内核释放锁；拒绝符号链接、硬链接、非正规文件及不安全所有权/写权限。锁文件不删除。systemd 设置 `RuntimeDirectoryPreserve=yes`，防止停止时删除 inode 导致接管者与新进程锁住不同文件。共享网络命名空间的容器必须共享 `/run/caddy-masque`；私有运行目录不能互相协调。独立网络命名空间允许独立管理。
+
+`Repair` 现在比较安装后读取的 nftables JSON，忽略 handle/metainfo，保留链策略、hook、priority、规则顺序和表达式；部分清空和额外规则也会修复。检查失败不再直接推断表消失，只有成功枚举确认缺失才重新安装。每条命令最多 5 秒、输出最多 64 KiB；进程退出后的 pipe 等待也有限。关闭幂等，清理失败向 Caddy 上报；恢复 sysctl 前检查当前值仍等于本进程安装值，不覆盖可辨识的后续管理员修改。这是非原子的 best-effort 比较，不是与所有管理软件的事务协调。systemd 留 45 秒给正在运行的修复及清理。
+
+跨进程争用/崩溃释放、不安全锁路径、命令超时/输出限额、并发关闭、sysctl 恢复和检查失败的只读行为均有本地 race 回归。原生内核测试进一步验证竞争者不创建 TUN、独立 namespace 不受父锁阻挡，以及 input/forward/postrouting 清空和插入额外规则后的恢复。后续服务测试检查运行目录在 restart/stop 后的身份；结果随最新交付记录保存。
+
+`manage_network off` 不安装默认宿主保护 input 链，访问控制责任交给管理员。30 秒 watcher 不能提供外部 flush 后的即时保护，也不与任意 UFW、Docker、firewalld 策略自动协调；仍需故障指标、报警及真实组合验证。Linux forwarding sysctl 的系统性副作用和生产路由冲突也须按实际宿主验收。
+
+崩溃会释放锁/TUN，但不会执行 `Close`，原始 sysctl 值仅保存在内存；下一次启动能替换保留表，却不能恢复已经丢失的崩溃前 forwarding 原值。这是源码可确认的恢复边界，尚未新增真实进程崩溃/持久状态恢复验收，不能把锁自动释放写成完整网络回滚。
 
 `tunnel.go` 还按 `Source`/`Conn` 字段名用反射解开 Caddy 的 body/连接包装。当前版本有测试，但字段名不是稳定的公开解包契约；升级后可能重新受到 idle timeout 影响或无法应用 TCP 设置。应优先采用公开解包接口，保持依赖版本与升级回归测试一致。现有 systemd 沙箱、0600 admin socket、工作流只读权限和关闭 checkout credential 持久化值得保留；第三方 Actions 的版本 tag 仍可进一步锁定为审核过的提交 SHA。
 
-配置校验已拒绝广播地址 `10.89.0.255/24`、无可用地址的 `10.89.0.1/31`、链路本地、loopback、multicast 网关和过小 IPv6 池；已补合法小池/带点接口和错误配置测试。这是本实现的可分配池限制，不是宣称 IETF 禁止 /31 或 /127 的点到点用途。真实宿主路由冲突检测、跨进程所有权和规则完整性仍未完成；链路本地转发限制始终保留。
+配置校验已拒绝广播地址 `10.89.0.255/24`、无可用地址的 `10.89.0.1/31`、链路本地、loopback、multicast 网关和过小 IPv6 池；已补合法小池/带点接口和错误配置测试。这是本实现的可分配池限制，不是宣称 IETF 禁止 /31 或 /127 的点到点用途。真实宿主路由冲突检测仍未完成；链路本地转发限制始终保留。
 
 ### S9 — Cloudflare provider 的错误路径可能输出 API token
 
@@ -158,7 +166,7 @@
 | RFC 9297 Capsule 解析 | 分块读取、截断、未知类型跳过和长度上限有测试；资源限制未引入私有线上格式；H2 错误仍受 S1 影响 |
 | HTTP/3 DATAGRAM 协商 | 检查双方设置，无法使用 QUIC DATAGRAM 时采用标准 Capsule 承载；不关闭 QUIC 拥塞控制 |
 | RFC 9484 §6 Context ID | 使用 Context ID 0；未知 context 的处理有测试 |
-| RFC 9484 §7.2 报文处理 | 源地址必须属于本会话；转发校验失败丢包，不将普通 IP 转发错误都误判为隧道协议错误；TTL 仍须完成 S7 |
+| RFC 9484 §7.2 报文处理 | 源地址必须属于本会话；转发校验失败丢包，不将普通 IP 转发错误都误判为隧道协议错误；S7 已验证基本 Linux TTL/ICMP 边界，复杂部署仍待验收 |
 | IPv6 最小 MTU / RFC 9484 §7.2 | 默认发送 1,280 字节完整 Echo 探测，校验来源、序号、内容和校验和；不足以承载 IPv6 时结束隧道；关闭探测须另有 MTU 保证 |
 | IPv4 分片、IPv6 Packet Too Big | DF/分片/ICMP 大小、校验和及返回方向有测试；真实低 MTU、中间代理路径还需验证 |
 | RFC 9484 §10 ICMP/拥塞 | ICMP 限速；保留 QUIC 拥塞机制；没有把可靠 Capsule 通道错误当作数据报拥塞控制的替代 |
@@ -188,7 +196,7 @@ bash tests/audit-ietf.sh
 
 本地重新扫描源仓库及按 Artifact 的 `go.mod`/`go.sum` 重建的组合程序源码，调用分析均报告 **0 个可达已知漏洞**，但 required module 中有 [GO-2026-5932](https://pkg.go.dev/vuln/GO-2026-5932)（未维护的 `x/crypto/openpgp`）。对删除符号表的 arm64 Artifact 做 binary-mode 扫描时，该告警被报告为命中；`govulncheck v1.8.0` 的 `ExtractPackagesAndSymbols` 在 stripped binary 上退回模块元数据，不能提供调用可达性证据。使用相同实现、依赖和 Go 版本重建保留符号表的 amd64 程序，binary-mode 扫描报告 0 命中，`go tool nm` 也没有 OpenPGP 符号。[各次扫描输出](audit-vulncheck-2026-10-04.txt) 均保留，不能把 stripped 模式的模块命中直接写成已证明的可利用路径，也不能把源码的 0 可达写成所有依赖都安全。依赖告警仍需持续跟踪。
 
-以下仍未验证：真实 Cloudflare DNS challenge 签发/续期、目标 Rust 客户端的完整 TUN/gateway/实际组合 Artifact 与 macOS 验收、生产网络拓扑、多租户故障、真实大规模/长期压力、S7 的 TTL 边界。后续真实 CLI 的六种组合已通过，见客户端兼容性记录。GitHub job 的绿色状态不能把因缺少 `MASQUE_VPN_TOKEN` 而跳过的步骤变成已测试。
+以下仍未验证：真实 Cloudflare DNS challenge 签发/续期、目标 Rust 客户端的完整 TUN/gateway/实际组合 Artifact 与 macOS 验收、生产网络拓扑、多租户故障、真实大规模/长期压力。S7 的基本 Linux TTL 边界后来已验证，上文单独记录范围；真实 CLI 的六种组合已通过，见客户端兼容性记录。GitHub job 的绿色状态不能把因缺少 `MASQUE_VPN_TOKEN` 而跳过的步骤变成已测试。
 
 ## 后续实现与真实客户端验证（`d414d2a`）
 
@@ -206,9 +214,15 @@ bash tests/audit-ietf.sh
 
 ## 改进顺序与验收门槛
 
-1. **严格标准门槛：**完成 S1 的跨构建一致流错误修复，并实测和明确 S7 内核委托边界；保留 S2 的回归。协议负面用例必须断言规范规定的错误，不能只断言“连接断开”。
+最新网络实现为 `e649126e66d07016e4eac0716367cb1006af489b`，加上 systemd 锁目录保留后的交付候选为 `2455ab70af40af6c8f364bc270265e97de27a3d6`。本地全量 race **225 个测试/子测试通过、8 个跳过、0 个失败**，包含真实客户端六种组合；hostnet 故障专项另通过 3 次 race 重复。
+
+候选的 [CI](https://github.com/ArcCal/caddy-masque/actions/runs/37176965685)、[源码扫描](https://github.com/ArcCal/caddy-masque/actions/runs/37176965624)、原生组合构建 [arm64](https://github.com/ArcCal/caddy-masque/actions/runs/37176981769)/[amd64](https://github.com/ArcCal/caddy-masque/actions/runs/37176982669) 均已通过。两种原生构建真正执行了 S7 TTL/ICMP、S8 所有权/规则漂移，以及实际 Artifact 的服务目录保留、启停重载、安装回滚。下载包 SHA-256、静态架构和源码 SHA 已核对；详情、下载和证据见 [本轮记录](network-hardening-2026-10-04.md)。内核数据通路使用 source test binary，服务/安装检查使用组合 Artifact；不将它们写成已经完成真实 Rust/组合 Artifact 互通。
+
+最新帧诊断仍复现 S1；源码扫描仍是 0 个可达已知漏洞、1 个 required-module advisory。GitHub private-client job 仍跳过；S3/S4 的真实容量、S5、S9、真实 macOS/模式和 DNS 续期门槛仍开放。
+
+1. **严格标准门槛：**完成 S1 的跨构建一致流错误修复，保留 S2/S7 回归并验证实际外部路由部署边界。协议负面用例必须断言规范规定的错误，不能只断言“连接断开”。
 2. **规模和资源门槛：**在真实资源限制和负载下验收 S3/S4 的新预算，验证 S5 在大 conntrack 表下的清理成本和失败隔离。给出 CPU、内存、吞吐、会话数和登录峰值的可测容量范围。
-3. **宿主可靠性门槛：**保留 S6 的原生回归，完善 S8 的所有权和规则完整性检查，验证网络冲突、规则漂移、低 MTU、IPv6 RA、服务重启和回滚；补 S10 的完整丢包指标和安全测试入口。
+3. **宿主可靠性门槛：**保留 S6/S8 的原生回归，验证实际网络冲突、外部防火墙组合、低 MTU、IPv6 RA、服务重启和回滚；补 S10 的完整丢包指标和安全测试入口。
 4. **部署与凭据门槛：**处理 S9，完成真实 DNS 签发/续期与目标客户端的 staging 测试，限定 token 权限、admin socket 权限和日志访问。先在隔离环境验证，再部署生产。
 
 保留标准 HTTP/3、HTTP/2、HTTP/1.1 与 DNS 插件集成。当前证据不支持删除协议校验、访问控制、MTU 检查或 conntrack 隔离来换取性能；也不支持新增私有协议扩展。完成上述门槛前，PR 保持 draft，不能宣称“完全符合 IETF”或“已验证大规模生产就绪”。

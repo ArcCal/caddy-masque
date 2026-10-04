@@ -76,3 +76,9 @@ MASQUE_TEST_CLIENT=/absolute/path/to/masque-client \
 真实互通测试已加入原 e2e Actions job；它仍需要仓库侧 `MASQUE_VPN_TOKEN` 才能获取私有客户端，缺少 secret 时未运行。只授予读取 companion 仓库的权限，在支持的设置中输入；不得在聊天发送或把环境代理凭据复制为 secret。当前本地读取与测试已完成，不再把云环境添加客户端仓库当作读取的必需前提。
 
 规范与规模门槛见 [安全与 IETF 审计](security-ietf-audit-2026-10-04.md)。当前结果确认所测 CLI/模式/传输范围内兼容，不构成“所有版本/所有模式完美兼容”或生产验收。
+
+## 网络加固后的再次验证
+
+服务端网络实现 `e649126e66d07016e4eac0716367cb1006af489b`（交付候选 `2455ab70af40af6c8f364bc270265e97de27a3d6` 的 Go 源码相同）再次运行全量 race suite，225 个测试/子测试通过，真实 companion CLI 的上述六种组合全部通过。客户端版本保持固定 SHA、原始二进制和证书验证；没有重跑此前 200 项 Rust workspace 测试，因为本轮没有修改客户端。
+
+原生 arm64/amd64 内核测试另验证了模拟协议客户端与独立 `connect-ip-go` 的双向 NAT、TTL/Hop Limit、ICMP 超时和本地回应；这不是目标 Rust TUN/macOS 验收。新的组合 Artifact 已通过实际 service/installer 检查和离线 DNS provider 配置，仍未完成 Rust/组合 Artifact 互通或真实 DNS 签发/续期。版本、下载、日志和证据边界见 [本轮记录](network-hardening-2026-10-04.md)。
