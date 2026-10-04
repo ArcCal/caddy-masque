@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/argon2"
+	"golang.org/x/sync/semaphore"
 )
 
 // MinPasswordLen is the shortest password the passwd command accepts.
@@ -101,8 +102,8 @@ type phc struct {
 	key     []byte
 }
 
-// Limits on accepted parameters, so a configured hash cannot make the
-// server allocate gigabytes or spin for minutes per login.
+// Absolute limits on configured hash parameters. The aggregate memory
+// budget is enforced separately before any verification starts.
 const (
 	maxMemory = 1 << 20 // 1 GiB in KiB
 	maxTime   = 64
@@ -160,6 +161,19 @@ func ValidateHash(s string) error {
 	return err
 }
 
+// ValidateHashWithMemory also checks that a single verification fits the
+// configured total working-memory budget, in KiB.
+func ValidateHashWithMemory(s string, memoryKiB uint32) error {
+	h, err := parsePHC(s)
+	if err != nil {
+		return err
+	}
+	if h.memory > memoryKiB {
+		return fmt.Errorf("argon2 memory %d KiB exceeds authentication budget %d KiB", h.memory, memoryKiB)
+	}
+	return nil
+}
+
 func verifyHash(password, hash string) bool {
 	h, err := parsePHC(hash)
 	if err != nil {
@@ -185,6 +199,14 @@ var ErrBusy = errors.New("too many requests waiting for password verification")
 // second or two.
 const waitingPerSlot = 32
 
+// Memory budgets cover concurrent Argon2 working memory, not the entire
+// process heap. Leave headroom for Go GC, networking and Caddy itself.
+const (
+	DefaultMemoryBudgetKiB = 128 << 10
+	MinMemoryBudgetKiB     = defaultMemory
+	maxAdmissionWait       = 5 * time.Second
+)
+
 // perSource is how many verifications one source (see sourceKey) may have
 // waiting or running at once. Users behind one address (a shared NAT) who
 // are past this get 503 and retry; with their credentials remembered they
@@ -201,7 +223,10 @@ type Authenticator struct {
 	users map[string]string // name -> hash
 	// Hashing takes tens of milliseconds and megabytes, so verifications
 	// run at most len(slots) at a time.
-	slots chan struct{}
+	slots       chan struct{}
+	memory      *semaphore.Weighted
+	memoryKiB   uint32
+	memoryInUse atomic.Int64
 	// Requests waiting for a slot, bounded so a flood of made-up
 	// credentials cannot queue without end ahead of real users.
 	waiting    atomic.Int64
@@ -236,14 +261,28 @@ type remembered struct {
 
 // New makes an authenticator with no users.
 func New() *Authenticator {
-	slots := runtime.NumCPU() * 2
+	a, err := NewWithMemory(DefaultMemoryBudgetKiB)
+	if err != nil {
+		panic(err) // the constant default is within the supported range
+	}
+	return a
+}
+
+// NewWithMemory sets an aggregate Argon2 working-memory budget in KiB.
+// GOMAXPROCS reflects CPU quotas; NumCPU can describe the larger host.
+func NewWithMemory(memoryKiB uint32) (*Authenticator, error) {
+	if memoryKiB < MinMemoryBudgetKiB || memoryKiB > maxMemory {
+		return nil, fmt.Errorf("authentication memory must be between %d and %d KiB", MinMemoryBudgetKiB, maxMemory)
+	}
+	slots := runtime.GOMAXPROCS(0) * 2
 	cacheKey := make([]byte, 32)
 	if _, err := rand.Read(cacheKey); err != nil {
 		panic(err)
 	}
 	return &Authenticator{users: map[string]string{}, slots: make(chan struct{}, slots),
+		memory: semaphore.NewWeighted(int64(memoryKiB)), memoryKiB: memoryKiB,
 		maxWaiting: int64(slots * waitingPerSlot), dummyHash: HashPassword(GeneratePassword()),
-		verified: map[[sha256.Size]byte]remembered{}, cacheKey: cacheKey, sources: map[netip.Addr]int{}}
+		verified: map[[sha256.Size]byte]remembered{}, cacheKey: cacheKey, sources: map[netip.Addr]int{}}, nil
 }
 
 // Replace installs a new user list (name -> hash).
@@ -306,6 +345,14 @@ func (a *Authenticator) Verify(ctx context.Context, authorization string, source
 	if !known {
 		hash = a.dummyHash
 	}
+	phc, err := parsePHC(hash)
+	if err != nil {
+		return User{}, false, nil
+	}
+	weight := int64(phc.memory)
+	if weight > int64(a.memoryKiB) {
+		return User{}, false, ErrBusy // configuration validation normally prevents this
+	}
 	src := sourceKey(source)
 	if !a.enterSource(src) {
 		return User{}, false, ErrBusy
@@ -317,26 +364,37 @@ func (a *Authenticator) Verify(ctx context.Context, authorization string, source
 			a.leaveSource(src)
 		}
 	}()
+	waitCtx, stopWaiting := context.WithTimeout(ctx, maxAdmissionWait)
+	defer stopWaiting()
 	select {
 	case a.slots <- struct{}{}:
 	default:
-		if a.waiting.Add(1) > a.maxWaiting {
-			a.waiting.Add(-1)
-			a.warnBusy()
-			return User{}, false, ErrBusy
-		}
-		select {
-		case a.slots <- struct{}{}:
-			a.waiting.Add(-1)
-		case <-ctx.Done():
-			a.waiting.Add(-1)
-			return User{}, false, ctx.Err()
+		if err := a.wait(ctx, waitCtx, func(ctx context.Context) error {
+			select {
+			case a.slots <- struct{}{}:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}); err != nil {
+			return User{}, false, err
 		}
 	}
+	if !a.memory.TryAcquire(weight) {
+		if err := a.wait(ctx, waitCtx, func(ctx context.Context) error {
+			return a.memory.Acquire(ctx, weight)
+		}); err != nil {
+			<-a.slots
+			return User{}, false, err
+		}
+	}
+	a.memoryInUse.Add(weight)
 	result := make(chan bool, 1)
 	leave = false
 	go func() {
 		defer func() {
+			a.memoryInUse.Add(-weight)
+			a.memory.Release(weight)
 			<-a.slots
 			a.leaveSource(src)
 		}()
@@ -353,6 +411,26 @@ func (a *Authenticator) Verify(ctx context.Context, authorization string, source
 		a.remember(tag, hash)
 	}
 	return u, ok, nil
+}
+
+// wait bounds both CPU and memory admission, sharing one deadline. Once
+// hashing starts, cancellation returns promptly but its reservations stay
+// held until the computation really finishes.
+func (a *Authenticator) wait(ctx, waitCtx context.Context, acquire func(context.Context) error) error {
+	if a.waiting.Add(1) > a.maxWaiting {
+		a.waiting.Add(-1)
+		a.warnBusy()
+		return ErrBusy
+	}
+	defer a.waiting.Add(-1)
+	if err := acquire(waitCtx); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		a.warnBusy()
+		return ErrBusy
+	}
+	return nil
 }
 
 // tag is the cache key of a user name and password.

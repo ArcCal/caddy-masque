@@ -57,6 +57,7 @@ func testPasswordHash() string {
 
 type testCert struct {
 	certPEM, keyPEM string
+	caPEM           string
 	pool            *x509.CertPool
 }
 
@@ -82,15 +83,34 @@ func newTestCert(t *testing.T) testCert {
 	if err != nil {
 		t.Fatal(err)
 	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
+	ca, err := x509.ParseCertificate(der)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cert, _ := x509.ParseCertificate(der)
+	caPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	// A distinct end-entity certificate also works with strict clients
+	// such as rustls, which correctly refuse a CA as a server certificate.
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf := *tmpl
+	leaf.SerialNumber = big.NewInt(2)
+	leaf.IsCA = false
+	leaf.KeyUsage = x509.KeyUsageDigitalSignature
+	der, err = x509.CreateCertificate(rand.Reader, &leaf, ca, &leafKey.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(leafKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	pool := x509.NewCertPool()
-	pool.AddCert(cert)
+	pool.AddCert(ca)
 	return testCert{
-		certPEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		certPEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})) + caPEM,
+		caPEM:   caPEM,
 		keyPEM:  string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})),
 		pool:    pool,
 	}

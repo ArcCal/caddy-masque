@@ -96,7 +96,10 @@ jobs:
         if: env.HAVE_CLIENT == 'true'
         run: |
           go build -o caddy ./cmd/caddy
-          cargo build --manifest-path masque-vpn/Cargo.toml --bin masque-client
+          cargo build --locked --manifest-path masque-vpn/Cargo.toml --bin masque-client
+      - name: Real client interoperability over all HTTP transports
+        if: env.HAVE_CLIENT == 'true'
+        run: MASQUE_TEST_CLIENT="$PWD/masque-vpn/target/debug/masque-client" go test -race -count=1 -v . -run '^TestInteropMasqueVPNClient$'
       - name: End-to-end test in network namespaces
         if: env.HAVE_CLIENT == 'true'
         run: |

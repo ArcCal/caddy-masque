@@ -55,11 +55,12 @@ func ParseTemplate(raw string) (*Template, error) {
 	if !ok {
 		return nil, TemplateError("must be absolute (scheme://authority/path)")
 	}
-	if scheme == "" || strings.Trim(scheme, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-.") != "" {
+	if scheme == "" || !(scheme[0] >= 'a' && scheme[0] <= 'z' || scheme[0] >= 'A' && scheme[0] <= 'Z') ||
+		strings.Trim(scheme, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-.") != "" {
 		return nil, TemplateError("missing or invalid scheme")
 	}
-	slash := strings.IndexByte(rest, '/')
-	if slash < 0 {
+	slash := strings.IndexAny(rest, "/?#")
+	if slash < 0 || rest[slash] != '/' {
 		return nil, TemplateError("path must not be empty and must start with '/'")
 	}
 	authority, path := rest[:slash], rest[slash:]
@@ -67,6 +68,13 @@ func ParseTemplate(raw string) (*Template, error) {
 		return nil, TemplateError("authority must not be empty")
 	}
 	if strings.ContainsAny(authority, "{}") {
+		return nil, TemplateError("variables are only allowed in the path or query")
+	}
+	// A literal fragment is allowed, but it is not part of an HTTP request
+	// target. Variables in it are forbidden by RFC 9484 §3. Percent-encoded
+	// %23 is a path/query character and must remain untouched.
+	path, fragment, _ := strings.Cut(path, "#")
+	if strings.ContainsAny(fragment, "{}") {
 		return nil, TemplateError("variables are only allowed in the path or query")
 	}
 	parts, err := parseParts(path)

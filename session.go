@@ -437,6 +437,7 @@ func (s *session) sendToClientLoop(ctx context.Context) error {
 	for {
 		select {
 		case q := <-s.lease.handle.toClient:
+			q.release()
 			if time.Since(q.at) > maxQueueDelay {
 				s.dropped()
 				continue

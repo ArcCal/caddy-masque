@@ -43,6 +43,9 @@ func TestCaddyfileGlobalOption(t *testing.T) {
 		allow_client_to_client
 		allow_host_access
 		max_sessions 3
+		auth_memory 64
+		max_total_sessions 256
+		queue_memory 16
 		http3 off
 		mtu_probe off
 		user alice `+testHash+`
@@ -53,6 +56,7 @@ func TestCaddyfileGlobalOption(t *testing.T) {
 	}
 	if app.Interface != "vpn0" || app.IPv4 != "10.9.0.1/24" || app.IPv6 != "fd09::1/64" || app.MTU != 1400 ||
 		*app.ManageNetwork || *app.HTTP3 || *app.MTUProbe || !app.AllowClientToClient || !app.AllowHostAccess || app.MaxSessions != 3 || app.sessionLimit() != 3 || len(app.Users) != 2 ||
+		app.AuthMemoryMiB != 64 || app.MaxTotalSessions != 256 || app.QueueMemoryMiB != 16 ||
 		app.Users[1].Name != "bob" || app.Users[1].PasswordHash != testHash ||
 		strings.Join(*app.BlockedDestinations, " ") != "10.0.0.0/8 192.168.0.0/16 fc00::/7" {
 		t.Errorf("parsed %+v", app)
@@ -93,6 +97,13 @@ func TestCaddyfileGlobalOptionErrors(t *testing.T) {
 		"masque {\n allow_host_access yes\n}",
 		"masque {\n max_sessions 0\n}",
 		"masque {\n max_sessions many\n}",
+		"masque {\n auth_memory 18\n}",
+		"masque {\n auth_memory 1025\n}",
+		"masque {\n auth_memory many\n}",
+		"masque {\n queue_memory 0\n}",
+		"masque {\n queue_memory 1025\n}",
+		"masque {\n max_total_sessions unlimited\n}",
+		"masque {\n max_total_sessions 0\n}",
 		"masque {\n block\n}",
 		"masque {\n user alice\n}",
 		"masque {\n user alice hash extra\n}",
@@ -138,7 +149,15 @@ func TestAppSettings(t *testing.T) {
 		{App{IPv4: "10.89.0.1/30"}, true},
 		{App{}, false},
 		{App{IPv4: "10.89.0.0/24"}, false}, // the network, not an address in it
-		{App{IPv4: "fd89::1/64"}, false},   // wrong family
+		{App{IPv4: "10.89.0.255/24"}, false},
+		{App{IPv4: "10.89.0.1/31"}, false},
+		{App{IPv4: "169.254.89.1/24"}, false},
+		{App{IPv4: "127.0.0.1/24"}, false},
+		{App{IPv4: "224.0.0.1/24"}, false},
+		{App{IPv4: "10.89.0.1/24", IPv6: "fe80::1/64"}, false},
+		{App{IPv4: "10.89.0.1/24", IPv6: "fd89::1/127"}, false},
+		{App{IPv4: "10.89.0.1/24", IPv6: "fd89::1/126"}, true},
+		{App{IPv4: "fd89::1/64"}, false}, // wrong family
 		{App{IPv4: "10.89.0.1/24", IPv6: "10.9.0.1/24"}, false},
 		{App{IPv4: "10.89.0.1/24", IPv6: "::ffff:10.9.0.1/120"}, false},
 		{App{IPv4: "10.89.0.1"}, false},
@@ -147,6 +166,12 @@ func TestAppSettings(t *testing.T) {
 		{App{IPv4: "10.89.0.1/24", IPv6: "fd89::1/64", MTU: 1279}, false},
 		{App{IPv4: "10.89.0.1/24", MTU: 1501}, false},
 		{App{IPv4: "10.89.0.1/24", Interface: "a-very-long-name0"}, false},
+		{App{IPv4: "10.89.0.1/24", Interface: "vpn.0"}, true},
+		{App{IPv4: "10.89.0.1/24", Interface: "."}, false},
+		{App{IPv4: "10.89.0.1/24", Interface: ".."}, false},
+		{App{IPv4: "10.89.0.1/24", Interface: "vpn/0"}, false},
+		{App{IPv4: "10.89.0.1/24", Interface: "vpn:0"}, false},
+		{App{IPv4: "10.89.0.1/24", Interface: "vpn 0"}, false},
 		{App{IPv4: "10.89.0.1/24", Users: []User{{"alice", testHash}, {"alice", testHash}}}, false},
 		{App{IPv4: "10.89.0.1/24", Users: []User{{"bad name", testHash}}}, false},
 		{App{IPv4: "10.89.0.1/24", Users: []User{{"alice", "plain"}}}, false},

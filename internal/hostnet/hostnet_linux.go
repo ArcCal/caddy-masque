@@ -101,7 +101,7 @@ func (n *Network) setup() error {
 		}
 	} else {
 		// Keep the kernel from using the interface for IPv6.
-		_ = SetSysctl("net.ipv6.conf."+iface+".disable_ipv6", "1")
+		_ = SetSysctl("net/ipv6/conf/"+iface+"/disable_ipv6", "1")
 	}
 	if err := run(nil, "ip", "link", "set", "dev", iface, "up"); err != nil {
 		return err
@@ -109,7 +109,7 @@ func (n *Network) setup() error {
 	// The ICMP errors the proxy sends toward the network (RFC 9484 §10.1
 	// "packet too big") come from its own tunnel address; without this the
 	// kernel drops them as martians.
-	if err := SetSysctl("net.ipv4.conf."+iface+".accept_local", "1"); err != nil {
+	if err := SetSysctl("net/ipv4/conf/"+iface+"/accept_local", "1"); err != nil {
 		n.cfg.Log(fmt.Sprintf("%v: senders may not learn about packets too big for the tunnel", err))
 	}
 	if !n.cfg.Manage {
@@ -142,7 +142,7 @@ func (n *Network) installRules() error {
 
 // changeSysctl sets a sysctl and remembers its value for Close.
 func (n *Network) changeSysctl(key, value string) error {
-	old, err := os.ReadFile("/proc/sys/" + strings.ReplaceAll(key, ".", "/"))
+	old, err := os.ReadFile(sysctlPath(key))
 	if err := SetSysctl(key, value); err != nil {
 		return err
 	}
@@ -237,7 +237,7 @@ func (n *Network) keepRouterAdvertisements() {
 		if err != nil || strings.TrimSpace(string(v)) != "1" {
 			continue
 		}
-		if err := n.changeSysctl("net.ipv6.conf."+name+".accept_ra", "2"); err != nil {
+		if err := n.changeSysctl("net/ipv6/conf/"+name+"/accept_ra", "2"); err != nil {
 			n.cfg.Log(fmt.Sprintf("could not keep router advertisements on %s: %v", name, err))
 		} else {
 			n.cfg.Log("set accept_ra=2 on " + name + " so IPv6 forwarding keeps the default route")
@@ -269,9 +269,20 @@ func (n *Network) Close() error {
 	return n.tun.Close()
 }
 
-// SetSysctl writes a sysctl such as "net.ipv4.ip_forward".
+// sysctlPath accepts a conventional dotted key or an explicit slash path.
+// Interface-specific callers use slash paths so dots in Linux interface
+// names remain literal directory characters.
+func sysctlPath(key string) string {
+	if !strings.Contains(key, "/") {
+		key = strings.ReplaceAll(key, ".", "/")
+	}
+	return "/proc/sys/" + key
+}
+
+// SetSysctl writes a sysctl such as "net.ipv4.ip_forward" or
+// "net/ipv4/conf/vpn.0/accept_local".
 func SetSysctl(key, value string) error {
-	path := "/proc/sys/" + strings.ReplaceAll(key, ".", "/")
+	path := sysctlPath(key)
 	if err := os.WriteFile(path, []byte(value), 0); err != nil {
 		return fmt.Errorf("setting %s=%s: %w", key, value, err)
 	}

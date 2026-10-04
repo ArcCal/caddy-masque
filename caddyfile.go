@@ -31,6 +31,9 @@ func init() {
 //	    http3                  on|off
 //	    mtu_probe              on|off
 //	    max_sessions           <n>|unlimited
+//	    auth_memory            <MiB>
+//	    max_total_sessions     <n>
+//	    queue_memory           <MiB>
 //	    user                   <name> <argon2id hash>
 //	}
 func parseGlobalOption(d *caddyfile.Dispenser, existing any) (any, error) {
@@ -109,6 +112,27 @@ func parseGlobalOption(d *caddyfile.Dispenser, existing any) (any, error) {
 					return nil, d.Errf("max_sessions: expected a positive number or unlimited, got %q", s)
 				default:
 					app.MaxSessions = n
+				}
+			}
+		case "auth_memory":
+			var s string
+			if err = single(&s); err == nil {
+				if app.AuthMemoryMiB, err = strconv.Atoi(s); err != nil || app.AuthMemoryMiB < 19 || app.AuthMemoryMiB > 1024 {
+					return nil, d.Errf("auth_memory: expected 19-1024 MiB, got %q", s)
+				}
+			}
+		case "max_total_sessions":
+			var s string
+			if err = single(&s); err == nil {
+				if app.MaxTotalSessions, err = strconv.Atoi(s); err != nil || app.MaxTotalSessions < 1 {
+					return nil, d.Errf("max_total_sessions: expected a positive number, got %q", s)
+				}
+			}
+		case "queue_memory":
+			var s string
+			if err = single(&s); err == nil {
+				if app.QueueMemoryMiB, err = strconv.Atoi(s); err != nil || app.QueueMemoryMiB < 1 || app.QueueMemoryMiB > 1024 {
+					return nil, d.Errf("queue_memory: expected 1-1024 MiB, got %q", s)
 				}
 			}
 		case "allow_host_access":

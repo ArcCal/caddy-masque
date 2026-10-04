@@ -34,7 +34,7 @@ func TestHostNetworkLifecycle(t *testing.T) {
 	}
 	readSysctl := func(key string) string {
 		t.Helper()
-		b, err := os.ReadFile("/proc/sys/" + strings.ReplaceAll(key, ".", "/"))
+		b, err := os.ReadFile(sysctlPath(key))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -42,7 +42,17 @@ func TestHostNetworkLifecycle(t *testing.T) {
 	}
 	keys := []string{"net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"}
 	before := []string{readSysctl(keys[0]), readSysctl(keys[1])}
-	n, err := Open(Config{Interface: "mq-test", IPv4: netip.MustParsePrefix("10.89.0.1/29"), IPv6: netip.MustParsePrefix("fd89::1/64"), MTU: 1400, Manage: true})
+	// Dotted names are valid for both TUN and WAN interfaces. IPv6
+	// forwarding must preserve RA acceptance on a dotted WAN interface.
+	if err := run(nil, "ip", "link", "add", "wan.100", "type", "veth", "peer", "name", "mq-peer"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = run(nil, "ip", "link", "delete", "wan.100") })
+	raKey := "net/ipv6/conf/wan.100/accept_ra"
+	if err := SetSysctl(raKey, "1"); err != nil {
+		t.Fatal(err)
+	}
+	n, err := Open(Config{Interface: "mq.test", IPv4: netip.MustParsePrefix("10.89.0.1/29"), IPv6: netip.MustParsePrefix("fd89::1/64"), MTU: 1400, Manage: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,6 +62,12 @@ func TestHostNetworkLifecycle(t *testing.T) {
 			_ = n.Close()
 		}
 	}()
+	if got := readSysctl("net/ipv4/conf/mq.test/accept_local"); got != "1" {
+		t.Fatalf("dotted TUN does not allow PMTU feedback: accept_local=%s", got)
+	}
+	if got := readSysctl(raKey); got != "2" {
+		t.Fatalf("dotted WAN lost RA acceptance while forwarding: accept_ra=%s", got)
+	}
 	for _, key := range keys {
 		if got := readSysctl(key); got != "1" {
 			t.Fatalf("%s = %s", key, got)
@@ -99,7 +115,7 @@ func TestHostNetworkLifecycle(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("TUN reader blocked after close")
 	}
-	if exec.Command("ip", "link", "show", "dev", "mq-test").Run() == nil {
+	if exec.Command("ip", "link", "show", "dev", "mq.test").Run() == nil {
 		t.Error("TUN device survived close")
 	}
 	if exec.Command("nft", "list", "table", "inet", NFTTable).Run() == nil {
@@ -109,5 +125,8 @@ func TestHostNetworkLifecycle(t *testing.T) {
 		if got := readSysctl(key); got != before[i] {
 			t.Errorf("%s = %s after close, want %s", key, got, before[i])
 		}
+	}
+	if got := readSysctl(raKey); got != "1" {
+		t.Errorf("dotted WAN accept_ra=%s after close, want original 1", got)
 	}
 }

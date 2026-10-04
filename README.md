@@ -100,9 +100,18 @@ for the web pages). It is ordered automatically before `file_server`, `reverse_p
 | `allow_client_to_client` | Let clients reach each other | Not allowed |
 | `allow_host_access` | Let clients reach services on the server itself (ports listening on the tunnel address and the server's public addresses) | Ping only |
 | `max_sessions COUNT` | The most tunnels one user may have at once; `unlimited` for no limit | 8 |
+| `max_total_sessions COUNT` | Total admitted tunnels, including pending address acquisition and closing tunnels; can change on reload | 1024 |
+| `auth_memory MIB` | Aggregate Argon2 working memory (19–1024 MiB); every configured hash must fit; requires restart | 128 MiB |
+| `queue_memory MIB` | Aggregate queued packet payload (1–1024 MiB); packets beyond the budget are dropped; requires restart | 64 MiB |
 | `manage_network off` | Leave forwarding and NAT (sysctl, nftables) alone; manage them yourself | Managed automatically |
 | `http3 off` | Do not take over HTTP/3 (see below); VPN packets then travel inside the stream (DATAGRAM capsules) on every HTTP version | Taken over |
 | `mtu_probe off` | Skip the IPv6 MTU probe (see below). Turn it off only when you know every client connects directly, with no HTTP proxy in between | Probe |
+
+These budgets bound concurrent hashing and retained packet payload, not process RSS. Leave memory for Go GC,
+Caddy, HTTP/QUIC state, in-flight writes and each session's channel/read buffers. A `/24` IPv4 pool also limits
+simultaneous sessions to about 253 clients, regardless of `max_total_sessions`. Measure your topology and login
+load before increasing limits. New authenticated requests receive 429 at the per-user limit or 503 when the
+server cannot admit them. Closing/revoked sessions retain admission until their addresses and queues are released.
 
 Once an HTTP/3 tunnel (QUIC datagrams) with IPv6 is up, the server sends a 1280-byte ICMPv6 Echo Request to the
 client's IPv6 address, to confirm that the tunnel can carry IPv6's minimum MTU; with no reply within 10 seconds it closes

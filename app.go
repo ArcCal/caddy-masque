@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -77,6 +78,15 @@ type App struct {
 	// (DefaultMaxSessions), -1 no limit. A user who uses up the client
 	// address pool would lock the others out.
 	MaxSessions int `json:"max_sessions,omitempty"`
+	// Aggregate Argon2 working memory in MiB. Zero uses 128 MiB; changing
+	// the budget requires a restart so in-flight reservations stay valid.
+	AuthMemoryMiB int `json:"auth_memory_mib,omitempty"`
+	// Total admitted sessions, including address acquisition and closing
+	// sessions. Zero uses 1024; this limit can change on reload.
+	MaxTotalSessions int `json:"max_total_sessions,omitempty"`
+	// Aggregate queued packet payload in MiB, excluding channel and protocol
+	// buffers. Zero uses 64 MiB; changing this budget requires a restart.
+	QueueMemoryMiB int `json:"queue_memory_mib,omitempty"`
 	// Serve HTTP/3 with datagrams for the HTTPS servers (default true). When
 	// off, Caddy keeps its own HTTP/3, which does not announce HTTP
 	// Datagrams, so CONNECT-IP over it carries packets in DATAGRAM capsules
@@ -161,7 +171,7 @@ func (a *App) Provision(ctx caddy.Context) error {
 	if a.core.cfg != a.cfg {
 		_, _ = cores.Delete(a.coreKey)
 		a.released = true
-		return errors.New("masque: the tunnel settings (interface, ipv4, ipv6, mtu, manage_network, allow_host_access) changed; restart Caddy to apply them")
+		return errors.New("masque: the core settings (interface, ipv4, ipv6, mtu, manage_network, allow_host_access, auth_memory, queue_memory) changed; restart Caddy to apply them")
 	}
 	return nil
 }
@@ -173,6 +183,9 @@ func (a *App) parse() error {
 	}
 	if len(a.cfg.iface) > 15 {
 		return fmt.Errorf("masque: interface name %q is longer than 15 characters", a.cfg.iface)
+	}
+	if a.cfg.iface == "." || a.cfg.iface == ".." || strings.ContainsAny(a.cfg.iface, "/:\x00 \t\n\r\v\f") {
+		return fmt.Errorf("masque: invalid Linux interface name %q", a.cfg.iface)
 	}
 	if a.IPv4 == "" {
 		return errors.New("masque: ipv4 is required, for example 10.89.0.1/24")
@@ -199,9 +212,26 @@ func (a *App) parse() error {
 	}
 	a.cfg.manage = a.ManageNetwork == nil || *a.ManageNetwork
 	a.cfg.hostAccess = a.AllowHostAccess
+	a.cfg.authMemoryKiB = auth.DefaultMemoryBudgetKiB
+	if a.AuthMemoryMiB != 0 {
+		if a.AuthMemoryMiB < int(auth.MinMemoryBudgetKiB>>10) || a.AuthMemoryMiB > 1024 {
+			return errors.New("masque: auth_memory must be between 19 and 1024 MiB")
+		}
+		a.cfg.authMemoryKiB = uint32(a.AuthMemoryMiB) << 10
+	}
 
 	if a.MaxSessions < -1 {
 		return fmt.Errorf("masque: max_sessions must be 0 (default), -1 (no limit) or positive, got %d", a.MaxSessions)
+	}
+	if a.MaxTotalSessions < 0 {
+		return errors.New("masque: max_total_sessions must be positive or 0 (default)")
+	}
+	a.cfg.queueMemoryBytes = DefaultQueueMemoryBytes
+	if a.QueueMemoryMiB != 0 {
+		if a.QueueMemoryMiB < 1 || a.QueueMemoryMiB > 1024 {
+			return errors.New("masque: queue_memory must be between 1 and 1024 MiB")
+		}
+		a.cfg.queueMemoryBytes = int64(a.QueueMemoryMiB) << 20
 	}
 	a.users = map[string]string{}
 	for _, u := range a.Users {
@@ -211,7 +241,7 @@ func (a *App) parse() error {
 		if _, dup := a.users[u.Name]; dup {
 			return fmt.Errorf("masque: user %q is listed twice", u.Name)
 		}
-		if err := auth.ValidateHash(u.PasswordHash); err != nil {
+		if err := auth.ValidateHashWithMemory(u.PasswordHash, a.cfg.authMemoryKiB); err != nil {
 			return fmt.Errorf("masque: user %q: %w", u.Name, err)
 		}
 		a.users[u.Name] = u.PasswordHash
@@ -263,8 +293,21 @@ func hostPrefix(s string, v6 bool) (netip.Prefix, error) {
 	if p.Addr().Is6() != v6 || p.Addr().Is4In6() {
 		return netip.Prefix{}, fmt.Errorf("masque: %q is not an IPv%s prefix", s, map[bool]string{false: "4", true: "6"}[v6])
 	}
+	if !p.Addr().IsGlobalUnicast() {
+		return netip.Prefix{}, fmt.Errorf("masque: %q must use a unicast tunnel address (private/ULA addresses are supported)", s)
+	}
+	maxBits := 30
+	if v6 {
+		maxBits = 126
+	}
+	if p.Bits() > maxBits {
+		return netip.Prefix{}, fmt.Errorf("masque: %q has no usable client pool; prefix length must be at most /%d", s, maxBits)
+	}
 	if p.Addr() == p.Masked().Addr() {
 		return netip.Prefix{}, fmt.Errorf("masque: %q must name the server's own address in the prefix, such as 10.89.0.1/24", s)
+	}
+	if !v6 && !p.Contains(p.Addr().Next()) {
+		return netip.Prefix{}, fmt.Errorf("masque: %q uses the IPv4 broadcast address", s)
 	}
 	return p, nil
 }

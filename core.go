@@ -31,8 +31,34 @@ const maxQueueDelay = 200 * time.Millisecond
 
 // queued is a packet toward the client, with the time it was queued.
 type queued struct {
-	pkt []byte
-	at  time.Time
+	pkt    []byte
+	at     time.Time
+	budget *packetBudget
+}
+
+// packetBudget bounds payload retained in all session queues combined.
+// In-flight writes and the Go heap need additional headroom.
+type packetBudget struct {
+	limit int64
+	used  atomic.Int64
+}
+
+func (b *packetBudget) reserve(n int64) bool {
+	for {
+		used := b.used.Load()
+		if n > b.limit-used {
+			return false
+		}
+		if b.used.CompareAndSwap(used, used+n) {
+			return true
+		}
+	}
+}
+
+func (q queued) release() {
+	if q.budget != nil {
+		q.budget.used.Add(-int64(len(q.pkt)))
+	}
 }
 
 // Failed logins from one client address per minute before its requests with
@@ -43,6 +69,11 @@ var loginFailures = 10
 // unless configured: a few devices sharing one user, and the old session of
 // a device that reconnects before the server has noticed its loss.
 const DefaultMaxSessions = 8
+
+const (
+	DefaultMaxTotalSessions = 1024
+	DefaultQueueMemoryBytes = 64 << 20
+)
 
 // A user who reconnects within this time gets the previous addresses back
 // if they are still free, so connections through the tunnel survive a brief
@@ -58,7 +89,9 @@ type tunnelConfig struct {
 	mtu    int
 	manage bool
 	// Clients may reach the host's own services.
-	hostAccess bool
+	hostAccess       bool
+	authMemoryKiB    uint32
+	queueMemoryBytes int64
 }
 
 // logLimit lets through at most max events a minute and counts the rest,
@@ -127,17 +160,23 @@ type core struct {
 	// Lock order: sessMu, then poolMu.
 	sessMu   sync.RWMutex
 	sessions map[netip.Addr]*sessionHandle
-	poolMu   sync.Mutex
-	pool     *pool.Pool
-	recent   map[string]recentLease // by user name, under poolMu
-	nextID   atomic.Uint64
+	// Counts include pending address acquisition and closing sessions. A
+	// revoked session keeps its reservation until its lease is released.
+	sessionCounts    map[string]int
+	reservedSessions int64
+	queueBudget      packetBudget
+	poolMu           sync.Mutex
+	pool             *pool.Pool
+	recent           map[string]recentLease // by user name, under poolMu
+	nextID           atomic.Uint64
 	// Session handlers that have not returned.
 	running  atomic.Int64
 	counters counters
 	// Clients that keep sending wrong credentials.
 	loginLimit *auth.FailureLimiter
 	// Sessions one user may have at a time (0: no limit).
-	maxSessions atomic.Int64
+	maxSessions      atomic.Int64
+	maxTotalSessions atomic.Int64
 	// Logging of failed logins and device errors.
 	authLog, deviceLog logLimit
 	// Deletes connection tracking entries (replaced in tests).
@@ -173,8 +212,47 @@ type sessionHandle struct {
 	revoked  chan struct{}
 	why      string // set before revoked closes
 	// Signalled when the allowed destinations change.
-	rescope chan struct{}
-	once    sync.Once
+	rescope     chan struct{}
+	once        sync.Once
+	queueMu     sync.Mutex
+	queueClosed bool
+}
+
+// enqueue checks capacity before copying, and serializes with closeQueue
+// so releasing a lease cannot leave a packet reservation behind.
+func (h *sessionHandle) enqueue(c *core, pkt []byte) {
+	h.queueMu.Lock()
+	defer h.queueMu.Unlock()
+	if h.queueClosed {
+		return
+	}
+	n := int64(1 + len(pkt))
+	if len(h.toClient) == cap(h.toClient) || !c.queueBudget.reserve(n) {
+		c.counters.dropped.Add(1)
+		return
+	}
+	p := make([]byte, n) // context ID 0, then the packet
+	copy(p[1:], pkt)
+	select {
+	case h.toClient <- queued{pkt: p, at: time.Now(), budget: &c.queueBudget}:
+	default:
+		c.queueBudget.used.Add(-n)
+		c.counters.dropped.Add(1)
+	}
+}
+
+func (h *sessionHandle) closeQueue() {
+	h.queueMu.Lock()
+	defer h.queueMu.Unlock()
+	h.queueClosed = true
+	for {
+		select {
+		case q := <-h.toClient:
+			q.release()
+		default:
+			return
+		}
+	}
 }
 
 func (h *sessionHandle) revoke(why string) {
@@ -185,20 +263,33 @@ func (h *sessionHandle) revoke(why string) {
 }
 
 func newCore(cfg tunnelConfig, log *zap.Logger) (*core, error) {
-	c := &core{
-		cfg:        cfg,
-		log:        log,
-		auth:       auth.New(),
-		gw4:        cfg.ipv4.Addr(),
-		sessions:   map[netip.Addr]*sessionHandle{},
-		pool:       pool.New(cfg.ipv4, cfg.ipv6),
-		recent:     map[string]recentLease{},
-		forget:     forgetConntrack,
-		loginLimit: auth.NewFailureLimiter(loginFailures, time.Minute),
-		authLog:    logLimit{max: 60},
-		deviceLog:  logLimit{max: 1},
-		done:       make(chan struct{}),
+	if cfg.authMemoryKiB == 0 {
+		cfg.authMemoryKiB = auth.DefaultMemoryBudgetKiB
 	}
+	if cfg.queueMemoryBytes == 0 {
+		cfg.queueMemoryBytes = DefaultQueueMemoryBytes
+	}
+	a, err := auth.NewWithMemory(cfg.authMemoryKiB)
+	if err != nil {
+		return nil, err
+	}
+	c := &core{
+		cfg:           cfg,
+		log:           log,
+		auth:          a,
+		gw4:           cfg.ipv4.Addr(),
+		sessions:      map[netip.Addr]*sessionHandle{},
+		sessionCounts: map[string]int{},
+		queueBudget:   packetBudget{limit: cfg.queueMemoryBytes},
+		pool:          pool.New(cfg.ipv4, cfg.ipv6),
+		recent:        map[string]recentLease{},
+		forget:        forgetConntrack,
+		loginLimit:    auth.NewFailureLimiter(loginFailures, time.Minute),
+		authLog:       logLimit{max: 60},
+		deviceLog:     logLimit{max: 1},
+		done:          make(chan struct{}),
+	}
+	c.maxTotalSessions.Store(DefaultMaxTotalSessions)
 	if cfg.ipv6.IsValid() {
 		c.gw6 = cfg.ipv6.Addr()
 	}
@@ -317,12 +408,7 @@ func (c *core) readNetwork() {
 		if s == nil {
 			continue
 		}
-		pkt := make([]byte, 1+h.TotalLen) // context ID 0, then the packet
-		copy(pkt[1:], buf[:h.TotalLen])
-		select {
-		case s.toClient <- queued{pkt: pkt, at: time.Now()}:
-		default: // queue full: dropped, as a network would
-		}
+		s.enqueue(c, buf[:h.TotalLen])
 	}
 }
 
@@ -381,6 +467,11 @@ func (c *core) apply(a *App) {
 	c.setAllowed(a.allowed)
 	c.noMTUProbe.Store(a.MTUProbe != nil && !*a.MTUProbe)
 	c.maxSessions.Store(int64(a.sessionLimit()))
+	total := a.MaxTotalSessions
+	if total == 0 {
+		total = DefaultMaxTotalSessions
+	}
+	c.maxTotalSessions.Store(int64(total))
 	c.setUsers(a.users)
 }
 
@@ -432,6 +523,7 @@ type lease struct {
 	core   *core
 	handle *sessionHandle
 	addrs  []netip.Addr
+	once   sync.Once
 }
 
 // acquire reserves addresses of the wanted families for a user: the user's
@@ -440,6 +532,26 @@ type lease struct {
 // entries are deleted. nil when no address is free, deleting fails, or the
 // user is no longer current.
 func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease {
+	if !v4 && !v6 {
+		return nil
+	}
+	c.sessMu.Lock()
+	if ctx.Err() != nil || c.ctx.Err() != nil || !c.auth.IsCurrent(user) ||
+		c.atSessionLimit(user) || c.reservedSessions >= c.maxTotalSessions.Load() {
+		c.sessMu.Unlock()
+		return nil
+	}
+	c.sessionCounts[user.Name]++
+	c.reservedSessions++
+	c.sessMu.Unlock()
+	registered := false
+	defer func() {
+		if !registered {
+			c.sessMu.Lock()
+			c.releaseAdmission(user.Name)
+			c.sessMu.Unlock()
+		}
+	}()
 	var addrs []netip.Addr
 	var used []netip.Prefix
 	c.poolMu.Lock()
@@ -511,7 +623,7 @@ func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease 
 	h := &sessionHandle{id: c.nextID.Add(1), user: user, toClient: make(chan queued, queueLen), revoked: make(chan struct{}),
 		rescope: make(chan struct{}, 1)}
 	c.sessMu.Lock()
-	if !c.auth.IsCurrent(user) || c.atSessionLimit(user) {
+	if ctx.Err() != nil || c.ctx.Err() != nil || !c.auth.IsCurrent(user) {
 		c.sessMu.Unlock()
 		releaseAll()
 		return nil
@@ -520,6 +632,7 @@ func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease 
 		c.sessions[a] = h
 	}
 	c.sessMu.Unlock()
+	registered = true
 	return &lease{core: c, handle: h, addrs: addrs}
 }
 
@@ -530,13 +643,16 @@ func (c *core) atSessionLimit(user auth.User) bool {
 	if limit <= 0 {
 		return false
 	}
-	ids := map[uint64]bool{}
-	for _, s := range c.sessions {
-		if s.user.Name == user.Name {
-			ids[s.id] = true
-		}
+	return int64(c.sessionCounts[user.Name]) >= limit
+}
+
+// sessMu is held; called once for every successful admission.
+func (c *core) releaseAdmission(user string) {
+	c.reservedSessions--
+	c.sessionCounts[user]--
+	if c.sessionCounts[user] == 0 {
+		delete(c.sessionCounts, user)
 	}
-	return int64(len(ids)) >= limit
 }
 
 // tooManySessions is the same check for a request that was refused.
@@ -565,7 +681,12 @@ func (l *lease) hasIPv6() bool {
 }
 
 func (l *lease) release() {
+	l.once.Do(l.releaseOnce)
+}
+
+func (l *lease) releaseOnce() {
 	c := l.core
+	l.handle.closeQueue()
 	c.sessMu.Lock()
 	for _, a := range l.addrs {
 		if s := c.sessions[a]; s != nil && s.id == l.handle.id {
@@ -582,4 +703,8 @@ func (l *lease) release() {
 	}
 	c.recent[l.handle.user.Name] = recentLease{addrs: l.addrs, at: time.Now(), hash: l.handle.user.Hash}
 	c.poolMu.Unlock()
+	// Keep admission reserved until both routing and addresses are released.
+	c.sessMu.Lock()
+	c.releaseAdmission(l.handle.user.Name)
+	c.sessMu.Unlock()
 }

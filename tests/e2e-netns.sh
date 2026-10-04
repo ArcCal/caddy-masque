@@ -34,7 +34,18 @@ if [ -z "$NETSIM" ] && command -v go >/dev/null 2>&1; then
     NETSIM=$WORK/netsim
     (cd "$ROOT" && go build -o "$NETSIM" ./tests/netsim) || NETSIM=""
 fi
-NS_I=mq-inet NS_S=mq-srv NS_C=mq-cli NS_C2=mq-cli2 NS_L=mq-lan NS_L2=mq-lan2
+NS_SUFFIX=${WORK##*.}
+NS_I=mq-inet-$NS_SUFFIX NS_S=mq-srv-$NS_SUFFIX NS_C=mq-cli-$NS_SUFFIX NS_C2=mq-cli2-$NS_SUFFIX NS_L=mq-lan-$NS_SUFFIX NS_L2=mq-lan2-$NS_SUFFIX
+CREATED_NS=()
+# Refuse an existing test topology before installing the cleanup trap: the
+# script must never delete namespaces or resolver files it did not create.
+existing_namespaces=$(ip netns list) || { echo "cannot inspect network namespaces"; exit 1; }
+for ns in $NS_I $NS_S $NS_C $NS_C2 $NS_L $NS_L2; do
+    if awk '{print $1}' <<<"$existing_namespaces" | grep -Fxq "$ns" || [ -e "/etc/netns/$ns" ]; then
+        echo "refusing existing namespace or resolver directory: $ns"
+        exit 1
+    fi
+done
 TARGET=192.0.2.80 TARGET6=2001:db8:80::80
 SERVER=198.51.100.2 SERVER6=2001:db8:5::2
 CLIENT=203.0.113.2 CLIENT6=2001:db8:c::2
@@ -73,11 +84,11 @@ cleanup() {
     [ -n "${NETSIM_PID:-}" ] && kill "$NETSIM_PID" 2>/dev/null
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     sleep 0.5
-    for ns in $NS_L $NS_L2 $NS_C $NS_C2 $NS_S $NS_I; do
+    for ns in "${CREATED_NS[@]}"; do
         ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null
         ip netns del "$ns" 2>/dev/null
+        rm -rf "/etc/netns/$ns"
     done
-    rm -rf "/etc/netns/$NS_L" "/etc/netns/$NS_L2" "/etc/netns/$NS_S"
     if [ "$FAIL" -ne 0 ]; then
         # The logs explain the failures; show them where only the output
         # can be seen, as on a CI server.
@@ -99,14 +110,19 @@ seen_as6() { in_ns $NS_C curl --noproxy "*" -s --max-time "${2:-3}" "http://[$TA
 
 echo "== topology"
 for ns in $NS_I $NS_S $NS_C $NS_C2 $NS_L $NS_L2; do
-    ip netns del "$ns" 2>/dev/null
-    ip netns add "$ns"
+    ip netns add "$ns" || { echo "creating namespace $ns failed"; exit 1; }
+    CREATED_NS+=("$ns")
     in_ns "$ns" ip link set lo up
 done
 link() { # link <ns-a> <if-a> <addr-a> <ns-b> <if-b> <addr-b>
-    ip link add "$2" type veth peer name "$5"
-    ip link set "$2" netns "$1"
-    ip link set "$5" netns "$4"
+    # Temporary host names are unique; otherwise a failed add could move
+    # an unrelated pre-existing host interface into a test namespace.
+    local tmp_a=m${NS_SUFFIX}a tmp_b=m${NS_SUFFIX}b
+    ip link add "$tmp_a" type veth peer name "$tmp_b" || exit 1
+    ip link set "$tmp_a" netns "$1" || exit 1
+    ip link set "$tmp_b" netns "$4" || exit 1
+    in_ns "$1" ip link set "$tmp_a" name "$2" || exit 1
+    in_ns "$4" ip link set "$tmp_b" name "$5" || exit 1
     in_ns "$1" ip addr add "$3" dev "$2"
     in_ns "$4" ip addr add "$6" dev "$5"
     in_ns "$1" ip link set "$2" up
@@ -121,9 +137,11 @@ in_ns $NS_I ip addr del 203.0.113.1/24 dev i-cli
 in_ns $NS_I ip link set i-cli master br-cli
 in_ns $NS_I ip addr add 203.0.113.1/24 dev br-cli
 in_ns $NS_I ip link set br-cli up
-ip link add i-lan2 type veth peer name l2-eth
-ip link set i-lan2 netns $NS_I
-ip link set l2-eth netns $NS_L2
+ip link add m${NS_SUFFIX}a type veth peer name m${NS_SUFFIX}b || exit 1
+ip link set m${NS_SUFFIX}a netns $NS_I || exit 1
+ip link set m${NS_SUFFIX}b netns $NS_L2 || exit 1
+in_ns $NS_I ip link set m${NS_SUFFIX}a name i-lan2 || exit 1
+in_ns $NS_L2 ip link set m${NS_SUFFIX}b name l2-eth || exit 1
 in_ns $NS_I ip link set i-lan2 master br-cli
 in_ns $NS_I ip link set i-lan2 up
 in_ns $NS_L2 ip addr add 203.0.113.9/24 dev l2-eth
