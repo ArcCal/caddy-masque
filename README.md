@@ -15,7 +15,7 @@ The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as
 
 Linux x86_64 and arm64 only (needs root: it creates a TUN device and sets up forwarding and NAT).
 
-Current version 1.0. The differences between versions are in [CHANGELOG.md](CHANGELOG.md).
+Current version 1.1. The differences between versions are in [CHANGELOG.md](CHANGELOG.md).
 Current review results and native-validation requirements are in [the October 4 production review](docs/review-2026-10-04-production.md).
 
 ## One-step install

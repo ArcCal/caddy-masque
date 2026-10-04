@@ -2,7 +2,9 @@
 
 Each version is tagged with its number; CI attaches Caddy builds to its release on GitHub.
 
-## Unreleased
+## 1.1
+
+Tag: **`1.1`**
 
 - Reachable dependency vulnerability scanning is now part of the required release test job.
 
