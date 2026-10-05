@@ -16,10 +16,13 @@
 #   CADDY       the Caddy binary with this module (default: built here)
 #   CLIENT_BIN  masque-vpn's masque-client (default: ../masque-vpn/target/debug)
 #   NETSIM      the slow link of tests/netsim (default: built here with go)
+#   REQUIRE_ALL_TESTS  1 makes missing prerequisites or skipped checks fail
 set -uo pipefail
 
+REQUIRE_ALL_TESTS=${REQUIRE_ALL_TESTS:-0}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d /tmp/caddy-masque-e2e.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
 CADDY=${CADDY:-}
 if [ -z "$CADDY" ]; then
     CADDY=$WORK/caddy
@@ -42,6 +45,12 @@ PASS=0 FAIL=0 SKIP=0
 SERVER_PID="" CLIENT_PID=""
 HAVE_V6=0
 [ -d /proc/sys/net/ipv6 ] && HAVE_V6=1
+
+if [ "$REQUIRE_ALL_TESTS" = 1 ]; then
+    [ -x "$CADDY" ] || { echo "required Caddy binary is not executable: $CADDY"; exit 1; }
+    [ -x "$NETSIM" ] || { echo "required adverse-network tests need an executable NETSIM"; exit 1; }
+    [ "$HAVE_V6" = 1 ] || { echo "required IPv6 interoperability tests cannot run on this host"; exit 1; }
+fi
 
 
 in_ns() { local ns=$1; shift; ip netns exec "$ns" "$@"; }
@@ -1184,5 +1193,8 @@ stop_client
 stop_server
 
 echo
+if [ "$REQUIRE_ALL_TESTS" = 1 ] && [ "$SKIP" -ne 0 ]; then
+    bad "required interoperability checks were skipped"
+fi
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
