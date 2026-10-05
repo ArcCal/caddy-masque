@@ -108,11 +108,11 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -o caddy ./cmd/caddy
           CGO_ENABLED=0 go build -o netsim ./tests/netsim
           cargo build --locked --release --manifest-path masque-vpn/Cargo.toml --bin masque-client
-      - name: masque-client against Caddy in process, IPv4 and IPv6 over every transport
+      - name: masque-client against Caddy in process, IPv4 and IPv6 over every transport and datagram mode
         run: |
           set -euo pipefail
           MASQUE_CLIENT="$PWD/masque-vpn/target/release/masque-client" go test -count=1 -run '^TestInteropMasqueClient$' -v . | tee "$RUNNER_TEMP/client-interop.log"
-          for transport in h3 h2 http1.1; do
+          for transport in h3 h2 http1.1 h3-capsules; do
             grep -q "^    --- PASS: TestInteropMasqueClient/$transport " "$RUNNER_TEMP/client-interop.log"
           done
           ! grep -q -- '--- SKIP' "$RUNNER_TEMP/client-interop.log"
