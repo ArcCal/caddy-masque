@@ -4,11 +4,13 @@ package masque
 // client that the IETF Masque app bundles, run as a separate process. In
 // SOCKS mode its user-space IP stack needs no TUN device and no kernel
 // IPv6, so IPv4 and IPv6 through the tunnel are checked on any host, over
-// HTTP/3, HTTP/2 and HTTP/1.1. MASQUE_CLIENT names the binary; CI sets it
-// in the end-to-end job, which builds the client.
+// HTTP/3 (with QUIC datagrams, and with DATAGRAM capsules), HTTP/2 and
+// HTTP/1.1. MASQUE_CLIENT names the binary; CI sets it in the end-to-end
+// job, which builds the client.
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -29,6 +31,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 
 	"github.com/ArcCal/caddy-masque/internal/ip"
 )
@@ -244,8 +249,35 @@ func TestInteropMasqueClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	v4, v6 := netip.MustParseAddr("198.51.100.7"), netip.MustParseAddr("2001:db8::7")
-	for _, transport := range []string{"h3", "h2", "http/1.1"} {
-		t.Run(strings.ReplaceAll(transport, "/", ""), func(t *testing.T) {
+	for _, c := range []struct{ name, transport string }{
+		{"h3", "h3"}, {"h2", "h2"}, {"http1.1", "http/1.1"},
+		// With `http3 off`, Caddy's own HTTP/3 server, which announces no
+		// HTTP Datagrams: packets travel in DATAGRAM capsules (RFC 9297
+		// §3.5) on the HTTP/3 stream.
+		{"h3-capsules", "h3"},
+	} {
+		transport := c.transport
+		t.Run(c.name, func(t *testing.T) {
+			if c.name == "h3-capsules" {
+				cfg["http3"] = false
+				if err := e.load(cfg); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				conn, err := quic.DialAddr(ctx, fmt.Sprintf("127.0.0.1:%d", e.port),
+					http3.ConfigureTLSConfig(e.tlsConfig("h3")), &quic.Config{EnableDatagrams: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				cc := (&http3.Transport{EnableDatagrams: true}).NewClientConn(conn)
+				<-cc.ReceivedSettings()
+				datagrams := cc.Settings().EnableDatagrams
+				_ = conn.CloseWithError(0, "")
+				if datagrams {
+					t.Fatal("Caddy's own HTTP/3 announces HTTP Datagrams")
+				}
+			}
 			socks := fmt.Sprintf("127.0.0.1:%d", freePort(t))
 			config := filepath.Join(dir, "client.toml")
 			if err := os.WriteFile(config, []byte(fmt.Sprintf(`uri_template = "https://127.0.0.1:%d/.well-known/masque/ip/{target}/{ipproto}/"
