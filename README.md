@@ -52,17 +52,18 @@ go build -o caddy ./cmd/caddy
 ```
 
 The resulting `caddy` includes all standard Caddy modules and MASQUE. Builds use
-Go 1.26 and the pinned HTTP/2 reset API patch in `third_party/xnet`. From this
-checkout, xcaddy uses the same dependency:
+Go 1.26 and the pinned protocol patches in `third_party/xnet` and
+`third_party/quic-go`. From this checkout, xcaddy uses both dependencies:
 
 ```sh
 xcaddy build v2.11.6 --with github.com/ArcCal/caddy-masque=. \
-  --replace golang.org/x/net=./third_party/xnet
+  --replace golang.org/x/net=./third_party/xnet \
+  --replace github.com/quic-go/quic-go=./third_party/quic-go
 ```
 
 Go does not inherit dependency replacements. Custom main modules must also
-replace `golang.org/x/net` with this tree; omitting it fails the build. See
-[the patch and its verification](third_party/README.md).
+replace `golang.org/x/net` and `github.com/quic-go/quic-go` with these trees;
+omitting either fails the build. See [the patches and their verification](third_party/README.md).
 
 ## Configuration
 
@@ -241,7 +242,7 @@ example.com, *.example.com, :443 {
 
 - **Build with the DNS plugin.** `dns cloudflare` needs the [caddy-dns/cloudflare](https://github.com/caddy-dns/cloudflare)
   plugin, which `./cmd/caddy` and the one-step install leave out:
-  `xcaddy build v2.11.6 --with github.com/ArcCal/caddy-masque=. --with github.com/caddy-dns/cloudflare --replace golang.org/x/net=./third_party/xnet` (from this checkout), then install the result
+  `xcaddy build v2.11.6 --with github.com/ArcCal/caddy-masque=. --with github.com/caddy-dns/cloudflare --replace golang.org/x/net=./third_party/xnet --replace github.com/quic-go/quic-go=./third_party/quic-go` (from this checkout), then install the result
   as `/usr/local/bin/caddy`. Running `install-server.sh` again replaces it with a build without the plugin, and Caddy
   then fails to load this Caddyfile.
 - **The API token** is a Cloudflare token with the "Edit zone DNS" permission for the domain. Put it alone in
@@ -329,11 +330,13 @@ Known limitations:
   HTTP/3, they just are not advertised.
 - The HTTP/3 the VPN takes over does not accept 0-RTT (replay risk), and does not apply Caddy's `packet_conn_wrappers`
   (such as the PROXY protocol over UDP).
-- An HTTP Datagram on an HTTP/3 request that defines none (a GET for the website, say) should abort that request with
-  H3_DATAGRAM_ERROR (RFC 9297 §2); here it is dropped instead and the request carries on. quic-go offers handlers no
-  way to watch a request's datagrams without taking over its stream. At most 32 such datagrams per request are held
-  until it ends, so this costs no unbounded memory. Malformed datagrams (too short, or a Quarter Stream ID above
-  2⁶⁰−1) do close the connection with H3_DATAGRAM_ERROR, as RFC 9297 §2.1 requires.
+
+An HTTP Datagram on an ordinary HTTP/3 GET, POST or classic CONNECT request aborts that request with
+H3_DATAGRAM_ERROR (0x33), as RFC 9297 §2 requires, including sites without the `masque` directive. The pinned
+quic-go patch rejects those datagrams without taking over the request stream; ordinary request bodies, response
+status codes and trailers retain their normal behavior. Extended CONNECT remains under its handler's control,
+including optimistic CONNECT-IP datagrams. Malformed datagrams (too short, or a Quarter Stream ID above 2⁶⁰−1)
+close the connection with H3_DATAGRAM_ERROR, as RFC 9297 §2.1 requires.
 
 HTTP/2 malformed requests and capsules use PROTOCOL_ERROR as required by
 RFC 9113 §8.1.1 and RFC 9297 §3.3. The pinned dependency patch supplies the
@@ -362,7 +365,8 @@ checksums (300 MB download and 100 MB upload over HTTP/3, 100 MB / 50 MB each ov
 
 For release validation, set `CLIENT_BIN` to `masque-vpn/target/release/masque-client` built with
 `cargo build --locked --release`. Build `tests/netsim` with Go and pass its path as `NETSIM` explicitly, including
-when using sudo. CI uses this configuration so optimized-client regressions and adverse-network checks are exercised.
+when using sudo. Set `REQUIRE_ALL_TESTS=1` to make missing IPv6 or simulator support and any skipped checks fail.
+CI uses this strict configuration so optimized-client regressions and adverse-network checks are exercised.
 
 ### Behaviour on bad networks
 
@@ -396,9 +400,12 @@ dependency and Actions updates. Publishing a GitHub Release builds Caddy for Lin
 program's architecture and the archives' checksums, and attaches the archives with their SHA-256 files once every test
 has passed (Actions → ci → Run workflow with a release's tag does the same for an existing release); while the
 repository is public they also carry build provenance attestations
-(`gh attestation verify FILE --repo ArcCal/caddy-masque`), which GitHub does not offer to private repositories. When the
-repository has `MASQUE_VPN_TOKEN` set (a token that can read masque-vpn), the end-to-end tests with masque-client run
-too, on both architectures; without it they are skipped with a warning.
+(`gh attestation verify FILE --repo ArcCal/caddy-masque`), which GitHub does not offer to private repositories. The
+end-to-end tests with masque-client must pass on both native architectures before downloadable builds or release
+uploads are produced. `MASQUE_VPN_TOKEN` must read masque-vpn; missing access fails the required job. Fork pull requests
+cannot use repository secrets, so a maintainer must validate their changes from a trusted repository branch.
+The manual Cloudflare build reuses these validation gates and also runs strict interoperability tests against its
+actual Caddy binary before uploading an artifact.
 
 ## License
 
