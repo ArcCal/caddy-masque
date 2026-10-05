@@ -1,6 +1,22 @@
 # Changelog
 
-Each version is tagged with its number; CI attaches Caddy builds to its release on GitHub.
+Each version is tagged with its number; CI attaches Caddy builds to its release on GitHub after required validation passes.
+
+## 1.2.0
+
+Tag: **`v1.2.0`**
+
+- **HTTP/3 Datagrams require defined request semantics.** On the module's HTTP/3 server, Datagrams on ordinary requests and unsupported extended-CONNECT tokens abort the request with H3_DATAGRAM_ERROR (0x33), as RFC 9297 requires, including on sites without the `masque` directive. Malformed HTTP Datagram framing closes the connection with that error. Recognized CONNECT-IP requests retain permitted optimistic Datagrams, including authentication refusals.
+- **Ordinary HTTP/3 website behavior is preserved.** The pinned quic-go patch rejects unsupported Datagrams without taking over the request stream or changing request bodies, response status codes or trailers. Custom builds must include both the quic-go and x/net replacements in [third_party/README.md](third_party/README.md).
+- **HTTP/1.0 ignores Upgrade.** Even requests with valid CONNECT-IP credentials follow the ordinary site's routes, as RFC 9110 §7.8 requires. HTTP/1.1 Upgrade tunnels remain supported.
+- **Open tunnels no longer prevent graceful process exit after a reload.** Shutdown ends retained HTTP/2 tunnels, including when the replacement configuration removes the MASQUE handler or all current HTTP servers, and HTTP/3 capsule tunnels with `http3 off`, before Caddy waits for HTTP shutdown. Successful reloads that retain the user and its permitted routes continue to preserve active tunnels.
+- Shutdown rejects new and delayed session acquisitions, and waits for an in-progress host-network repair before closing the TUN device and removing forwarding/NAT state.
+- Changing the TUN interface now enforces the documented restart requirement instead of opening a second network with the same nftables table. A rejected interface-change reload preserves the original tunnel; the new interface can be used after a genuine stop and restart.
+- Removed verified unused internal fields and helpers; compatibility paths and supported transports are retained.
+- **Missing interoperability validation now blocks artifacts and release uploads.** Unlike the 1.1 behavior recorded below, missing `MASQUE_VPN_TOKEN` access fails the required job. Unit/race, protocol and strict optimized-client end-to-end tests must pass on native Linux x86_64 and arm64. End-to-end validation requires a positive passing count with zero failures and zero skips; fork pull requests need validation from a trusted repository branch.
+- The manual Cloudflare variant reuses the required gates, scans its actual custom build for reachable vulnerabilities, and runs strict interoperability tests against that binary on the selected native architecture before uploading an artifact.
+
+HTTP/3, HTTP/2 and HTTP/1.1 CONNECT-IP, existing client configurations and interchangeable password hashes remain supported. Linux x86_64 and arm64 remain the release platforms; native validation and deployment-specific certificate, DNS, firewall, forwarding and MTU checks are still required.
 
 ## 1.1
 
