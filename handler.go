@@ -106,6 +106,11 @@ func connectIPRequest(r *http.Request) (request, bool) {
 	case 2:
 		return request{transport: "HTTP/2", wellFormed: true}, r.Method == http.MethodConnect && r.Header.Get(":protocol") == connectIP
 	default:
+		// CONNECT-IP uses Upgrade only with HTTP/1.1 (RFC 9484 §4.2).
+		// An HTTP/1.0 Upgrade field must be ignored (RFC 9110 §7.8).
+		if r.ProtoMajor != 1 || r.ProtoMinor != 1 {
+			return request{}, false
+		}
 		// RFC 9484 §4.2: GET with "Connection: Upgrade" and "Upgrade:
 		// connect-ip". Any request to upgrade to connect-ip is one; the
 		// others are malformed.

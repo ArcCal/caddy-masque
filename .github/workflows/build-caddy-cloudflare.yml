@@ -16,9 +16,16 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+    secrets:
+      MASQUE_VPN_TOKEN: ${{ secrets.MASQUE_VPN_TOKEN }}
+
   build:
     name: Build Linux ${{ inputs.arch }}
+    needs: validate
     runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
@@ -26,10 +33,22 @@ jobs:
           path: source
           persist-credentials: false
 
+      - uses: actions/checkout@v7
+        with:
+          repository: ArcCal/masque-vpn
+          token: ${{ secrets.MASQUE_VPN_TOKEN }}
+          path: masque-vpn
+          persist-credentials: false
+
       - uses: actions/setup-go@v7
         with:
           go-version: '1.26.8'
           cache: false
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: masque-vpn
 
       - name: Build pinned modules
         shell: bash
@@ -55,6 +74,7 @@ jobs:
           EOF
           go mod edit -require=github.com/ArcCal/caddy-masque@v0.0.0 -replace=github.com/ArcCal/caddy-masque=../source
           go mod edit -replace=golang.org/x/net=../source/third_party/xnet
+          go mod edit -replace=github.com/quic-go/quic-go=../source/third_party/quic-go
           go get github.com/caddyserver/caddy/v2@v2.11.6 github.com/caddy-dns/cloudflare@a8737d095ad5a48ca031cea6ab704057dbc2d250
           go mod tidy
           go mod verify
@@ -72,6 +92,32 @@ jobs:
           cd dist
           tar -czf caddy-masque-cloudflare-linux-${{ inputs.arch }}.tar.gz caddy-masque-cloudflare-linux-${{ inputs.arch }}
           sha256sum caddy-masque-cloudflare-linux-${{ inputs.arch }}.tar.gz > caddy-masque-cloudflare-linux-${{ inputs.arch }}.tar.gz.sha256
+
+      - name: Reachable vulnerabilities in the Cloudflare build
+        working-directory: build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ inputs.arch }}
+          GOTOOLCHAIN: local
+          GOFLAGS: '-mod=readonly'
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest -mode=source ./...
+
+      - name: Build interoperability client and network simulator
+        run: |
+          cargo build --locked --release --manifest-path masque-vpn/Cargo.toml --bin masque-client
+          CGO_ENABLED=0 go -C source build -trimpath -o "$PWD/netsim" ./tests/netsim
+
+      - name: Required interoperability tests of the Cloudflare build
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q iperf3 nftables
+          sudo REQUIRE_ALL_TESTS=1 CADDY="$PWD/build/dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/caddy" CLIENT_BIN="$PWD/masque-vpn/target/release/masque-client" NETSIM="$PWD/netsim" source/tests/e2e-netns.sh | tee "$RUNNER_TEMP/masque-e2e.log"
+          if ! grep -Eq '^[1-9][0-9]* passed, 0 failed, 0 skipped$' "$RUNNER_TEMP/masque-e2e.log"; then
+            echo "::error::required interoperability tests must report passing checks with no failures or skips"
+            exit 1
+          fi
 
       - name: Upload downloadable artifact
         uses: actions/upload-artifact@v7

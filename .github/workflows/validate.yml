@@ -1,0 +1,120 @@
+# Shared required validation; no artifact or release publishing permissions.
+name: validate
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: false
+        default: ""
+    secrets:
+      MASQUE_VPN_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-go@v7
+        with:
+          # The newest patch release of the line go.mod asks for: it carries the
+          # standard library security fixes (go.mod says 1.26.0, the first release).
+          go-version: "1.26"
+          check-latest: true
+      - name: Dependencies match go.sum
+        run: go mod verify
+      - name: Verify pinned HTTP/2 reset patch
+        run: python3 tests/verify-http2-fork.py
+      - name: Verify pinned HTTP/3 datagram rejection patch
+        run: python3 tests/verify-http3-fork.py
+      - name: gofmt
+        run: test -z "$(git ls-files '*.go' ':!third_party/**' | xargs gofmt -l | tee /dev/stderr)"
+      - run: go vet ./...
+      - name: Reachable dependency vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Unit and in-process tests (with the race detector)
+        run: go test -race -count=1 ./...
+      - name: Required nftables ruleset checks
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q nftables
+          go test -race -c -o "$RUNNER_TEMP/hostnet.test" ./internal/hostnet
+          sudo "$RUNNER_TEMP/hostnet.test" -test.run '^TestRuleset$' -test.v | tee "$RUNNER_TEMP/hostnet.log"
+          grep -q '^--- PASS: TestRuleset' "$RUNNER_TEMP/hostnet.log"
+          ! grep -q -- '--- SKIP:' "$RUNNER_TEMP/hostnet.log"
+      - name: Capsule stream segmentation fuzzing
+        run: go test ./internal/proto -run '^$' -fuzz '^FuzzCapsuleStream$' -fuzztime=30s -parallel=2
+      - name: Upstream HTTP/2 and HPACK tests for the patched dependency
+        working-directory: third_party/xnet
+        run: go test -race ./http2 ./http2/hpack
+      - name: Upstream HTTP/3 tests for the patched dependency
+        working-directory: third_party/quic-go
+        run: go test -race ./http3
+
+  e2e:
+    name: end-to-end with masque-client (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    env:
+      HAVE_CLIENT: ${{ secrets.MASQUE_VPN_TOKEN != '' }}
+      TRUSTED_SOURCE: ${{ (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - name: Require authenticated client checkout for interoperability tests
+        if: env.HAVE_CLIENT != 'true' || env.TRUSTED_SOURCE != 'true'
+        run: |
+          echo "::error::required interoperability tests cannot run: MASQUE_VPN_TOKEN must read ArcCal/masque-vpn, and fork pull requests need validation from a trusted repository branch"
+          exit 1
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          repository: ArcCal/masque-vpn
+          token: ${{ secrets.MASQUE_VPN_TOKEN }}
+          path: masque-vpn
+      - uses: actions/setup-go@v7
+        with:
+          # The newest patch release of the line go.mod asks for: it carries the
+          # standard library security fixes (go.mod says 1.26.0, the first release).
+          go-version: "1.26"
+          check-latest: true
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: masque-vpn
+      - name: Build
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o caddy ./cmd/caddy
+          CGO_ENABLED=0 go build -o netsim ./tests/netsim
+          cargo build --locked --release --manifest-path masque-vpn/Cargo.toml --bin masque-client
+      - name: End-to-end test in network namespaces
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q iperf3 nftables
+          sudo REQUIRE_ALL_TESTS=1 CADDY="$PWD/caddy" CLIENT_BIN="$PWD/masque-vpn/target/release/masque-client" NETSIM="$PWD/netsim" tests/e2e-netns.sh | tee "$RUNNER_TEMP/masque-e2e.log"
+          if ! grep -Eq '^[1-9][0-9]* passed, 0 failed, 0 skipped$' "$RUNNER_TEMP/masque-e2e.log"; then
+            echo "::error::required interoperability tests must report passing checks with no failures or skips"
+            exit 1
+          fi
