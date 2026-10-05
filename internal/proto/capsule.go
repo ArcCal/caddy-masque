@@ -176,11 +176,6 @@ func Unspecified(v6 bool) Prefix {
 	return Host(netip.IPv4Unspecified())
 }
 
-// IsUnspecifiedHost reports 0.0.0.0/32 and ::/128.
-func IsUnspecifiedHost(p Prefix) bool {
-	return p.Addr().IsUnspecified() && p.Bits() == p.Addr().BitLen()
-}
-
 // AssignedAddress is one entry of an ADDRESS_ASSIGN capsule.
 type AssignedAddress struct {
 	RequestID uint64 // the ADDRESS_REQUEST entry this answers, or 0
