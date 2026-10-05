@@ -331,11 +331,13 @@ Known limitations:
 - The HTTP/3 the VPN takes over does not accept 0-RTT (replay risk), and does not apply Caddy's `packet_conn_wrappers`
   (such as the PROXY protocol over UDP).
 
-An HTTP Datagram on an ordinary HTTP/3 GET, POST or classic CONNECT request aborts that request with
-H3_DATAGRAM_ERROR (0x33), as RFC 9297 §2 requires, including sites without the `masque` directive. The pinned
+CONNECT-IP is the only HTTP Datagram protocol supported by the bundled builds. An HTTP Datagram on any other
+HTTP/3 request aborts that request with H3_DATAGRAM_ERROR (0x33), as RFC 9297 §2 requires, including unsupported
+extended-CONNECT tokens and sites without the `masque` directive. Requests without Datagrams follow the site's
+normal routes. The pinned
 quic-go patch rejects those datagrams without taking over the request stream; ordinary request bodies, response
-status codes and trailers retain their normal behavior. Extended CONNECT remains under its handler's control,
-including optimistic CONNECT-IP datagrams. Malformed datagrams (too short, or a Quarter Stream ID above 2⁶⁰−1)
+status codes and trailers retain their normal behavior. Recognized CONNECT-IP requests retain optimistic Datagrams,
+including authentication refusals (RFC 9484 §7.1). Malformed datagrams (too short, or a Quarter Stream ID above 2⁶⁰−1)
 close the connection with H3_DATAGRAM_ERROR, as RFC 9297 §2.1 requires.
 
 HTTP/2 malformed requests and capsules use PROTOCOL_ERROR as required by

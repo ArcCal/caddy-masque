@@ -63,14 +63,20 @@ func proxyTestRoutes(e *caddyEnv, upstream *httptest.Server) {
 // error. Keep both request directions open until the upstream confirms
 // dispatch, so this cannot accidentally exercise the late-Datagram drop.
 func TestHTTP3UnexpectedDatagramsPreserveOtherStreams(t *testing.T) {
-	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodConnect} {
+	for _, reqCase := range []struct{ name, method, protocol string }{
+		{http.MethodGet, http.MethodGet, ""},
+		{http.MethodPost, http.MethodPost, ""},
+		{http.MethodConnect, http.MethodConnect, ""},
+		{"unknown-protocol", http.MethodConnect, "unknown-protocol"},
+		{"websocket", http.MethodConnect, "websocket"},
+	} {
 		for _, host := range []string{"vpn.test", "plain.test"} {
-			if method == http.MethodConnect && host == "vpn.test" {
+			if reqCase.method == http.MethodConnect && reqCase.protocol == "" && host == "vpn.test" {
 				// Classic CONNECT has only :authority, so the plain host
 				// route catches it without depending on :path.
 				continue
 			}
-			t.Run(method+"/"+host, func(t *testing.T) {
+			t.Run(reqCase.name+"/"+host, func(t *testing.T) {
 				entered := make(chan struct{})
 				canceled := make(chan struct{})
 				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +127,8 @@ func TestHTTP3UnexpectedDatagramsPreserveOtherStreams(t *testing.T) {
 				}
 				_ = str.SetDeadline(time.Now().Add(5 * time.Second))
 				u, _ := url.Parse(e.url("/held"))
-				if err := str.SendRequestHeader(&http.Request{Method: method, Host: host, URL: u, Header: make(http.Header), ContentLength: -1}); err != nil {
+				if err := str.SendRequestHeader(&http.Request{Method: reqCase.method, Proto: reqCase.protocol, Host: host,
+					URL: u, Header: make(http.Header), ContentLength: -1}); err != nil {
 					t.Fatal(err)
 				}
 				select {
