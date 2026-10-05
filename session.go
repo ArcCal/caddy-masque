@@ -199,8 +199,12 @@ func (s *session) icmpAllow() bool {
 // How long an ending session waits for writes in progress.
 const drainTimeout = 2 * time.Second
 
-// errAbort ends the session with an aborted stream.
-type errAbort struct{ why string }
+// errAbort ends the session with an aborted stream: as a malformed message
+// when the client broke the protocol, otherwise cancelled (see ending).
+type errAbort struct {
+	why       string
+	malformed bool
+}
 
 func (e errAbort) Error() string { return "aborted: " + e.why }
 
@@ -270,9 +274,14 @@ func (s *session) run(ctx context.Context) string {
 	// stream after the handler returns. A write still blocked (a client
 	// that stopped reading) is cut short after a while.
 	cancel()
-	var abort errAbort
-	aborted := errors.As(err, &abort)
-	s.tun.stop(aborted)
+	how := endClose
+	if abort := (errAbort{}); errors.As(err, &abort) {
+		how = endCancel
+		if abort.malformed {
+			how = endMalformed
+		}
+	}
+	s.tun.stop(how)
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -284,7 +293,7 @@ func (s *session) run(ctx context.Context) string {
 		s.tun.force()
 		<-done
 	}
-	s.tun.finish(aborted)
+	s.tun.finish(how)
 	if errors.Is(err, io.EOF) {
 		return "client closed the tunnel"
 	}
@@ -340,7 +349,7 @@ func (s *session) probeMTU(ctx context.Context) error {
 			s.log.Debug("the tunnel carries 1280-byte IPv6 packets")
 			return nil
 		case <-timeout.C:
-			return errAbort{"no reply to 1280-byte ICMPv6 echo requests: the tunnel may not carry IPv6's minimum MTU (RFC 9484 §7.2)"}
+			return errAbort{why: "no reply to 1280-byte ICMPv6 echo requests: the tunnel may not carry IPv6's minimum MTU (RFC 9484 §7.2)"}
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-tick.C:
@@ -388,7 +397,7 @@ func (s *session) advertise() error {
 	// bug here ends this tunnel only.
 	if err := proto.ValidateRoutes(routes); err != nil {
 		s.log.Error("not sending invalid routes", zap.Error(err), zap.Any("routes", routes))
-		return errAbort{"internal error: invalid route advertisement"}
+		return errAbort{why: "internal error: invalid route advertisement"}
 	}
 	return s.tun.writeCapsule(proto.RouteAdvertisement(routes))
 }
@@ -399,7 +408,7 @@ func (s *session) readCapsules() error {
 		if err != nil {
 			var m proto.MalformedError
 			if errors.As(err, &m) {
-				return errAbort{"malformed capsule stream (" + m.Error() + ")"}
+				return errAbort{why: "malformed capsule stream (" + m.Error() + ")", malformed: true}
 			}
 			return err
 		}
@@ -527,7 +536,7 @@ func (s *session) sendToClient(payload []byte) error {
 		// once QUIC DATAGRAM frames are known not to, whatever packet
 		// showed it, the stream must be aborted.
 		if s.lease.hasIPv6() && tooBig.MaxDatagramPayloadSize < 1+ip.IPv6MinMTU {
-			return errAbort{"the path cannot carry 1280-byte IPv6 packets in QUIC datagrams (RFC 9484 §7.2)"}
+			return errAbort{why: "the path cannot carry 1280-byte IPv6 packets in QUIC datagrams (RFC 9484 §7.2)"}
 		}
 		mtu := int(tooBig.MaxDatagramPayloadSize) - 1
 		// An IPv4 packet without DF is fragmented, as a router would.
