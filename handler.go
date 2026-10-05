@@ -46,10 +46,9 @@ type Handler struct {
 	// Path and query of the URI Template clients are configured with.
 	Template string `json:"template,omitempty"`
 
-	tpl  *proto.Template
-	app  *App
-	log  *zap.Logger
-	name string
+	tpl *proto.Template
+	app *App
+	log *zap.Logger
 }
 
 // CaddyModule returns the Caddy module information.

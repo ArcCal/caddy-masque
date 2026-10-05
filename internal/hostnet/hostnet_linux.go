@@ -245,9 +245,6 @@ func (n *Network) keepRouterAdvertisements() {
 	}
 }
 
-// Name is the TUN device's name.
-func (n *Network) Name() string { return n.name }
-
 // Read reads one packet from the TUN device.
 func (n *Network) Read(b []byte) (int, error) { return n.tun.Read(b) }
 
