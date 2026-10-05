@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyevents"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -144,7 +145,9 @@ func (a *App) Provision(ctx caddy.Context) error {
 			return err
 		}
 	}
-	a.coreKey = "masque-core/" + a.cfg.iface
+	// The app owns one host network and one nftables table. All tunnel
+	// settings, including its interface, must match across reloads.
+	a.coreKey = "masque-core"
 	val, _, err := cores.LoadOrNew(a.coreKey, func() (caddy.Destructor, error) {
 		return newCore(a.cfg, a.log)
 	})
@@ -159,6 +162,26 @@ func (a *App) Provision(ctx caddy.Context) error {
 		_, _ = cores.Delete(a.coreKey)
 		a.released = true
 		return errors.New("masque: the tunnel settings (interface, ipv4, ipv6, mtu, manage_network, allow_host_access) changed; restart Caddy to apply them")
+	}
+	// Caddy emits stopping before any app stops. HTTP shutdown may wait
+	// for tunnels retained from an earlier configuration, even when this
+	// configuration has no masque handler or HTTP server left. Cleanup
+	// would run too late to end them.
+	events, err := ctx.App("events")
+	if err != nil {
+		return err
+	}
+	if err := events.(*caddyevents.App).On("stopping", shutdownHandler{core: a.core}); err != nil {
+		return err
+	}
+	return nil
+}
+
+type shutdownHandler struct{ core *core }
+
+func (h shutdownHandler) Handle(context.Context, caddy.Event) error {
+	if caddy.Exiting() {
+		h.core.shutdown("server shutting down")
 	}
 	return nil
 }
