@@ -470,12 +470,12 @@ func (a *App) serveHTTP3(network, hostport string, srv *caddyhttp.Server, tlsCfg
 		}
 		l.server = &http3.Server{
 			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				// Ordinary HTTP methods and classic CONNECT have no HTTP
-				// Datagram semantics (RFC 9297 section 2). Extended CONNECT
-				// remains with its handler, including optimistic CONNECT-IP
-				// packets before authentication or the response (RFC 9484
-				// section 7.1), and extensions provided by other Caddy modules.
-				if r.Method != http.MethodConnect || r.Proto == "HTTP/3.0" {
+				// CONNECT-IP is the only Datagram-capable protocol in the
+				// bundled builds. Other requests still follow Caddy's routes,
+				// but associated Datagrams abort them (RFC 9297 section 2).
+				// Recognized CONNECT-IP requests retain optimistic Datagrams
+				// before authentication or the response (RFC 9484 section 7.1).
+				if _, definesDatagrams := connectIPRequest(r); !definesDatagrams {
 					if err := http3.RejectDatagrams(w); err != nil {
 						http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 						return
