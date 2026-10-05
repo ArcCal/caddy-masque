@@ -103,6 +103,16 @@ jobs:
           GOFLAGS: '-mod=readonly'
         run: go run golang.org/x/vuln/cmd/govulncheck@latest -mode=source ./...
 
+      - name: Reachable vulnerabilities in the Cloudflare build
+        working-directory: build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ inputs.arch }}
+          GOTOOLCHAIN: local
+          GOFLAGS: '-mod=readonly'
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest -mode=source ./...
+
       - name: Build interoperability client and network simulator
         run: |
           cargo build --locked --release --manifest-path masque-vpn/Cargo.toml --bin masque-client
