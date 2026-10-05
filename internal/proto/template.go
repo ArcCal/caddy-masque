@@ -29,11 +29,10 @@ type part struct {
 
 // Template is a parsed URI Template.
 type Template struct {
-	raw       string
-	authority string
-	parts     []part
-	m         *matcher // nil when requests cannot be matched: see matchErr
-	matchErr  error
+	raw      string
+	parts    []part
+	m        *matcher // nil when requests cannot be matched: see matchErr
+	matchErr error
 }
 
 // TemplateError reports an invalid template.
@@ -74,7 +73,7 @@ func ParseTemplate(raw string) (*Template, error) {
 		return nil, err
 	}
 	m, merr := compile(parts)
-	return &Template{raw: raw, authority: authority, parts: parts, m: m, matchErr: merr}, nil
+	return &Template{raw: raw, parts: parts, m: m, matchErr: merr}, nil
 }
 
 // ParsePathTemplate parses a template for just the path and query, as the
