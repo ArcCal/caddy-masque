@@ -40,11 +40,12 @@ hijacking, flushing, reading the body, or starting a goroutine. Queued
 Datagrams are checked when the policy is applied; later Datagrams are
 silently dropped after the receive side closes, as required by §2.1.
 
-The app applies this policy to ordinary HTTP methods and classic CONNECT
-on every HTTP/3 site it serves. Extended CONNECT stays with its owning
-handler. This preserves CONNECT-IP's permitted optimistic Datagrams
-before authentication or a response (RFC 9484 §7.1), including refused
-requests, and the semantics of extensions provided by other Caddy modules.
+CONNECT-IP is the only Datagram-capable protocol in the bundled builds.
+The app applies the rejection policy to every other request, including
+unsupported extended-CONNECT tokens, on every HTTP/3 site it serves.
+Requests without Datagrams retain normal Caddy routing. Recognized
+CONNECT-IP requests preserve permitted optimistic Datagrams before
+authentication or a response (RFC 9484 §7.1), including refused requests.
 
 External main modules, including xcaddy, must explicitly replace both
 dependencies with the trees in this repository. For example, with this
