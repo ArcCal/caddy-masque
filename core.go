@@ -154,6 +154,8 @@ type core struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+	// Host repairs must finish before Close removes their configuration.
+	hostWatch sync.WaitGroup
 }
 
 type recentLease struct {
@@ -230,7 +232,11 @@ func (c *core) start() error {
 	}
 	c.attach(n)
 	if r, ok := device(n).(interface{ Repair() []string }); ok {
-		go c.watchHost(r)
+		c.hostWatch.Add(1)
+		go func() {
+			defer c.hostWatch.Done()
+			c.watchHost(r)
+		}()
 	}
 	return nil
 }
@@ -265,8 +271,8 @@ func (c *core) attach(d device) {
 // Destruct implements caddy.Destructor: the last configuration using the
 // core is gone.
 func (c *core) Destruct() error {
-	c.cancel()
-	c.revokeAll("server stopped")
+	c.shutdown("server stopped")
+	c.hostWatch.Wait()
 	if c.net != nil {
 		c.net.Close()
 		<-c.done
@@ -394,6 +400,13 @@ func (c *core) revokeAll(why string) {
 	}
 }
 
+// shutdown also prevents requests still authenticating or acquiring
+// addresses from registering a session after the current ones are ended.
+func (c *core) shutdown(why string) {
+	c.cancel()
+	c.revokeAll(why)
+}
+
 // endOnExit ends the sessions when Caddy exits and shuts the HTTP server
 // down: a server waits for its requests to finish, and tunnels do not
 // finish on their own. A configuration reload also shuts the old servers
@@ -405,7 +418,7 @@ func (c *core) endOnExit(srv *http.Server) {
 	srv.RegisterOnShutdown(func() {
 		c.watched.Delete(srv)
 		if caddy.Exiting() {
-			c.revokeAll("server shutting down")
+			c.shutdown("server shutting down")
 		}
 	})
 }
@@ -424,6 +437,9 @@ type lease struct {
 // entries are deleted. nil when no address is free, deleting fails, or the
 // user is no longer current.
 func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease {
+	if ctx.Err() != nil || c.ctx.Err() != nil {
+		return nil
+	}
 	var addrs []netip.Addr
 	var used []netip.Prefix
 	c.poolMu.Lock()
@@ -495,7 +511,7 @@ func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease 
 	h := &sessionHandle{id: c.nextID.Add(1), user: user, toClient: make(chan queued, queueLen), revoked: make(chan struct{}),
 		rescope: make(chan struct{}, 1)}
 	c.sessMu.Lock()
-	if !c.auth.IsCurrent(user) || c.atSessionLimit(user) {
+	if ctx.Err() != nil || c.ctx.Err() != nil || !c.auth.IsCurrent(user) || c.atSessionLimit(user) {
 		c.sessMu.Unlock()
 		releaseAll()
 		return nil
