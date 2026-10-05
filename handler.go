@@ -411,7 +411,7 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 			conn.Close()
 			return nil, err
 		}
-		closeConn := func(bool) { conn.Close() }
+		closeConn := func(ending) { conn.Close() }
 		return &streamTunnel{
 			reader:        newCapsuleReader(io.MultiReader(bufferedOf(brw.Reader), conn)),
 			capsuleWriter: capsuleWriter{w: conn},
@@ -465,15 +465,19 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 	conn, _ := r.Context().Value(connKey{}).(net.Conn)
 	h.tuneConn(conn)
 	body := rawBody(r.Body)
-	// Forced shutdown wakes blocked writers; malformed capsules instead use
-	// the precise stream error required by RFC 9297 §3.3 / RFC 9113 §8.1.1.
+	// Forced shutdown wakes blocked writers; aborts use the stream error
+	// for their reason: PROTOCOL_ERROR for malformed capsules (RFC 9297
+	// §3.3, RFC 9113 §8.1.1), CANCEL otherwise.
 	reset := func() { _ = rc.SetWriteDeadline(time.Now()) }
 	return &streamTunnel{
 		reader:        newCapsuleReader(body),
 		capsuleWriter: capsuleWriter{w: raw, flush: rc.Flush},
-		stopFn: func(abort bool) {
-			if abort {
+		stopFn: func(how ending) {
+			switch how {
+			case endMalformed:
 				_ = http2.ResetStream(raw, http2.ErrCodeProtocol)
+			case endCancel:
+				_ = http2.ResetStream(raw, http2.ErrCodeCancel)
 			}
 			_ = body.Close()
 		},

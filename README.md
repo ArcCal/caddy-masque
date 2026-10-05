@@ -310,7 +310,9 @@ Caddy obtains by itself need nothing.
 - **Malformed requests**: an authenticated request whose `target` or `ipproto` is missing or invalid, or that has content
   headers, is malformed (RFC 9484 §4.1, RFC 9297 §3.2): the answer is 400; over HTTP/3 the request stream is also ended
   with H3_MESSAGE_ERROR as RFC 9114 §4.1.2 says (STOP_SENDING; the 400 still gets through). A destination that is not
-  allowed (403), a DNS failure (502) and the like are refusals, not malformed requests.
+  allowed (403), a DNS failure (502) and the like are refusals, not malformed requests. A tunnel the server aborts for
+  another reason (an unanswered IPv6 MTU probe, a path too narrow for 1280-byte packets) is cancelled with
+  H3_REQUEST_CANCELLED (HTTP/2: CANCEL), not reported as malformed.
 - **Timeouts**: Caddy 2.11's default read and write idle timeouts (1 minute) and `read_timeout` and `write_timeout` do not
   apply to tunnels, which stay up however long they are idle; they apply to ordinary web requests as usual. The TCP
   connections of tunnels over HTTP/1.1 and HTTP/2 get the settings masque-vpn's server uses, whatever the server's
