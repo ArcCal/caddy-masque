@@ -2,6 +2,12 @@
 
 Each version is tagged with its number; CI attaches Caddy builds to its release on GitHub after required validation passes.
 
+## Unreleased
+
+- **Tunnels ended for reasons other than a malformed message are cancelled.** An unanswered IPv6 MTU probe (RFC 9484 §7.2), a path that cannot carry 1280-byte IPv6 packets (§7.1) and an internal route-advertisement error ended the request stream with `H3_MESSAGE_ERROR` (or HTTP/2 `PROTOCOL_ERROR`), which tells the client its message was malformed (RFC 9114 §8.1). They now use `H3_REQUEST_CANCELLED` (RFC 9114 §4.1.1) or HTTP/2 `CANCEL`; malformed capsules and requests keep `H3_MESSAGE_ERROR` / `PROTOCOL_ERROR`, and other session ends still close the stream normally. masque-vpn's server does the same.
+- The validation job also runs masque-vpn's wire-level conformance probe (`tests/conformance.sh` with `SERVER_KIND=caddy`), which builds CONNECT-IP requests, capsules and datagrams itself over HTTP/3, HTTP/2 and HTTP/1.1 and checks the answers against RFC 9484 and RFC 9297, and `TestInteropMasqueClient`, which runs masque-client against Caddy in process over IPv4 and IPv6, on every transport and HTTP/3 datagram mode.
+- Release builds run on native runners for each architecture and must start, list the MASQUE app and handler, and carry a tag the changelog documents.
+
 ## 1.2.0
 
 Tag: **`v1.2.0`**

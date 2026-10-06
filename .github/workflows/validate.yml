@@ -108,6 +108,14 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -o caddy ./cmd/caddy
           CGO_ENABLED=0 go build -o netsim ./tests/netsim
           cargo build --locked --release --manifest-path masque-vpn/Cargo.toml --bin masque-client
+      - name: masque-client against Caddy in process, IPv4 and IPv6 over every transport and datagram mode
+        run: |
+          set -euo pipefail
+          MASQUE_CLIENT="$PWD/masque-vpn/target/release/masque-client" go test -count=1 -run '^TestInteropMasqueClient$' -v . | tee "$RUNNER_TEMP/client-interop.log"
+          for transport in h3 h2 http1.1 h3-capsules; do
+            grep -q "^    --- PASS: TestInteropMasqueClient/$transport " "$RUNNER_TEMP/client-interop.log"
+          done
+          ! grep -q -- '--- SKIP' "$RUNNER_TEMP/client-interop.log"
       - name: End-to-end test in network namespaces
         run: |
           set -euo pipefail
@@ -118,3 +126,13 @@ jobs:
             echo "::error::required interoperability tests must report passing checks with no failures or skips"
             exit 1
           fi
+      # masque-vpn's wire-level probe builds requests, capsules and datagrams
+      # itself, so this server is checked against RFC 9484 and RFC 9297 by
+      # a program that is neither project's client.
+      - name: Wire-level conformance with masque-vpn's probe
+        run: |
+          set -euo pipefail
+          go -C masque-vpn/interop build -mod=readonly -o "$RUNNER_TEMP/conformance" ./conformance
+          sudo REQUIRE_ALL_TESTS=1 SERVER_KIND=caddy CADDY="$PWD/caddy" PROBE="$RUNNER_TEMP/conformance" \
+            masque-vpn/tests/conformance.sh | tee "$RUNNER_TEMP/conformance.log"
+          grep -Eq '^[1-9][0-9]* passed, 0 failed, 0 skipped$' "$RUNNER_TEMP/conformance.log"

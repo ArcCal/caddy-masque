@@ -21,10 +21,31 @@ import (
 	"github.com/ArcCal/caddy-masque/internal/proto"
 )
 
-// H3_MESSAGE_ERROR (RFC 9114 §8.1): the request stream is aborted when
-// the client breaks the Capsule Protocol or the path cannot carry what
-// RFC 9484 requires.
-const h3MessageError = 0x10e
+// HTTP/3 error codes (RFC 9114 §8.1) that abort a request stream:
+// H3_MESSAGE_ERROR when the client broke the Capsule Protocol (RFC 9297
+// §3.3, RFC 9114 §4.1.2), H3_REQUEST_CANCELLED when the server ends the
+// tunnel for another reason, such as a path that cannot carry what RFC 9484
+// requires (RFC 9114 §4.1.1).
+const (
+	h3MessageError     = 0x10e
+	h3RequestCancelled = 0x10c
+)
+
+// ending is how a session ends its request stream.
+type ending int
+
+const (
+	// endClose finishes it: FIN, END_STREAM, or closing an HTTP/1.1
+	// connection.
+	endClose ending = iota
+	// endMalformed aborts it because the client's message is malformed:
+	// H3_MESSAGE_ERROR, or PROTOCOL_ERROR over HTTP/2 (RFC 9113 §8.1.1).
+	endMalformed
+	// endCancel aborts it for another reason: H3_REQUEST_CANCELLED, or
+	// CANCEL over HTTP/2. H3_MESSAGE_ERROR would tell the client that its
+	// message was malformed.
+	endCancel
+)
 
 // tunnel is a CONNECT-IP request stream, whatever the HTTP version:
 // capsules both ways, and HTTP Datagrams as QUIC DATAGRAM frames (HTTP/3)
@@ -32,7 +53,8 @@ const h3MessageError = 0x10e
 //
 // A session ends it in three steps: stop unblocks reads (and, when
 // aborting, writes too), force unblocks writes that did not finish soon
-// after, and finish ends the stream once nothing uses it any more.
+// after, and finish ends the stream once nothing uses it any more; both
+// stop and finish are told how it ends.
 type tunnel interface {
 	// readCapsule returns the next capsule from the client: io.EOF when the
 	// client finished the stream, a proto.MalformedError when it broke the
@@ -47,9 +69,9 @@ type tunnel interface {
 	// (HTTP/3 with datagrams only).
 	receiveDatagram(ctx context.Context) ([]byte, error)
 	hasQUICDatagrams() bool
-	stop(abort bool)
+	stop(how ending)
 	force()
-	finish(abort bool)
+	finish(how ending)
 }
 
 // capsuleReader reads capsules from a byte stream.
@@ -115,7 +137,7 @@ func (cw *capsuleWriter) writeCapsule(c proto.Capsule) error {
 type streamTunnel struct {
 	reader *capsuleReader
 	capsuleWriter
-	stopFn  func(abort bool)
+	stopFn  func(how ending)
 	forceFn func()
 }
 
@@ -128,12 +150,12 @@ func (t *streamTunnel) receiveDatagram(ctx context.Context) ([]byte, error) {
 }
 
 func (t *streamTunnel) hasQUICDatagrams() bool { return false }
-func (t *streamTunnel) stop(abort bool)        { t.stopFn(abort) }
+func (t *streamTunnel) stop(how ending)        { t.stopFn(how) }
 func (t *streamTunnel) force()                 { t.forceFn() }
 
 // finish: the handler returning ends an HTTP/2 stream (END_STREAM), and
 // stop already closed an HTTP/1.1 connection.
-func (t *streamTunnel) finish(bool) {}
+func (t *streamTunnel) finish(ending) {}
 
 // h3Tunnel is an HTTP/3 request stream. HTTP Datagrams travel in QUIC
 // DATAGRAM frames when the client supports them (RFC 9297 §2.1.1), else in
@@ -175,19 +197,23 @@ func (t *h3Tunnel) receiveDatagram(ctx context.Context) ([]byte, error) {
 
 func (t *h3Tunnel) hasQUICDatagrams() bool { return t.quicDatagrams }
 
-func (t *h3Tunnel) stop(abort bool) {
-	if abort {
+func (t *h3Tunnel) stop(how ending) {
+	switch how {
+	case endMalformed:
 		t.str.CancelRead(h3MessageError)
 		t.str.CancelWrite(h3MessageError)
-		return
+	case endCancel:
+		t.str.CancelRead(h3RequestCancelled)
+		t.str.CancelWrite(h3RequestCancelled)
+	default:
+		t.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
 	}
-	t.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
 }
 
 func (t *h3Tunnel) force() { _ = t.str.SetWriteDeadline(time.Now()) }
 
-func (t *h3Tunnel) finish(abort bool) {
-	if !abort {
+func (t *h3Tunnel) finish(how ending) {
+	if how == endClose {
 		// Nothing writes any more: end the stream with a FIN.
 		t.mu.Lock()
 		defer t.mu.Unlock()

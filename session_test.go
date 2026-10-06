@@ -65,9 +65,11 @@ type fakeTunnel struct {
 	ignoreProbes atomic.Bool
 	out          chan any // capsules and datagrams (sentDatagram) to the client
 	aborted      atomic.Bool
-	closed       atomic.Bool
-	done         chan struct{} // closed by abort and close
-	doneOnce     sync.Once
+	// How the session aborted the stream, when it did.
+	abortedAs atomic.Int32
+	closed    atomic.Bool
+	done      chan struct{} // closed by abort and close
+	doneOnce  sync.Once
 	// Writes fail from this one on (1: the first; 0: none).
 	failFrom int
 	writes   atomic.Int32
@@ -157,17 +159,18 @@ func (t *fakeTunnel) receiveDatagram(ctx context.Context) ([]byte, error) {
 }
 
 func (t *fakeTunnel) hasQUICDatagrams() bool { return t.quic }
-func (t *fakeTunnel) stop(abort bool) {
-	if abort {
+func (t *fakeTunnel) stop(how ending) {
+	if how != endClose {
 		t.aborted.Store(true)
+		t.abortedAs.Store(int32(how))
 	}
 	t.doneOnce.Do(func() { close(t.done) })
 }
 
 func (t *fakeTunnel) force() {}
 
-func (t *fakeTunnel) finish(abort bool) {
-	if !abort {
+func (t *fakeTunnel) finish(how ending) {
+	if how == endClose {
 		t.closed.Store(true)
 	}
 }
@@ -714,8 +717,8 @@ func TestMalformedCapsulesAbortTheStream(t *testing.T) {
 	if why := r.waitEnd(t); why == "" {
 		t.Error("no reason")
 	}
-	if !r.tun.aborted.Load() {
-		t.Error("the stream was not aborted")
+	if !r.tun.aborted.Load() || ending(r.tun.abortedAs.Load()) != endMalformed {
+		t.Error("the stream was not aborted as malformed")
 	}
 }
 
@@ -875,8 +878,9 @@ func TestIPv6NeedsRoomFor1280BytePackets(t *testing.T) {
 		src := map[bool]string{true: "2606:4700::1111", false: "1.1.1.1"}[v6]
 		e.dev.fromHost <- udp(src, r.addr(v6), 1280)
 		r.waitEnd(t)
-		if !r.tun.aborted.Load() {
-			t.Errorf("IPv6 %v: the stream was not aborted", v6)
+		// Cancelled: the client's messages were not malformed.
+		if !r.tun.aborted.Load() || ending(r.tun.abortedAs.Load()) != endCancel {
+			t.Errorf("IPv6 %v: the stream was not cancelled (%d)", v6, r.tun.abortedAs.Load())
 		}
 	}
 }
@@ -961,8 +965,8 @@ func TestMTUProbeWithoutReply(t *testing.T) {
 	tun.ignoreProbes.Store(true)
 	r := e.startOn(t, alice, tun, newScope(*e.core.allowed.Load(), anyDestination, 0))
 	why := r.waitEnd(t)
-	if !strings.Contains(why, "ICMPv6 echo") || !r.tun.aborted.Load() {
-		t.Errorf("ended: %s (aborted %v)", why, r.tun.aborted.Load())
+	if !strings.Contains(why, "ICMPv6 echo") || ending(r.tun.abortedAs.Load()) != endCancel {
+		t.Errorf("ended: %s (aborted %v as %d)", why, r.tun.aborted.Load(), r.tun.abortedAs.Load())
 	}
 }
 

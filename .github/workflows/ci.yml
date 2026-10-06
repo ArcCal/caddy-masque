@@ -1,5 +1,6 @@
 # Tests every push to main and every pull request, and builds Caddy with
-# the module for Linux on x86_64 and arm64 only. For a published GitHub
+# the module for Linux on x86_64 and arm64 only, each on its own native
+# runner. For a published GitHub
 # Release, the builds are attached to it once every test has passed; a run
 # started by hand with the tag of an existing release builds and attaches
 # that tag's code the same way (for a release whose own run failed).
@@ -38,13 +39,15 @@ jobs:
   build:
     name: build ${{ matrix.os }}-${{ matrix.arch }}
     needs: validate
-    runs-on: ubuntu-24.04
+    # Each architecture is built on its own native runner, so the program
+    # can also be run there before it is packaged.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: linux, arch: amd64 }
-          - { os: linux, arch: arm64 }
+          - { os: linux, arch: amd64, runner: ubuntu-24.04 }
+          - { os: linux, arch: arm64, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -66,6 +69,11 @@ jobs:
         run: |
           version=${TAG#v}
           [ -n "$TAG" ] || version=$(git rev-parse --short HEAD)
+          # A release's tag must be a version the changelog describes.
+          if [ -n "$TAG" ] && ! grep -qF "Tag: **\`$TAG\`**" CHANGELOG.md; then
+            echo "::error::the release tag $TAG is not a version in CHANGELOG.md"
+            exit 1
+          fi
           name=caddy-masque-$version-${{ matrix.os }}-${{ matrix.arch }}
           mkdir -p "dist/$name"
           go build -trimpath -ldflags "-s -w" -o "dist/$name/caddy" ./cmd/caddy
@@ -80,6 +88,12 @@ jobs:
           grep -qP '^\tbuild\tGOOS=${{ matrix.os }}$' "$info"
           grep -qP '^\tbuild\tGOARCH=${{ matrix.arch }}$' "$info"
           grep -qP "^\tbuild\tvcs.revision=$(git rev-parse HEAD)$" "$info"
+          # It runs on its architecture and has the MASQUE app and handler.
+          "dist/$name/caddy" version
+          "dist/$name/caddy" list-modules >"$RUNNER_TEMP/modules.txt"
+          for module in masque http.handlers.masque; do
+            grep -qFx "$module" "$RUNNER_TEMP/modules.txt"
+          done
           cp -r deploy README.md "dist/$name/"
           tar -czf "dist/$name.tar.gz" -C dist "$name"
           (cd dist && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
