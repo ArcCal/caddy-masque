@@ -9,7 +9,7 @@ replace golang.org/x/net => ./third_party/xnet
 replace github.com/quic-go/quic-go => ./third_party/quic-go
 
 require (
-	github.com/caddyserver/caddy/v2 v2.11.6
+	github.com/caddyserver/caddy/v2 v2.11.7
 	github.com/prometheus/client_golang v1.24.1
 	github.com/quic-go/connect-ip-go v0.4.0
 	github.com/quic-go/quic-go v0.63.0
