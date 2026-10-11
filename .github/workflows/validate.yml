@@ -102,7 +102,7 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           check-latest: true
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: masque-vpn
