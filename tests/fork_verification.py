@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 
 
 NOTICE_NAME = re.compile(
@@ -176,6 +177,26 @@ def apply_patch(directory, patch_path):
     output = (result.stdout + result.stderr).decode(errors="replace")
     if result.returncode or re.search(r"\b(?:offset|fuzz)\b", output, re.IGNORECASE):
         raise SystemExit(f"Documented fork patch did not apply exactly:\n{output}")
+
+
+def apply_english_fixtures(directory, record_path):
+    """Apply ASCII-encoded Unicode fixture edits to a verified baseline."""
+    records = json.loads(Path(record_path).read_text())
+    if records["format"] != 1:
+        raise SystemExit("Unsupported English fixture record")
+    for entry in records["files"]:
+        name = entry["path"]
+        if Path(name).is_absolute() or ".." in Path(name).parts:
+            raise SystemExit("Invalid English fixture path")
+        path = Path(directory) / name
+        if hashlib.sha256(path.read_bytes()).hexdigest() != entry["before_sha256"]:
+            raise SystemExit(f"English fixture baseline mismatch: {name}")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as patch:
+            patch.write(entry["patch"])
+            patch.flush()
+            apply_patch(directory, patch.name)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != entry["after_sha256"]:
+            raise SystemExit(f"English fixture output mismatch: {name}")
 
 
 def tree_files(directory):
