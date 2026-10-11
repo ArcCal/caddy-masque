@@ -184,21 +184,21 @@ var proxyForURLTests = []proxyForURLTest{{
 	want: "http://proxy",
 }, {
 	cfg: httpproxy.Config{
-		NoProxy:   ".示例.com",
+		NoProxy:   ".\u793a\u4f8b.com",
 		HTTPProxy: "proxy",
 	},
-	req:  "http://www.示例.com",
+	req:  "http://www.\u793a\u4f8b.com",
 	want: "<nil>",
 }, {
 	cfg: httpproxy.Config{
 		NoProxy:   "xn--fsq092h.com",
 		HTTPProxy: "proxy",
 	},
-	req:  "http://www.示例.com",
+	req:  "http://www.\u793a\u4f8b.com",
 	want: "<nil>",
 }, {
 	cfg: httpproxy.Config{
-		NoProxy:   "示例.com",
+		NoProxy:   "\u793a\u4f8b.com",
 		HTTPProxy: "proxy",
 	},
 	req:  "http://www.xn--fsq092h.com",
