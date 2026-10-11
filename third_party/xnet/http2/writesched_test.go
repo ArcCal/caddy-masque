@@ -72,6 +72,7 @@ func TestFrameWriteRequestWithData(t *testing.T) {
 		id: 1,
 		sc: &serverConn{maxFrameSize: 16},
 	}
+	st.flow.conn = &connOutflow{}
 	const size = 32
 	wr := FrameWriteRequest{&writeData{st.id, make([]byte, size), true}, st, make(chan error)}
 	if got, want := wr.DataSize(), size; got != want {
@@ -109,6 +110,8 @@ func TestFrameWriteRequestData(t *testing.T) {
 		id: 1,
 		sc: &serverConn{maxFrameSize: 16},
 	}
+	st.flow.conn = &connOutflow{}
+	st.flow.conn.add(maxFlowWindow) // conn-level flow is large
 	const size = 32
 	wr := FrameWriteRequest{&writeData{st.id, make([]byte, size), true}, st, make(chan error)}
 	if got, want := wr.DataSize(), size; got != want {

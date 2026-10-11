@@ -178,8 +178,8 @@ func (c *Conn) maybeSend(now time.Time) (next time.Time) {
 		}
 
 		c.endpoint.sendDatagram(datagram{
-			b:        buf,
-			peerAddr: c.peerAddr,
+			b:    buf,
+			path: pathAddrs{peer: c.path.peer},
 		})
 	}
 }

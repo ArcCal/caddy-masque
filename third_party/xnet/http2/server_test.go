@@ -974,6 +974,9 @@ func testServer_Send_RstStream_After_Bogus_WindowUpdate(t testing.TB) {
 		t.Fatal(err)
 	}
 	st.wantRSTStream(1, ErrCodeFlowControl)
+	// Connection is still alive, even if the stream has been reset.
+	st.writePing(false, [8]byte{})
+	st.wantFrameType(FramePing)
 }
 
 // testServerPostUnblock sends a hanging POST with unsent data to handler,
@@ -2294,6 +2297,64 @@ func testServer_MaxEncoderHeaderTableSize(t testing.TB) {
 	}
 }
 
+// TestServer_HeaderTableSizeDuringWrite tests that a
+// SETTINGS_HEADER_TABLE_SIZE change from the client is not applied to the
+// server's HPACK encoder while a frame write, which may be using the encoder
+// on another goroutine, is in progress.
+func TestServer_HeaderTableSizeDuringWrite(t *testing.T) {
+	synctestTest(t, testServer_HeaderTableSizeDuringWrite)
+}
+func testServer_HeaderTableSizeDuringWrite(t testing.TB) {
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {})
+	defer st.Close()
+	st.greet()
+	enc := st.sc.TestHPACKEncoder()
+
+	// Leave the response HEADERS write for stream 1 in progress while the
+	// client changes SETTINGS_HEADER_TABLE_SIZE twice.
+	st.cc.(*synctestNetConn).SetReadBufferSize(0)
+	st.bodylessReq1()
+	synctest.Wait()
+	st.writeSettings(Setting{SettingHeaderTableSize, 0})
+	st.writeSettings(Setting{SettingHeaderTableSize, 2048})
+	synctest.Wait()
+	// Table size should not be changed immediately. To avoid concurrent use of
+	// the encoder, we apply the size change right before we use the encoder to
+	// write frames.
+	if got, want := enc.MaxDynamicTableSize(), uint32(InitialHeaderTableSize); got != want {
+		t.Errorf("during frame write: encoder header table size = %d, want %d", got, want)
+	}
+	st.cc.(*synctestNetConn).SetReadBufferSize(math.MaxInt)
+	st.wantHeaders(wantHeader{streamID: 1, endStream: true})
+	st.wantSettingsAck()
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      3,
+		BlockFragment: st.encodeHeader(),
+		EndStream:     true,
+		EndHeaders:    true,
+	})
+	synctest.Wait()
+	hf := readFrame[*HeadersFrame](t, st)
+	if hf.StreamID != 3 {
+		t.Fatalf("got HEADERS for stream %d, want stream 3", hf.StreamID)
+	}
+	// The response must signal both the smallest (0) and the final (2048)
+	// table size (RFC 7541, Section 4.2), just like an encoder that saw both
+	// size changes directly.
+	var want bytes.Buffer
+	wantEnc := hpack.NewEncoder(&want)
+	wantEnc.SetMaxDynamicTableSize(0)
+	wantEnc.SetMaxDynamicTableSize(2048)
+	wantEnc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	if got := hf.HeaderBlockFragment(); !bytes.HasPrefix(got, want.Bytes()) {
+		t.Errorf("stream 3 header block = %x, want prefix %x", got, want.Bytes())
+	}
+	if got, want := enc.MaxDynamicTableSize(), uint32(2048); got != want {
+		t.Errorf("after frame write: encoder header table size = %d, want %d", got, want)
+	}
+}
+
 // Issue 12843
 func TestServerDoS_MaxHeaderListSize(t *testing.T) { synctestTest(t, testServerDoS_MaxHeaderListSize) }
 func testServerDoS_MaxHeaderListSize(t testing.TB) {
@@ -2652,162 +2713,6 @@ func testServerDoesntWriteInvalidHeaders(t testing.TB) {
 	})
 }
 
-func BenchmarkServerGets(b *testing.B) {
-	DisableGoroutineTracking(b)
-	b.ReportAllocs()
-
-	const msg = "Hello, world"
-	st := newServerTesterWithRealConn(b, func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, msg)
-	})
-	defer st.Close()
-	st.greet()
-
-	// Give the server quota to reply. (plus it has the 64KB)
-	if err := st.fr.WriteWindowUpdate(0, uint32(b.N*len(msg))); err != nil {
-		b.Fatal(err)
-	}
-
-	for i := 0; i < b.N; i++ {
-		id := 1 + uint32(i)*2
-		st.writeHeaders(HeadersFrameParam{
-			StreamID:      id,
-			BlockFragment: st.encodeHeader(),
-			EndStream:     true,
-			EndHeaders:    true,
-		})
-		st.wantFrameType(FrameHeaders)
-		if df := readFrame[*DataFrame](b, st); !df.StreamEnded() {
-			b.Fatalf("DATA didn't have END_STREAM; got %v", df)
-		}
-	}
-}
-
-func BenchmarkServerPosts(b *testing.B) {
-	DisableGoroutineTracking(b)
-	b.ReportAllocs()
-
-	const msg = "Hello, world"
-	st := newServerTesterWithRealConn(b, func(w http.ResponseWriter, r *http.Request) {
-		// Consume the (empty) body from th peer before replying, otherwise
-		// the server will sometimes (depending on scheduling) send the peer a
-		// a RST_STREAM with the CANCEL error code.
-		if n, err := io.Copy(io.Discard, r.Body); n != 0 || err != nil {
-			b.Errorf("Copy error; got %v, %v; want 0, nil", n, err)
-		}
-		io.WriteString(w, msg)
-	})
-	defer st.Close()
-	st.greet()
-
-	// Give the server quota to reply. (plus it has the 64KB)
-	if err := st.fr.WriteWindowUpdate(0, uint32(b.N*len(msg))); err != nil {
-		b.Fatal(err)
-	}
-
-	for i := 0; i < b.N; i++ {
-		id := 1 + uint32(i)*2
-		st.writeHeaders(HeadersFrameParam{
-			StreamID:      id,
-			BlockFragment: st.encodeHeader(":method", "POST"),
-			EndStream:     false,
-			EndHeaders:    true,
-		})
-		st.writeData(id, true, nil)
-		st.wantFrameType(FrameHeaders)
-		if df := readFrame[*DataFrame](b, st); !df.StreamEnded() {
-			b.Fatalf("DATA didn't have END_STREAM; got %v", df)
-		}
-	}
-}
-
-// Send a stream of messages from server to client in separate data frames.
-// Brings up performance issues seen in long streams.
-// Created to show problem in go issue #18502
-func BenchmarkServerToClientStreamDefaultOptions(b *testing.B) {
-	benchmarkServerToClientStream(b)
-}
-
-// Justification for Change-Id: Iad93420ef6c3918f54249d867098f1dadfa324d8
-// Expect to see memory/alloc reduction by opting in to Frame reuse with the Framer.
-func BenchmarkServerToClientStreamReuseFrames(b *testing.B) {
-	benchmarkServerToClientStream(b, optFramerReuseFrames)
-}
-
-func benchmarkServerToClientStream(b *testing.B, newServerOpts ...interface{}) {
-	DisableGoroutineTracking(b)
-	b.ReportAllocs()
-	const msgLen = 1
-	// default window size
-	const windowSize = 1<<16 - 1
-
-	// next message to send from the server and for the client to expect
-	nextMsg := func(i int) []byte {
-		msg := make([]byte, msgLen)
-		msg[0] = byte(i)
-		if len(msg) != msgLen {
-			panic("invalid test setup msg length")
-		}
-		return msg
-	}
-
-	st := newServerTesterWithRealConn(b, func(w http.ResponseWriter, r *http.Request) {
-		// Consume the (empty) body from th peer before replying, otherwise
-		// the server will sometimes (depending on scheduling) send the peer a
-		// a RST_STREAM with the CANCEL error code.
-		if n, err := io.Copy(io.Discard, r.Body); n != 0 || err != nil {
-			b.Errorf("Copy error; got %v, %v; want 0, nil", n, err)
-		}
-		for i := 0; i < b.N; i += 1 {
-			w.Write(nextMsg(i))
-			w.(http.Flusher).Flush()
-		}
-	}, newServerOpts...)
-	defer st.Close()
-	st.greet()
-
-	const id = uint32(1)
-
-	st.writeHeaders(HeadersFrameParam{
-		StreamID:      id,
-		BlockFragment: st.encodeHeader(":method", "POST"),
-		EndStream:     false,
-		EndHeaders:    true,
-	})
-
-	st.writeData(id, true, nil)
-	st.wantHeaders(wantHeader{
-		streamID:  1,
-		endStream: false,
-	})
-
-	var pendingWindowUpdate = uint32(0)
-
-	for i := 0; i < b.N; i += 1 {
-		expected := nextMsg(i)
-		st.wantData(wantData{
-			streamID:  1,
-			endStream: false,
-			data:      expected,
-		})
-		// try to send infrequent but large window updates so they don't overwhelm the test
-		pendingWindowUpdate += uint32(len(expected))
-		if pendingWindowUpdate >= windowSize/2 {
-			if err := st.fr.WriteWindowUpdate(0, pendingWindowUpdate); err != nil {
-				b.Fatal(err)
-			}
-			if err := st.fr.WriteWindowUpdate(id, pendingWindowUpdate); err != nil {
-				b.Fatal(err)
-			}
-			pendingWindowUpdate = 0
-		}
-	}
-	st.wantData(wantData{
-		streamID:  1,
-		endStream: true,
-	})
-}
-
 // go-fuzz bug, originally reported at https://github.com/bradfitz/http2/issues/53
 // Verify we don't hang.
 func TestIssue53(t *testing.T) { synctestTest(t, testIssue53) }
@@ -3059,70 +2964,6 @@ func testServerContentLengthCanBeDisabled(t testing.TB) {
 			"content-type": []string{"text/plain; charset=utf-8"},
 		},
 	})
-}
-
-func BenchmarkServer_GetRequest(b *testing.B) {
-	DisableGoroutineTracking(b)
-	b.ReportAllocs()
-	const msg = "Hello, world."
-	st := newServerTesterWithRealConn(b, func(w http.ResponseWriter, r *http.Request) {
-		n, err := io.Copy(io.Discard, r.Body)
-		if err != nil || n > 0 {
-			b.Errorf("Read %d bytes, error %v; want 0 bytes.", n, err)
-		}
-		io.WriteString(w, msg)
-	})
-	defer st.Close()
-
-	st.greet()
-	// Give the server quota to reply. (plus it has the 64KB)
-	if err := st.fr.WriteWindowUpdate(0, uint32(b.N*len(msg))); err != nil {
-		b.Fatal(err)
-	}
-	hbf := st.encodeHeader(":method", "GET")
-	for i := 0; i < b.N; i++ {
-		streamID := uint32(1 + 2*i)
-		st.writeHeaders(HeadersFrameParam{
-			StreamID:      streamID,
-			BlockFragment: hbf,
-			EndStream:     true,
-			EndHeaders:    true,
-		})
-		st.wantFrameType(FrameHeaders)
-		st.wantFrameType(FrameData)
-	}
-}
-
-func BenchmarkServer_PostRequest(b *testing.B) {
-	DisableGoroutineTracking(b)
-	b.ReportAllocs()
-	const msg = "Hello, world."
-	st := newServerTesterWithRealConn(b, func(w http.ResponseWriter, r *http.Request) {
-		n, err := io.Copy(io.Discard, r.Body)
-		if err != nil || n > 0 {
-			b.Errorf("Read %d bytes, error %v; want 0 bytes.", n, err)
-		}
-		io.WriteString(w, msg)
-	})
-	defer st.Close()
-	st.greet()
-	// Give the server quota to reply. (plus it has the 64KB)
-	if err := st.fr.WriteWindowUpdate(0, uint32(b.N*len(msg))); err != nil {
-		b.Fatal(err)
-	}
-	hbf := st.encodeHeader(":method", "POST")
-	for i := 0; i < b.N; i++ {
-		streamID := uint32(1 + 2*i)
-		st.writeHeaders(HeadersFrameParam{
-			StreamID:      streamID,
-			BlockFragment: hbf,
-			EndStream:     false,
-			EndHeaders:    true,
-		})
-		st.writeData(streamID, true, nil)
-		st.wantFrameType(FrameHeaders)
-		st.wantFrameType(FrameData)
-	}
 }
 
 type connStateConn struct {
@@ -3398,6 +3239,166 @@ func testServerReturnsStreamAndConnFlowControlOnBodyClose(t testing.TB) {
 	st.wantData(wantData{
 		streamID:  1,
 		endStream: true,
+	})
+}
+
+func TestServerResetStreamUnreadBody(t *testing.T) {
+	synctestSubtest(t, "read_after_reset", func(t testing.TB) {
+		st := newServerTester(t, nil)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := st.nextHandlerCall()
+
+		const size = InflowMinRefresh
+		st.writeData(1, false, make([]byte, size))
+		st.writeRSTStream(1, ErrCodeCancel)
+		st.sync()
+
+		// The handler reads the body after the stream has been reset.
+		call.do(func(w http.ResponseWriter, req *http.Request) {
+			io.ReadAll(req.Body)
+		})
+		st.wantWindowUpdate(0, size)
+
+		// Handler exits; no second refund.
+		call.exit()
+		st.wantIdle()
+	})
+
+	synctestSubtest(t, "exit_without_reading", func(t testing.TB) {
+		st := newServerTester(t, nil)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := st.nextHandlerCall()
+
+		const size = InflowMinRefresh
+		st.writeData(1, false, make([]byte, size))
+		st.writeRSTStream(1, ErrCodeCancel)
+		st.sync()
+
+		// The handler exits without reading the body. Flow control is returned on exit.
+		call.exit()
+		st.wantWindowUpdate(0, size)
+		st.wantIdle()
+	})
+
+	synctestSubtest(t, "read_after_handler_exit", func(t testing.TB) {
+		st := newServerTester(t, nil)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := st.nextHandlerCall()
+
+		const size = InflowMinRefresh
+		st.writeData(1, false, make([]byte, size))
+		synctest.Wait()
+
+		// The handler exits without reading the body.
+		call.exit()
+
+		// Flow control is returned when the handler exits.
+		st.wantUnorderedFrames(
+			func(f *WindowUpdateFrame) bool {
+				return f.StreamID == 0 && f.Increment == size
+			},
+			func(f *HeadersFrame) bool {
+				return f.StreamID == 1 && f.StreamEnded()
+			},
+			func(f *RSTStreamFrame) bool {
+				return f.StreamID == 1 && f.ErrCode == ErrCodeNo
+			},
+		)
+
+		// Reading the body after the handler exits must not cause a double refund.
+		io.ReadAll(call.req.Body)
+		st.wantIdle()
+	})
+
+	synctestSubtest(t, "unstarted_handler", func(t testing.TB) {
+		st := newServerTester(t, nil, func(s *Server) {
+			s.MaxConcurrentStreams = 1
+		})
+		defer st.Close()
+
+		st.greet()
+
+		// Stream 1 uses the single handler slot.
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(),
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+		call := st.nextHandlerCall()
+
+		// Reset stream 1 so the client can open another stream without
+		// exceeding the concurrent stream limit.
+		st.writeRSTStream(1, ErrCodeCancel)
+
+		// Stream 3 is queued in unstartedHandlers because the handler for
+		// stream 1 is still executing.
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      3,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+
+		const size = InflowMinRefresh
+		st.writeData(3, false, make([]byte, size))
+		st.writeRSTStream(3, ErrCodeCancel)
+		st.wantIdle()
+
+		// Stream 1 handler exits. Stream 3 is removed from unstartedHandlers
+		// and its flow control is returned.
+		call.exit()
+		st.wantWindowUpdate(0, size)
+		st.wantIdle()
+	})
+
+	// Same thing as exit_without_reading, but some imaginary middleware
+	// replaced Request.Body first.
+	synctestSubtest(t, "middleware_replaces_body", func(t testing.TB) {
+		st := newServerTester(t, nil)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := st.nextHandlerCall()
+
+		call.do(func(w http.ResponseWriter, r *http.Request) {
+			// Wrap r.Body like some middleware might.
+			r.Body = http.MaxBytesReader(w, r.Body, 1000)
+		})
+
+		const size = InflowMinRefresh
+		st.writeData(1, false, make([]byte, size))
+		st.writeRSTStream(1, ErrCodeCancel)
+		st.sync()
+
+		call.exit()
+		st.wantWindowUpdate(0, size)
+		st.wantIdle()
 	})
 }
 
@@ -3892,9 +3893,21 @@ func testServerWindowUpdateOnBodyClose(t testing.TB) {
 		}
 	}
 
+	st.wantHeaders(wantHeader{
+		streamID:  1,
+		endStream: true,
+	})
+
 	// Writing data after the stream is reset immediately returns flow control credit.
 	st.writeData(1, false, content[windowSize/2:])
-	st.wantWindowUpdate(0, windowSize/2)
+	st.wantUnorderedFrames(
+		func(f *WindowUpdateFrame) bool {
+			return f.StreamID == 0 && f.Increment == windowSize/2
+		},
+		func(f *RSTStreamFrame) bool {
+			return f.StreamID == 1 && f.ErrCode == ErrCodeStreamClosed
+		},
+	)
 }
 
 func TestNoErrorLoggedOnPostAfterGOAWAY(t *testing.T) {
@@ -4961,4 +4974,79 @@ func testServerRFC9218PriorityAware(t testing.TB) {
 	if !slices.Equal(slices.Compact(half), half) {
 		t.Errorf("want stream to be processed one-by-one to completion when aware of priority, got: %v", streamFrameOrder)
 	}
+}
+
+// "An endpoint MUST treat a change to SETTINGS_INITIAL_WINDOW_SIZE
+// that causes any flow-control window to exceed the maximum size as
+// a connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR."
+// -- https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2-7
+func TestServerSettingsFlowControlUpdateBeyondLimit(t *testing.T) {
+	synctestTest(t, testServerSettingsFlowControlUpdateBeyondLimit)
+}
+func testServerSettingsFlowControlUpdateBeyondLimit(t testing.TB) {
+	st := newServerTester(t, nil)
+	st.greet()
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1, // clients send odd numbers
+		BlockFragment: st.encodeHeader(":method", "POST"),
+		EndStream:     false, // data coming
+		EndHeaders:    true,
+	})
+	call := st.nextHandlerCall()
+	http.NewResponseController(call.w).Flush()
+	st.wantFrameType(FrameHeaders)
+
+	// Give this stream some additional flow control.
+	const windowIncrease = 1000
+	st.writeWindowUpdate(1, windowIncrease)
+	st.wantIdle()
+
+	// Adjust the initial flow control window. The stream is now over the limit.
+	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+	const maxInitialWindowSize = maxWindowSize - windowIncrease
+	st.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize + 1})
+	st.wantSettingsAck()
+
+	// We detect this condition lazily. Write something to the stream so we notice.
+	call.w.Write([]byte("hello"))
+	http.NewResponseController(call.w).Flush()
+
+	st.wantGoAway(1, ErrCodeFlowControl)
+}
+
+// Counterpart to TestServerSettingsFlowControlUpdateBeyondLimit:
+// A SETTINGS update which doesn't quite put a stream over the flow control limit.
+func TestServerSettingsFlowControlUpdateWithinLimit(t *testing.T) {
+	synctestTest(t, testServerSettingsFlowControlUpdateWithinLimit)
+}
+func testServerSettingsFlowControlUpdateWithinLimit(t testing.TB) {
+	st := newServerTester(t, nil)
+	st.greet()
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1, // clients send odd numbers
+		BlockFragment: st.encodeHeader(":method", "POST"),
+		EndStream:     false, // data coming
+		EndHeaders:    true,
+	})
+	call := st.nextHandlerCall()
+	http.NewResponseController(call.w).Flush()
+	st.wantFrameType(FrameHeaders)
+
+	// Give this stream some additional flow control.
+	const windowIncrease = 1000
+	st.writeWindowUpdate(1, windowIncrease)
+	st.wantIdle()
+
+	// Adjust the initial flow control window. The stream is just within the limit.
+	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+	const maxInitialWindowSize = maxWindowSize - windowIncrease
+	st.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize})
+	st.wantSettingsAck()
+
+	call.w.Write([]byte("hello"))
+	http.NewResponseController(call.w).Flush()
+	st.wantFrameType(FrameData)
+	st.wantIdle()
 }
