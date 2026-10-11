@@ -1,7 +1,3 @@
-// Copyright 2025 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 package http3
 
 import (
@@ -241,7 +237,7 @@ func TestStreamReadFrameDataAtEOF(t *testing.T) {
 		t.Fatalf("st.readFrameHeader() = %v, %v; want %v, nil", got, err, typ)
 	}
 
-	st1.Write(data)         // data
+	st1.Write(data)  // data
 	st1.CloseWrite() // end stream
 	got := make([]byte, len(data)+1)
 	if n, err := st2.Read(got); err != nil || n != len(data) || !bytes.Equal(got[:n], data) {

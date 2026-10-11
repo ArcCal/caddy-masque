@@ -1,8 +1,7 @@
-// Copyright 2026 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+//go:build go1.27 && !go1.27
 
-//go:build go1.27 && !http2legacy
+// MASQUE requires the patched legacy implementation on every toolchain.
+// Retain this upstream wrapper for review, but never select it for a build.
 
 package http2_test
 

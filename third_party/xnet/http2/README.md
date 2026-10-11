@@ -1,3 +1,13 @@
+## Local MASQUE fork
+
+This repository always selects the patched original HTTP/2 server and
+transport on Go 1.26 and Go 1.27 to preserve extended CONNECT and explicit
+stream reset behavior. No `http2legacy` build tag is required.
+
+The text below describes the upstream package's selection behavior.
+
+## Upstream package
+
 This package (golang.org/x/net/http2) is the original source of truth
 of the Go HTTP/2 implementation.
 

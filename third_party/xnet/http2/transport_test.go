@@ -1,9 +1,3 @@
-// Copyright 2015 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
-//go:build !(go1.27 && !http2legacy)
-
 package http2_test
 
 import (
@@ -299,18 +293,41 @@ func TestTransportFailureErrorForHTTP1Response(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			wroteHeaders := make(chan struct{})
+			var wroteHeadersOnce sync.Once
 			tr := &Transport{
-				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-					return net.Dial(network, addr)
+				DialTLSContext: func(_ context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+					conn, err := net.Dial(network, addr)
+					if err != nil {
+						return nil, err
+					}
+					return &readAfterHeadersConn{
+						Conn:         conn,
+						ctx:          ctx,
+						wroteHeaders: wroteHeaders,
+						closed:       make(chan struct{}),
+					}, nil
 				},
 				MaxReadFrameSize: tc.maxFrameSize,
 				AllowHTTP:        true,
 			}
+			defer tr.CloseIdleConnections()
 
 			req, err := http.NewRequest("GET", ts.URL, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
+			// Keep the request in flight before reading the HTTP/1 response.
+			// Otherwise the peer can close the unused connection before the
+			// first stream is allocated, giving a connection-establishment
+			// error instead of testing the malformed response diagnostic.
+			req = req.WithContext(httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+				WroteHeaders: func() {
+					wroteHeadersOnce.Do(func() { close(wroteHeaders) })
+				},
+			}))
 
 			_, err = tr.RoundTrip(req)
 			if !strings.Contains(err.Error(), expectedHTTP1PayloadHint) {
@@ -318,6 +335,30 @@ func TestTransportFailureErrorForHTTP1Response(t *testing.T) {
 			}
 		})
 	}
+}
+
+type readAfterHeadersConn struct {
+	net.Conn
+	ctx          context.Context
+	wroteHeaders <-chan struct{}
+	closed       chan struct{}
+	closeOnce    sync.Once
+}
+
+func (c *readAfterHeadersConn) Read(p []byte) (int, error) {
+	select {
+	case <-c.wroteHeaders:
+		return c.Conn.Read(p)
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err()
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
+}
+
+func (c *readAfterHeadersConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
 }
 
 func testTransportReusesConns(t *testing.T, useClient, wantSame bool, modReq func(*http.Request)) {
