@@ -17,7 +17,7 @@ var punycodeTestCases = [...]struct {
 	{"a-b", "a-b-"},
 	{"books", "books-"},
 	{"bücher", "bcher-kva"},
-	{"Hello世界", "Hello-ck1hg65u"},
+	{"Hello\u4e16\u754c", "Hello-ck1hg65u"},
 	{"ü", "tda"},
 	{"üý", "tdac"},
 

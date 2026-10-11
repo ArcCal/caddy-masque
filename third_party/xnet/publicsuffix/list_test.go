@@ -167,7 +167,7 @@ var publicSuffixTestCases = []struct {
 	// game.tw
 	// ebiz.tw
 	// club.tw
-	// 台灣.tw (xn--kpry57d.tw)
+	// Taiwan IDN: xn--kpry57d.tw
 	{"tw", "tw", true},
 	{"aaa.tw", "tw", true},
 	{"www.aaa.tw", "tw", true},

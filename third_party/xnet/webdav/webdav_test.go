@@ -286,9 +286,9 @@ func TestFilenameEscape(t *testing.T) {
 		wantHref:        `/foo%25bar`,
 		wantDisplayName: `foo%bar`,
 	}, {
-		name:            `/こんにちわ世界`,
+		name:            "/\u3053\u3093\u306b\u3061\u308f\u4e16\u754c",
 		wantHref:        `/%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%82%8F%E4%B8%96%E7%95%8C`,
-		wantDisplayName: `こんにちわ世界`,
+		wantDisplayName: "\u3053\u3093\u306b\u3061\u308f\u4e16\u754c",
 	}, {
 		name:            `/Program Files/`,
 		wantHref:        `/Program%20Files/`,

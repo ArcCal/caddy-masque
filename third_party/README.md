@@ -88,3 +88,13 @@ module's race and interoperability suites. Regression tests check queued
 Datagrams, concurrent classification, closed receive-side drops, exact
 wire errors, website bodies and trailers, and other streams on the same
 connection. Refresh and verify the patch when updating quic-go or Go.
+
+## English source presentation
+
+`english-unicode-fixtures.json` records the ASCII presentation changes separately
+from protocol patches. Its JSON strings escape Unicode, including removed text,
+so the record itself contains no Chinese literals. Exact baseline/output hashes
+and strict patch application remain part of fork verification. Unicode strings
+in Go source use escapes with identical runtime bytes. In the HTML parser
+fixture, U+00BA replaces U+41BA while retaining four hexadecimal digits, greedy
+character-reference consumption, and the missing-semicolon condition.

@@ -234,7 +234,7 @@ FOO&#41BAR
 |     "FOO)BAR"
 
 #data
-FOO&#x41BAR
+FOO&#x00BAR
 #errors
 (1,3): expected-doctype-but-got-chars
 (1,10): numeric-entity-without-semicolon
@@ -244,7 +244,7 @@ FOO&#x41BAR
 | <html>
 |   <head>
 |   <body>
-|     "FOO䆺R"
+|     "FOOºR"
 
 #data
 FOO&#x41ZOO
