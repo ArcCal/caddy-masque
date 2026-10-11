@@ -3,7 +3,7 @@
 from pathlib import Path
 import tempfile
 
-from fork_verification import apply_patch, compare_tree, download_verified_module, prepare_upstream, summarize_notices
+from fork_verification import apply_patch, apply_english_fixtures, compare_tree, download_verified_module, prepare_upstream, summarize_notices
 
 root = Path(__file__).resolve().parents[1]
 version = "v0.60.0"
@@ -14,5 +14,6 @@ with tempfile.TemporaryDirectory(prefix="masque-http2-") as temp:
     upstream = Path(temp) / "xnet"
     notices = prepare_upstream(module, upstream)
     apply_patch(upstream, root / "third_party/http2-reset.patch")
+    apply_english_fixtures(upstream, root / "third_party/english-unicode-fixtures.json")
     compare_tree(upstream, root / "third_party/xnet", "HTTP/2")
-print("HTTP/2 fork matches verified upstream v0.60.0 plus documented patch; " + summarize_notices(notices))
+print("HTTP/2 fork matches verified upstream v0.60.0 plus documented protocol and English-fixture patches; " + summarize_notices(notices))

@@ -15,19 +15,9 @@ const testInput = `
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
   "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 <body xmlns:foo="ns1" xmlns="ns2" xmlns:tag="ns3" ` +
-	"\r\n\t" + `  >
-  <hello lang="en">World &lt;&gt;&apos;&quot; &#x767d;&#40300;翔</hello>
-  <query>&何; &is-it;</query>
-  <goodbye />
-  <outer foo:attr="value" xmlns:tag="ns4">
-    <inner/>
-  </outer>
-  <tag:name>
-    <![CDATA[Some text here.]]>
-  </tag:name>
-</body><!-- missing final newline -->`
+	"\r\n\t" + "  >\n  <hello lang=\"en\">World &lt;&gt;&apos;&quot; &#x767d;&#40300;\u7fd4</hello>\n  <query>&\u4f55; &is-it;</query>\n  <goodbye />\n  <outer foo:attr=\"value\" xmlns:tag=\"ns4\">\n    <inner/>\n  </outer>\n  <tag:name>\n    <![CDATA[Some text here.]]>\n  </tag:name>\n</body><!-- missing final newline -->"
 
-var testEntity = map[string]string{"何": "What", "is-it": "is it?"}
+var testEntity = map[string]string{"\u4f55": "What", "is-it": "is it?"}
 
 var rawTokens = []Token{
 	CharData("\n"),
@@ -39,7 +29,7 @@ var rawTokens = []Token{
 	StartElement{Name{"", "body"}, []Attr{{Name{"xmlns", "foo"}, "ns1"}, {Name{"", "xmlns"}, "ns2"}, {Name{"xmlns", "tag"}, "ns3"}}},
 	CharData("\n  "),
 	StartElement{Name{"", "hello"}, []Attr{{Name{"", "lang"}, "en"}}},
-	CharData("World <>'\" 白鵬翔"),
+	CharData("World <>'\" \u767d\u9d6c\u7fd4"),
 	EndElement{Name{"", "hello"}},
 	CharData("\n  "),
 	StartElement{Name{"", "query"}, []Attr{}},
@@ -76,7 +66,7 @@ var cookedTokens = []Token{
 	StartElement{Name{"ns2", "body"}, []Attr{{Name{"xmlns", "foo"}, "ns1"}, {Name{"", "xmlns"}, "ns2"}, {Name{"xmlns", "tag"}, "ns3"}}},
 	CharData("\n  "),
 	StartElement{Name{"ns2", "hello"}, []Attr{{Name{"", "lang"}, "en"}}},
-	CharData("World <>'\" 白鵬翔"),
+	CharData("World <>'\" \u767d\u9d6c\u7fd4"),
 	EndElement{Name{"ns2", "hello"}},
 	CharData("\n  "),
 	StartElement{Name{"ns2", "query"}, []Attr{}},

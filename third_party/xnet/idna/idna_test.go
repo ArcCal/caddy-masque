@@ -15,7 +15,7 @@ var idnaTestCases = [...]struct {
 	{"foo--xn--bar.org", "foo--xn--bar.org"},
 	{"golang.org", "golang.org"},
 	{"example.xn--p1ai", "example.рф"},
-	{"xn--czrw28b.tw", "商業.tw"},
+	{"xn--czrw28b.tw", "\u5546\u696d.tw"},
 	{"www.xn--mller-kva.de", "www.müller.de"},
 }
 
@@ -51,32 +51,32 @@ func TestIDNASeparators(t *testing.T) {
 			name: "Punycode", profile: Punycode,
 			subCases: []subCase{
 				{"example\u3002jp", "xn--examplejp-ck3h", false},
-				{"東京\uFF0Ejp", "xn--jp-l92cn98g071o", false},
-				{"大阪\uFF61jp", "xn--jp-ku9cz72u463f", false},
+				{"\u6771\u4eac\uff0ejp", "xn--jp-l92cn98g071o", false},
+				{"\u5927\u962a\uff61jp", "xn--jp-ku9cz72u463f", false},
 			},
 		},
 		{
 			name: "Lookup", profile: Lookup,
 			subCases: []subCase{
 				{"example\u3002jp", "example.jp", false},
-				{"東京\uFF0Ejp", "xn--1lqs71d.jp", false},
-				{"大阪\uFF61jp", "xn--pssu33l.jp", false},
+				{"\u6771\u4eac\uff0ejp", "xn--1lqs71d.jp", false},
+				{"\u5927\u962a\uff61jp", "xn--pssu33l.jp", false},
 			},
 		},
 		{
 			name: "Display", profile: Display,
 			subCases: []subCase{
 				{"example\u3002jp", "example.jp", false},
-				{"東京\uFF0Ejp", "xn--1lqs71d.jp", false},
-				{"大阪\uFF61jp", "xn--pssu33l.jp", false},
+				{"\u6771\u4eac\uff0ejp", "xn--1lqs71d.jp", false},
+				{"\u5927\u962a\uff61jp", "xn--pssu33l.jp", false},
 			},
 		},
 		{
 			name: "Registration", profile: Registration,
 			subCases: []subCase{
 				{"example\u3002jp", "", true},
-				{"東京\uFF0Ejp", "", true},
-				{"大阪\uFF61jp", "", true},
+				{"\u6771\u4eac\uff0ejp", "", true},
+				{"\u5927\u962a\uff61jp", "", true},
 			},
 		},
 	}
