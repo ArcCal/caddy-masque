@@ -1,7 +1,3 @@
-// Copyright 2012 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // Package atom provides integer codes (also known as atoms) for a fixed set of
 // frequently occurring HTML strings: tag names and attribute keys such as "p"
 // and "id".

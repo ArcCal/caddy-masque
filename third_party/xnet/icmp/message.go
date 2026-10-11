@@ -1,7 +1,3 @@
-// Copyright 2012 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // Package icmp provides basic functions for the manipulation of
 // messages used in the Internet Control Message Protocols,
 // ICMPv4 and ICMPv6.

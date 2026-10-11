@@ -1,7 +1,3 @@
-// Copyright 2016 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 /*
 Package bpf implements marshaling and unmarshaling of programs for the
 Berkeley Packet Filter virtual machine, and provides a Go implementation

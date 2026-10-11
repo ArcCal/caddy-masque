@@ -2,10 +2,21 @@
 
 ## HTTP/2 stream reset
 
-`xnet` is the complete, pinned `golang.org/x/net v0.59.0` source, with its
-upstream license. The only implementation change adds an explicit stream
-reset API to `http2.ResponseWriter`; `http2/reset.go` unwraps middleware.
-`http2-reset.patch` records the exact difference from the upstream module.
+`xnet` is the pinned `golang.org/x/net v0.59.0` source. It adds an explicit
+stream reset API to `http2.ResponseWriter`; `http2/reset.go` unwraps middleware.
+`http2-reset.patch` records the protocol and build-selection changes.
+Verification checks the pinned upstream checksum, reconstructs the documented
+notice cleanup and Go formatting, applies the patch without fuzzy or offset
+matching, then compares every shipped file byte. Unexpected files, missing
+files, or other edits fail verification.
+
+The fork selects that server and transport on both Go 1.26 and Go 1.27.
+The upstream Go 1.27 wrappers delegate to `net/http`, which does not expose
+the required stream reset method and rejects the extended-CONNECT client
+pseudo-header on this path. Their source is retained for review behind an
+unsatisfiable build constraint. No additional build tag is required. The
+reset API has a compile-time check that the selected writer implements it,
+so future updates cannot silently bypass the protocol patch.
 
 RFC 9113 §8.1.1 requires PROTOCOL_ERROR for malformed HTTP/2 messages.
 RFC 9297 §3.3 applies that requirement to malformed capsules. Go's existing
@@ -18,16 +29,22 @@ Go does not inherit dependency replacements. The handler calls the added API
 directly, so a build missing the replacement fails at compile time instead
 of silently shipping incorrect error codes.
 
-Validation uses Go 1.26.8, the complete upstream HTTP/2 and HPACK tests with
+Validation covers Go 1.26 and Go 1.27, the upstream HTTP/2 and HPACK tests with
 the race detector, frame-level MASQUE regression tests, and the Rust client.
 Run `python3 tests/verify-http2-fork.py` from this repository to compare the
 entire fork against the pinned upstream source plus the recorded patch.
 When updating x/net or Go, refresh this patch and run both sets of tests.
 
+The HTTP/1-response diagnostic regression test also synchronizes response
+reads with request-header writes. The upstream test otherwise sometimes
+observes an already-closed unused connection instead of its intended active
+request error. The original diagnostic assertion and production retry logic
+are unchanged.
+
 ## HTTP/3 Datagram rejection
 
-`quic-go` is the complete, pinned `github.com/quic-go/quic-go v0.63.0`
-source with its upstream license. `http3-datagram-rejection.patch` records
+`quic-go` is the pinned `github.com/quic-go/quic-go v0.63.0`
+source. `http3-datagram-rejection.patch` records
 the only changes: an explicit `http3.RejectDatagrams` API, request-scoped
 Datagram rejection state, and regression tests.
 

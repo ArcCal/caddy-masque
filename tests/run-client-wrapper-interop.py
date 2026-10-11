@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Build current Rust app APIs and test them against the real Caddy transports."""
+
+import argparse
+import itertools
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+TEST_NAME = "TestInteropCurrentMacAndKillswitch"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--masque-vpn-root", type=Path,
+        help="Current masque-vpn checkout; defaults to the sibling of caddy-masque.",
+    )
+    parser.add_argument("--release", action="store_true", help="Build the Rust harness with --release.")
+    parser.add_argument(
+        "--compile-only", action="store_true",
+        help="Compile the Rust harness and Go overlay without running interoperability cases.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    repo = Path(__file__).resolve().parents[1]
+    assets = repo / "tests" / "clients"
+    vpn = (args.masque_vpn_root or repo.parent / "masque-vpn").resolve()
+    paths = {
+        "__MASQUE_CORE_PATH__": vpn / "crates" / "masque-vpn",
+        "__MASQUE_MAC_PATH__": vpn / "masque-vpn-mac",
+        "__MASQUE_KILLSWITCH_PATH__": vpn / "masque-vpn-killswitch",
+    }
+    for dependency in paths.values():
+        if not (dependency / "Cargo.toml").is_file():
+            raise SystemExit(f"Required current Rust project is missing: {dependency}")
+
+    environment = os.environ.copy()
+    target = environment.get("CARGO_TARGET_DIR")
+    if target:
+        # Interpret a caller's relative shared cache before changing directory.
+        environment["CARGO_TARGET_DIR"] = str(Path(target).resolve())
+
+    with tempfile.TemporaryDirectory(prefix="caddy-masque-wrapper-interop-") as temporary:
+        workspace = Path(temporary)
+        (workspace / "src").mkdir()
+        template = (assets / "Cargo.toml.in").read_text(encoding="utf-8")
+        for marker, dependency in paths.items():
+            template = template.replace(marker, json.dumps(str(dependency)))
+        (workspace / "Cargo.toml").write_text(template, encoding="utf-8")
+        shutil.copyfile(assets / "Cargo.lock", workspace / "Cargo.lock")
+        shutil.copyfile(assets / "main.rs", workspace / "src" / "main.rs")
+
+        cargo = ["cargo", "build", "--locked", "--manifest-path", str(workspace / "Cargo.toml")]
+        if args.release:
+            cargo.append("--release")
+        built = subprocess.run(cargo, cwd=workspace, env=environment)
+        if built.returncode:
+            return built.returncode
+        target = Path(environment.get("CARGO_TARGET_DIR", workspace / "target"))
+        profile = "release" if args.release else "debug"
+        binary = target / profile / "caddy-wrapper-compat"
+        if not binary.is_file():
+            raise SystemExit(f"The built Rust interoperability harness is missing: {binary}")
+        environment["MASQUE_WRAPPER_COMPAT"] = str(binary)
+
+        overlay = workspace / "overlay.json"
+        overlay.write_text(json.dumps({"Replace": {
+            str(repo / "zz_current_wrapper_compat_test.go"):
+                str(assets / "caddy_wrapper_compat_test.go.in"),
+        }}), encoding="utf-8")
+        pattern = "^$" if args.compile_only else f"^{TEST_NAME}$"
+        command = [
+            "go", "test", "-race", f"-overlay={overlay}", "-count=1",
+            "-timeout=10m", "-run", pattern, "-v", ".",
+        ]
+        process = subprocess.Popen(
+            command, cwd=repo, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        lines = []
+        for line in process.stdout:
+            lines.append(line)
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        code = process.wait()
+        if code:
+            return code
+        output = "".join(lines)
+        if "--- SKIP:" in output:
+            raise SystemExit("Interoperability validation cannot succeed with skipped cases.")
+        if args.compile_only:
+            print("Build-only check passed; zero interoperability cases were run.")
+            return 0
+        expected = set(itertools.product(
+            ("mac", "killswitch"), ("ipv4-only", "dual-stack"),
+            ("h3", "h2", "http1.1", "h3-capsules"),
+        ))
+        passed = re.findall(
+            rf"^\s*--- PASS: {TEST_NAME}/(mac|killswitch)/(ipv4-only|dual-stack)/(h3|h2|http1\.1|h3-capsules)(?=\s|$)",
+            output, re.MULTILINE,
+        )
+        if len(passed) != 16 or set(passed) != expected:
+            raise SystemExit(f"Expected all 16 distinct interoperability cases; observed {len(passed)}.")
+        print("All 16 current Mac/Killswitch Caddy interoperability cases passed under Go race checking.")
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except FileNotFoundError as error:
+        raise SystemExit(f"Required build tool or test asset is missing: {error.filename}")

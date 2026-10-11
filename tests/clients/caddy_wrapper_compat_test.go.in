@@ -1,0 +1,153 @@
+package masque
+
+// Real Caddy TLS, authentication and HTTP transports with the current Mac and
+// Killswitch Rust public APIs. The server TUN and client native host setup are
+// replaced with packet channels. This does not exercise native macOS utun, PF,
+// routing, DNS store or GUI lifecycle.
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/ArcCal/caddy-masque/internal/ip"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+)
+
+// wrapperReflectUDP answers a deterministic UDP echo or a root NS DNS query.
+// Packets still pass Caddy's routing, TTL, checksum, authentication and protocol
+// processing; checksums are recomputed for the simulated destination's replies.
+func wrapperReflectUDP(packet []byte) []byte {
+	h, ok := ip.Parse(packet)
+	if !ok || h.Protocol != ip.ProtoUDP || h.PayloadOffset < 0 || h.PayloadOffset+8 > h.TotalLen {
+		return nil
+	}
+	u := packet[h.PayloadOffset:h.TotalLen]
+	port := binary.BigEndian.Uint16(u[2:4])
+	if port == 7 {
+		return reflectUDP(packet)
+	}
+	if port != 53 || len(u) != 25 || !h.IsIPv4() {
+		return nil
+	}
+	// Reuse the echo helper to swap endpoints and form a valid UDP checksum.
+	copyPacket := append([]byte(nil), packet[:h.TotalLen]...)
+	binary.BigEndian.PutUint16(copyPacket[h.PayloadOffset+2:h.PayloadOffset+4], 7)
+	copyPacket[h.PayloadOffset+8+2] |= 0x80 // DNS QR response, same question/ID.
+	response := reflectUDP(copyPacket)
+	if response == nil {
+		return nil
+	}
+	u = response[h.PayloadOffset:]
+	binary.BigEndian.PutUint16(u[:2], 53)
+	u[6], u[7] = 0, 0
+	length := binary.BigEndian.AppendUint32(nil, uint32(len(u)))
+	csum := ip.Checksum(response[12:16], response[16:20], length, []byte{0, 0, 0, ip.ProtoUDP}, u)
+	if csum == 0 {
+		csum = 0xffff
+	}
+	binary.BigEndian.PutUint16(u[6:8], csum)
+	return response
+}
+
+func TestInteropCurrentMacAndKillswitch(t *testing.T) {
+	binary := os.Getenv("MASQUE_WRAPPER_COMPAT")
+	if binary == "" {
+		t.Fatal("MASQUE_WRAPPER_COMPAT must name the built current wrapper compatibility harness")
+	}
+	for _, app := range []string{"mac", "killswitch"} {
+		for _, family := range []string{"ipv4-only", "dual-stack"} {
+			for _, mode := range []struct{ name, transport string }{
+				{"h3", "h3"}, {"h2", "h2"}, {"http1.1", "http/1.1"}, {"h3-capsules", "h3"},
+			} {
+				t.Run(app+"/"+family+"/"+mode.name, func(t *testing.T) {
+					e := newCaddyEnv(t)
+					cert, caPEM := newTestChain(t)
+					// Do not increase max_sessions or turn off MTU probing: test
+					// production defaults with independent simultaneous sessions.
+					e.cert = cert
+					cfg := masqueConfig("alice")
+					cfg["blocked_destinations"] = []string{}
+					if family == "ipv4-only" {
+						delete(cfg, "ipv6")
+					}
+					if mode.name == "h3-capsules" {
+						cfg["http3"] = false
+					}
+					if err := e.load(cfg); err != nil {
+						t.Fatal(err)
+					}
+					// Independently verify the selected HTTP/3 server's advertised
+					// datagram capability instead of labeling both H3 paths alike.
+					if mode.transport == "h3" {
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+						conn, err := quic.DialAddr(ctx, fmt.Sprintf("127.0.0.1:%d", e.port), http3.ConfigureTLSConfig(e.tlsConfig("h3")), &quic.Config{EnableDatagrams: true})
+						if err != nil {
+							t.Fatal(err)
+						}
+						cc := (&http3.Transport{EnableDatagrams: true}).NewClientConn(conn)
+						select {
+						case <-cc.ReceivedSettings():
+						case <-ctx.Done():
+							t.Fatal("HTTP/3 SETTINGS missing")
+						}
+						wantDatagrams := mode.name == "h3"
+						if cc.Settings().EnableDatagrams != wantDatagrams || !cc.Settings().EnableExtendedConnect {
+							t.Fatalf("unexpected HTTP/3 capabilities: %+v", cc.Settings())
+						}
+						_ = conn.CloseWithError(0, "")
+					}
+					var sourcesMu sync.Mutex
+					sources := make(map[string]int)
+					go func() {
+						for {
+							select {
+							case packet := <-e.dev.toHost:
+								if h, ok := ip.Parse(packet); ok && h.IsIPv4() && h.Protocol == ip.ProtoUDP {
+									sourcesMu.Lock()
+									sources[h.Src.String()]++
+									sourcesMu.Unlock()
+								}
+								if response := wrapperReflectUDP(packet); response != nil {
+									select {
+									case e.dev.fromHost <- response:
+									case <-e.dev.closed:
+										return
+									}
+								}
+							case <-e.dev.closed:
+								return
+							}
+						}
+					}()
+					caFile := filepath.Join(t.TempDir(), "ca.pem")
+					if err := os.WriteFile(caFile, []byte(caPEM), 0600); err != nil {
+						t.Fatal(err)
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+					defer cancel()
+					command := exec.CommandContext(ctx, binary, app, fmt.Sprint(e.port), caFile, mode.transport, family)
+					output, err := command.CombinedOutput()
+					if err != nil {
+						t.Fatalf("current wrapper harness: %v\n%s", err, output)
+					}
+					t.Logf("%s", output)
+					sourcesMu.Lock()
+					if len(sources) != 2 {
+						t.Errorf("VPN and SOCKS must use two independently assigned IPv4 addresses; got %d", len(sources))
+					}
+					sourcesMu.Unlock()
+					waitNoSessions(t)
+				})
+			}
+		}
+	}
+}
