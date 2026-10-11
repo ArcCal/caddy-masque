@@ -1,15 +1,13 @@
 package quic
 
 import (
-	"net/netip"
 	"sync"
 )
 
 type datagram struct {
-	b         []byte
-	localAddr netip.AddrPort
-	peerAddr  netip.AddrPort
-	ecn       ecnBits
+	b    []byte
+	path pathAddrs
+	ecn  ecnBits
 }
 
 // Explicit Congestion Notification bits.

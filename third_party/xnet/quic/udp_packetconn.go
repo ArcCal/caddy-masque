@@ -33,6 +33,14 @@ func (c *netPacketConn) LocalAddr() netip.AddrPort {
 	return c.localAddr
 }
 
+func (c *netPacketConn) LocalAddrFor(remote netip.AddrPort) (netip.AddrPort, error) {
+	if c.localAddr.Addr().IsUnspecified() {
+		// If this is the unspec address, we have no way to pick a better one.
+		return netip.AddrPort{}, nil
+	}
+	return c.localAddr, nil
+}
+
 func (c *netPacketConn) Read(f func(*datagram)) error {
 	for {
 		dgram := newDatagram()
@@ -40,7 +48,7 @@ func (c *netPacketConn) Read(f func(*datagram)) error {
 		if err != nil {
 			return err
 		}
-		dgram.peerAddr, err = addrPortFromAddr(peerAddr)
+		dgram.path.peer, err = addrPortFromAddr(peerAddr)
 		if err != nil {
 			continue
 		}
@@ -50,7 +58,7 @@ func (c *netPacketConn) Read(f func(*datagram)) error {
 }
 
 func (c *netPacketConn) Write(dgram datagram) error {
-	_, err := c.c.WriteTo(dgram.b, net.UDPAddrFromAddrPort(dgram.peerAddr))
+	_, err := c.c.WriteTo(dgram.b, net.UDPAddrFromAddrPort(dgram.path.peer))
 	return err
 }
 
