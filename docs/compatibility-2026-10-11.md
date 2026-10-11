@@ -1,5 +1,9 @@
 # Caddy 2.11.7 and Go 1.27 compatibility verification
 
+This report records the earlier x/net 0.59.0 compatibility repair. The
+[subsequent HTTP/2 security repair](http2-security-2026-10-11.md) uses x/net
+0.60.0 and fresh validation; its results supersede this report for security.
+
 The repaired working tree supports the existing CONNECT-IP protocol on Go
 1.26.9 and Go 1.27.2 without an additional HTTP/2 build tag. Caddy was upgraded
 from 2.11.6 to [2.11.7](https://github.com/caddyserver/caddy/releases/tag/v2.11.7),

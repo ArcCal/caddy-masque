@@ -3,9 +3,7 @@ package http2_test
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
-	crand "crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -13,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math/rand"
 	"net"
 	"net/http"
@@ -22,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1873,6 +1873,76 @@ func testTransportResponseHeaderTimeout(t testing.TB, body bool) {
 	}
 }
 
+// "An endpoint MUST treat a change to SETTINGS_INITIAL_WINDOW_SIZE
+// that causes any flow-control window to exceed the maximum size as
+// a connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR."
+// -- https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2-7
+func TestTransportSettingsFlowControlUpdateBeyondLimit(t *testing.T) {
+	synctestTest(t, testTransportSettingsFlowControlUpdateBeyondLimit)
+}
+func testTransportSettingsFlowControlUpdateBeyondLimit(t testing.TB) {
+	tc := newTestClientConn(t)
+	tc.greet()
+
+	body := tc.newRequestBody()
+	req, _ := http.NewRequest("GET", "https://dummy.tld/", body)
+	rt := tc.roundTrip(req)
+	tc.wantFrameType(FrameHeaders)
+
+	// Give this stream some additional flow control.
+	const windowIncrease = 1000
+	tc.writeWindowUpdate(rt.streamID(), windowIncrease)
+	tc.wantIdle()
+
+	// Adjust the initial flow control window. The stream is now over the limit.
+	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+	const maxInitialWindowSize = maxWindowSize - windowIncrease
+	tc.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize + 1})
+	tc.wantSettingsAck()
+
+	// We detect this condition lazily. Write something to the stream so we notice.
+	body.writeBytes(1)
+	body.closeWithError(io.EOF)
+
+	tc.wantGoAway(0, ErrCodeFlowControl)
+}
+
+// Counterpart to TestTransportSettingsFlowControlUpdateBeyondLimit:
+// A SETTINGS update which doesn't quite put a stream over the flow control limit.
+func TestTransportSettingsFlowControlUpdateWithinLimit(t *testing.T) {
+	synctestTest(t, testTransportSettingsFlowControlUpdateWithinLimit)
+}
+func testTransportSettingsFlowControlUpdateWithinLimit(t testing.TB) {
+	tc := newTestClientConn(t)
+	tc.greet()
+
+	body := tc.newRequestBody()
+	req, _ := http.NewRequest("GET", "https://dummy.tld/", body)
+	rt := tc.roundTrip(req)
+	tc.wantFrameType(FrameHeaders)
+
+	// Give this stream some additional flow control.
+	const windowIncrease = 1000
+	tc.writeWindowUpdate(rt.streamID(), windowIncrease)
+	tc.wantIdle()
+
+	// Adjust the initial flow control window. The stream is just within the limit.
+	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+	const maxInitialWindowSize = maxWindowSize - windowIncrease
+	tc.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize})
+	tc.wantSettingsAck()
+
+	body.writeBytes(1)
+	body.closeWithError(io.EOF)
+	tc.wantData(wantData{
+		streamID:  1,
+		endStream: true,
+		size:      1,
+		multiple:  true,
+	})
+	tc.wantIdle()
+}
+
 // https://go.dev/issue/77331
 func TestTransportWindowUpdateBeyondLimit(t *testing.T) {
 	synctestTest(t, testTransportWindowUpdateBeyondLimit)
@@ -2095,6 +2165,161 @@ func TestTransportRejectsContentLengthWithSign(t *testing.T) {
 
 			if got != tt.wantCL {
 				t.Fatalf("Got: %q\nWant: %q", got, tt.wantCL)
+			}
+		})
+	}
+}
+
+// TestTransportResponseContentLength checks that a Content-Length we cannot
+// validate is dropped from the response rather than passed on to the caller,
+// who may be forwarding it to an HTTP/1 endpoint.
+func TestTransportResponseContentLength(t *testing.T) {
+	tests := []struct {
+		name     string
+		clValues []string
+		wantLen  int // -1 means the header is expected to be dropped.
+	}{
+		{
+			name:     "single value",
+			clValues: []string{"3"},
+			wantLen:  3,
+		},
+		{
+			name:     "identical duplicate values",
+			clValues: []string{"3", "3", "3"},
+			wantLen:  3,
+		},
+		{
+			name:     "different duplicate values",
+			clValues: []string{"3", "1", "3"},
+			wantLen:  -1,
+		},
+		{
+			name:     "extraneous whitespace",
+			clValues: []string{" 3"},
+			wantLen:  -1,
+		},
+		{
+			name:     "identical duplicate values with extraneous whitespace",
+			clValues: []string{"3", "3", " 3"},
+			wantLen:  -1,
+		},
+		{
+			name:     "plus sign",
+			clValues: []string{"+3"},
+			wantLen:  -1,
+		},
+		{
+			name:     "non-numeric",
+			clValues: []string{"abc"},
+			wantLen:  -1,
+		},
+		{
+			name:     "empty value",
+			clValues: []string{""},
+			wantLen:  -1,
+		},
+		{
+			name:    "no header",
+			wantLen: -1,
+		},
+	}
+	for _, tt := range tests {
+		synctestSubtest(t, tt.name, func(t testing.TB) {
+			tc := newTestClientConn(t)
+			tc.greet()
+
+			req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
+			rt := tc.roundTrip(req)
+
+			headers := []string{":status", "200"}
+			for _, val := range tt.clValues {
+				headers = append(headers, "content-length", val)
+			}
+			tc.wantFrameType(FrameHeaders)
+			tc.writeHeaders(HeadersFrameParam{
+				StreamID:      rt.streamID(),
+				EndHeaders:    true,
+				BlockFragment: tc.makeHeaderBlockFragment(headers...),
+			})
+			body := slices.Repeat([]byte("a"), max(tt.wantLen, 1))
+			tc.writeData(rt.streamID(), true, body)
+
+			res := rt.response()
+			rt.wantBody(body)
+
+			if res.ContentLength != int64(tt.wantLen) {
+				t.Errorf("got ContentLength = %d, want %d", res.ContentLength, tt.wantLen)
+			}
+			var wantHeader []string
+			if tt.wantLen >= 0 {
+				wantHeader = []string{strconv.FormatInt(int64(tt.wantLen), 10)}
+			}
+			if got := res.Header["Content-Length"]; !slices.Equal(got, wantHeader) {
+				t.Errorf("got Header[%q] = %q, want %q", "Content-Length", got, wantHeader)
+			}
+		})
+	}
+}
+
+// TestTransportResponseConnHeaders checks that connection-related headers,
+// which are not valid in HTTP/2 and which an HTTP/1 endpoint may use for
+// framing, are dropped from the response.
+func TestTransportResponseConnHeaders(t *testing.T) {
+	tests := []struct {
+		name       string
+		fields     []string
+		wantHeader http.Header
+	}{
+		{
+			name:       "unaffected header",
+			fields:     []string{"content-type", "text/plain"},
+			wantHeader: http.Header{"Content-Type": {"text/plain"}},
+		},
+		{
+			name:   "transfer-encoding",
+			fields: []string{"transfer-encoding", "chunked"},
+		},
+		{
+			name:   "transfer-encoding alongside content-length",
+			fields: []string{"content-length", "-1", "transfer-encoding", "chunked"},
+		},
+		{
+			name:   "connection and keep-alive",
+			fields: []string{"connection", "keep-alive", "keep-alive", "timeout=5"},
+		},
+		{
+			name:   "proxy-connection",
+			fields: []string{"proxy-connection", "keep-alive"},
+		},
+		{
+			name:   "upgrade",
+			fields: []string{"upgrade", "websocket"},
+		},
+	}
+	for _, tt := range tests {
+		synctestSubtest(t, tt.name, func(t testing.TB) {
+			tc := newTestClientConn(t)
+			tc.greet()
+
+			req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
+			rt := tc.roundTrip(req)
+
+			headers := []string{":status", "200"}
+			headers = append(headers, tt.fields...)
+			tc.wantFrameType(FrameHeaders)
+			tc.writeHeaders(HeadersFrameParam{
+				StreamID:      rt.streamID(),
+				EndHeaders:    true,
+				BlockFragment: tc.makeHeaderBlockFragment(headers...),
+			})
+			tc.writeData(rt.streamID(), true, []byte("body"))
+
+			res := rt.response()
+			rt.wantBody([]byte("body"))
+
+			if !maps.EqualFunc(res.Header, tt.wantHeader, slices.Equal) {
+				t.Errorf("got Header = %q, want %q", res.Header, tt.wantHeader)
 			}
 		})
 	}
@@ -3676,125 +3901,6 @@ func testTransportHandlesInvalidStatuslessResponse(t testing.TB) {
 		),
 	})
 	tc.writeData(rt.streamID(), true, []byte("payload"))
-}
-
-func BenchmarkClientRequestHeaders(b *testing.B) {
-	b.Run("   0 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 0, 0) })
-	b.Run("  10 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 10, 0) })
-	b.Run(" 100 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 100, 0) })
-	b.Run("1000 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 1000, 0) })
-}
-
-func BenchmarkClientResponseHeaders(b *testing.B) {
-	b.Run("   0 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 0, 0) })
-	b.Run("  10 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 0, 10) })
-	b.Run(" 100 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 0, 100) })
-	b.Run("1000 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 0, 1000) })
-}
-
-func BenchmarkDownloadFrameSize(b *testing.B) {
-	b.Run(" 16k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 16*1024) })
-	b.Run(" 64k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 64*1024) })
-	b.Run("128k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 128*1024) })
-	b.Run("256k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 256*1024) })
-	b.Run("512k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 512*1024) })
-}
-func benchLargeDownloadRoundTrip(b *testing.B, frameSize uint32) {
-	DisableGoroutineTracking(b)
-	const transferSize = 1024 * 1024 * 1024 // must be multiple of 1M
-	b.ReportAllocs()
-	ts := newTestServer(b,
-		func(w http.ResponseWriter, r *http.Request) {
-			// test 1GB transfer
-			w.Header().Set("Content-Length", strconv.Itoa(transferSize))
-			w.Header().Set("Content-Transfer-Encoding", "binary")
-			var data [1024 * 1024]byte
-			for i := 0; i < transferSize/(1024*1024); i++ {
-				w.Write(data[:])
-			}
-		}, optQuiet,
-	)
-
-	tr := &Transport{TLSClientConfig: tlsConfigInsecure, MaxReadFrameSize: frameSize}
-	defer tr.CloseIdleConnections()
-
-	req, err := http.NewRequest("GET", ts.URL, nil)
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	b.N = 3
-	b.SetBytes(transferSize)
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		res, err := tr.RoundTrip(req)
-		if err != nil {
-			if res != nil {
-				res.Body.Close()
-			}
-			b.Fatalf("RoundTrip err = %v; want nil", err)
-		}
-		data, _ := io.ReadAll(res.Body)
-		if len(data) != transferSize {
-			b.Fatalf("Response length invalid")
-		}
-		res.Body.Close()
-		if res.StatusCode != http.StatusOK {
-			b.Fatalf("Response code = %v; want %v", res.StatusCode, http.StatusOK)
-		}
-	}
-}
-
-func BenchmarkClientGzip(b *testing.B) {
-	DisableGoroutineTracking(b)
-	b.ReportAllocs()
-
-	const responseSize = 1024 * 1024
-
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	if _, err := io.CopyN(gz, crand.Reader, responseSize); err != nil {
-		b.Fatal(err)
-	}
-	gz.Close()
-
-	data := buf.Bytes()
-	ts := newTestServer(b,
-		func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Encoding", "gzip")
-			w.Write(data)
-		},
-		optQuiet,
-	)
-
-	tr := &Transport{TLSClientConfig: tlsConfigInsecure}
-	defer tr.CloseIdleConnections()
-
-	req, err := http.NewRequest("GET", ts.URL, nil)
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		res, err := tr.RoundTrip(req)
-		if err != nil {
-			b.Fatalf("RoundTrip err = %v; want nil", err)
-		}
-		if res.StatusCode != http.StatusOK {
-			b.Fatalf("Response code = %v; want %v", res.StatusCode, http.StatusOK)
-		}
-		n, err := io.Copy(io.Discard, res.Body)
-		res.Body.Close()
-		if err != nil {
-			b.Fatalf("RoundTrip err = %v; want nil", err)
-		}
-		if n != responseSize {
-			b.Fatalf("RoundTrip expected %d bytes, got %d", responseSize, n)
-		}
-	}
 }
 
 // The client closes the connection just after the server got the client's HEADERS

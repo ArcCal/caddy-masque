@@ -29,3 +29,9 @@ jobs:
           go-version: "1.26"
           check-latest: true
       - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      # Local replacements have no version of their own. Also query the
+      # recorded upstream pins instead of relying only on the source scan.
+      - run: python3 tests/verify-http2-fork.py
+      - run: python3 tests/verify-http3-fork.py
+      - run: python3 tests/check-transport-vulnerabilities.py
+      - run: python3 tests/test-http2-security.py

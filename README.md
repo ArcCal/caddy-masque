@@ -15,7 +15,9 @@ The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as
 
 Linux x86_64 and arm64 only (needs root: it creates a TUN device and sets up forwarding and NAT).
 
-Current version 1.2.0 (tag `v1.2.0`). The differences between versions are in [CHANGELOG.md](CHANGELOG.md).
+The latest release tag is `v1.2.0`; main contains newer fixes. Rebuild from updated
+main for the [HTTP/2 security repair](docs/http2-security-2026-10-11.md).
+The differences between versions are in [CHANGELOG.md](CHANGELOG.md).
 Earlier review results and native-validation requirements are in [the October 4 production review](docs/review-2026-10-04-production.md).
 Design goals and the checks required for Caddy updates are in [the design document](docs/design.md).
 
@@ -46,7 +48,7 @@ Existing users carry over as they are: each `[[user]]` in `server.toml` becomes 
 
 ## Building by hand
 
-Needs Go 1.26 or 1.27:
+Needs Go 1.26.9 or 1.27.2, or a later reviewed patch of those lines:
 
 ```sh
 go build -o caddy ./cmd/caddy

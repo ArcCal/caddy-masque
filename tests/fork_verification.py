@@ -33,6 +33,8 @@ def verify_module_directory(directory, name, version, expected_sum):
     were subsequently edited. Hash the sources actually used as our baseline.
     """
     directory = Path(directory)
+    if directory.is_symlink() or not directory.is_dir():
+        raise SystemExit("Upstream module root must be a regular directory")
     summary = hashlib.sha256()
     for path in sorted(directory.rglob("*"), key=lambda item: item.relative_to(directory).as_posix()):
         relative = path.relative_to(directory).as_posix()
@@ -178,6 +180,9 @@ def apply_patch(directory, patch_path):
 
 def tree_files(directory):
     """Reject nonregular entries and include all file bytes and directories."""
+    directory = Path(directory)
+    if directory.is_symlink() or not directory.is_dir():
+        raise SystemExit("Fork source root must be a regular directory")
     entries = {}
     for path in sorted(Path(directory).rglob("*")):
         relative = path.relative_to(directory).as_posix()

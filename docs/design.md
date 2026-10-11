@@ -56,6 +56,11 @@ Every proposed upgrade requires these checks:
    cancellation uses CANCEL/H3_REQUEST_CANCELLED, and Datagram faults use
    H3_DATAGRAM_ERROR with the required stream/connection distinction. Check
    other-stream isolation, Capsule negotiation and IPv6 MTU behavior.
+   Run the named security regressions and both reachability-based vulnerability
+   scanning and the recorded transport-version advisory query. Local
+   replacements can hide their upstream version from the source scan. Updating
+   Go's standard library does not patch the separately vendored HTTP/2 server
+   and transport; verify the actual source against a security-fixed snapshot.
 4. Run real masque-client interoperability and the current Mac/Killswitch
    protocol-core matrix over all four modes. Run strict Linux kernel and wire
    conformance checks against the final artifact. Cover TLS trust and refusal,
@@ -75,4 +80,5 @@ separately, and identify native Mac or arm64 execution that remains unrun.
 Neither cross-compilation nor Linux kernel tests substitute for those checks.
 Test evidence is not a claim of formal IETF or Apple certification. See the
 [current compatibility report](compatibility-2026-10-11.md) and
+[HTTP/2 security repair](http2-security-2026-10-11.md), plus the
 [wrapper harness scope](../tests/clients/README.md).

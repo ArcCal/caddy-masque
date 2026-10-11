@@ -106,6 +106,7 @@ func handshakeDatagrams(tc *testConn) (dgrams []*testDatagram) {
 			},
 		}},
 		paddedSize: 1200,
+		path:       tc.path,
 	}, {
 		// Server Initial + Handshake + 1-RTT
 		packets: []*testPacket{{
@@ -142,6 +143,7 @@ func handshakeDatagrams(tc *testConn) (dgrams []*testDatagram) {
 			},
 		}},
 		paddedSize: 1200,
+		path:       tc.path,
 	}, {
 		// Client Initial + Handshake + 1-RTT
 		packets: []*testPacket{{
@@ -183,6 +185,7 @@ func handshakeDatagrams(tc *testConn) (dgrams []*testDatagram) {
 			},
 		}},
 		paddedSize: 1200,
+		path:       tc.path,
 	}, {
 		// Server HANDSHAKE_DONE
 		packets: []*testPacket{{
@@ -196,6 +199,7 @@ func handshakeDatagrams(tc *testConn) (dgrams []*testDatagram) {
 				debugFrameHandshakeDone{},
 			},
 		}},
+		path: tc.path,
 	}, {
 		// Client ack (after max_ack_delay)
 		packets: []*testPacket{{
@@ -210,6 +214,7 @@ func handshakeDatagrams(tc *testConn) (dgrams []*testDatagram) {
 				},
 			},
 		}},
+		path: tc.path,
 	}}
 }
 
@@ -614,7 +619,8 @@ func testConnAEADLimitReached(t *testing.T) {
 	sendInvalid := func() {
 		t.Logf("<- conn under test receives invalid datagram")
 		tc.conn.sendMsg(&datagram{
-			b: invalid,
+			b:    invalid,
+			path: tc.path,
 		})
 		synctest.Wait()
 	}

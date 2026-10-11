@@ -790,6 +790,7 @@ func testRejectInitialSrcConnIDTooLong(t *testing.T) {
 				},
 			},
 		}},
+		path:       defaultEndpointPath,
 		paddedSize: 1200,
 	})
 	te.wantIdle("server should ignore Initial with too-long SCID")
@@ -822,6 +823,7 @@ func testRejectInitialDstConnIDTooLong(t *testing.T) {
 				},
 			},
 		}},
+		path:       defaultEndpointPath,
 		paddedSize: 1200,
 	})
 	te.wantIdle("server should ignore Initial with too-long DCID")

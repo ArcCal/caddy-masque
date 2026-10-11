@@ -88,7 +88,7 @@
 @@ -1,2 +0,0 @@
 -//go:build !(go1.27 && !http2legacy)
 -
-@@ -2693,0 +2692,10 @@
+@@ -2715,0 +2714,10 @@
 +// ResetStream terminates this stream with the specified HTTP/2 error code.
 +// It uses the server's frame queue, preserving serialization with other streams.
 +func (w *responseWriter) ResetStream(code uint32) error {
@@ -211,11 +211,6 @@
 +// Retain this upstream wrapper for review, but never select it for a build.
 --- a/http2/writesched.go
 +++ b/http2/writesched.go
-@@ -1,2 +0,0 @@
--//go:build !(go1.27 && !http2legacy)
--
---- a/http2/writesched_benchmarks_test.go
-+++ b/http2/writesched_benchmarks_test.go
 @@ -1,2 +0,0 @@
 -//go:build !(go1.27 && !http2legacy)
 -
