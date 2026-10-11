@@ -1,31 +1,72 @@
---- a/http2/server.go
-+++ b/http2/server.go
-@@ -2695,6 +2695,16 @@
- 	}
- }
- 
-+// ResetStream terminates this stream with the specified HTTP/2 error code.
-+// It uses the server's frame queue, preserving serialization with other streams.
-+func (w *responseWriter) ResetStream(code uint32) error {
-+	st := w.rws.stream
-+	return st.sc.writeFrameFromHandler(FrameWriteRequest{
-+		write:  StreamError{StreamID: st.id, Code: ErrCode(code)},
-+		stream: st,
-+	})
-+}
+--- a/http2/README.md
++++ b/http2/README.md
+@@ -0,0 +1,10 @@
++## Local MASQUE fork
 +
- func (w *responseWriter) SetReadDeadline(deadline time.Time) error {
- 	st := w.rws.stream
- 	if !deadline.IsZero() && deadline.Before(time.Now()) {
---- a/http2/reset.go
++This repository always selects the patched original HTTP/2 server and
++transport on Go 1.26 and Go 1.27 to preserve extended CONNECT and explicit
++stream reset behavior. No `http2legacy` build tag is required.
++
++The text below describes the upstream package's selection behavior.
++
++## Upstream package
++
+--- a/http2/client_conn_pool.go
++++ b/http2/client_conn_pool.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/clientconn_go126_test.go
++++ b/http2/clientconn_go126_test.go
+@@ -1 +1 @@
+-//go:build go1.26 && !(go1.27 && !http2legacy)
++//go:build go1.26
+--- a/http2/clientconn_nowrap_test.go
++++ b/http2/clientconn_nowrap_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/clientconn_wrap_test.go
++++ b/http2/clientconn_wrap_test.go
+@@ -1 +1,4 @@
+-//go:build go1.27 && !http2legacy
++//go:build go1.27 && !go1.27
++
++// MASQUE requires the patched legacy implementation on every toolchain.
++// Retain this upstream wrapper for review, but never select it for a build.
+--- a/http2/config.go
++++ b/http2/config.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/config_test.go
++++ b/http2/config_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/export_test.go
++++ b/http2/export_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/export_wrap_test.go
++++ b/http2/export_wrap_test.go
+@@ -1 +1,4 @@
+-//go:build go1.27 && !http2legacy
++//go:build go1.27 && !go1.27
++
++// MASQUE requires the patched legacy implementation on every toolchain.
++// Retain this upstream wrapper for review, but never select it for a build.
+--- /dev/null
 +++ b/http2/reset.go
-@@ -0,0 +1,22 @@
-+// Copyright 2026 The Go Authors. All rights reserved.
-+// Use of this source code is governed by a BSD-style license in LICENSE.
-+
+@@ -0,0 +1,23 @@
 +package http2
 +
 +import "net/http"
++
++// Keep the reset API and the selected server implementation together.
++// A build must fail if a dependency update bypasses the patched writer.
++var _ interface{ ResetStream(uint32) error } = (*responseWriter)(nil)
 +
 +// ResetStream terminates an HTTP/2 response stream using code. It unwraps
 +// middleware response writers and returns http.ErrNotSupported on other
@@ -42,3 +83,184 @@
 +		return http.ErrNotSupported
 +	}
 +}
+--- a/http2/server.go
++++ b/http2/server.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+@@ -2693,0 +2692,10 @@
++// ResetStream terminates this stream with the specified HTTP/2 error code.
++// It uses the server's frame queue, preserving serialization with other streams.
++func (w *responseWriter) ResetStream(code uint32) error {
++	st := w.rws.stream
++	return st.sc.writeFrameFromHandler(FrameWriteRequest{
++		write:  StreamError{StreamID: st.id, Code: ErrCode(code)},
++		stream: st,
++	})
++}
++
+--- a/http2/server_internal_test.go
++++ b/http2/server_internal_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/server_push_test.go
++++ b/http2/server_push_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/server_test.go
++++ b/http2/server_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/server_wrap.go
++++ b/http2/server_wrap.go
+@@ -1 +1,4 @@
+-//go:build go1.27 && !http2legacy
++//go:build go1.27 && !go1.27
++
++// MASQUE requires the patched legacy implementation on every toolchain.
++// Retain this upstream wrapper for review, but never select it for a build.
+--- a/http2/transport.go
++++ b/http2/transport.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/transport_internal_test.go
++++ b/http2/transport_internal_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/transport_test.go
++++ b/http2/transport_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+@@ -297,0 +296,4 @@
++			ctx, cancel := context.WithCancel(t.Context())
++			defer cancel()
++			wroteHeaders := make(chan struct{})
++			var wroteHeadersOnce sync.Once
+@@ -299,2 +301,11 @@
+-				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+-					return net.Dial(network, addr)
++				DialTLSContext: func(_ context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
++					conn, err := net.Dial(network, addr)
++					if err != nil {
++						return nil, err
++					}
++					return &readAfterHeadersConn{
++						Conn:         conn,
++						ctx:          ctx,
++						wroteHeaders: wroteHeaders,
++						closed:       make(chan struct{}),
++					}, nil
+@@ -304,0 +316 @@
++			defer tr.CloseIdleConnections()
+@@ -309,0 +322,9 @@
++			// Keep the request in flight before reading the HTTP/1 response.
++			// Otherwise the peer can close the unused connection before the
++			// first stream is allocated, giving a connection-establishment
++			// error instead of testing the malformed response diagnostic.
++			req = req.WithContext(httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
++				WroteHeaders: func() {
++					wroteHeadersOnce.Do(func() { close(wroteHeaders) })
++				},
++			}))
+@@ -316,0 +338,24 @@
++}
++
++type readAfterHeadersConn struct {
++	net.Conn
++	ctx          context.Context
++	wroteHeaders <-chan struct{}
++	closed       chan struct{}
++	closeOnce    sync.Once
++}
++
++func (c *readAfterHeadersConn) Read(p []byte) (int, error) {
++	select {
++	case <-c.wroteHeaders:
++		return c.Conn.Read(p)
++	case <-c.ctx.Done():
++		return 0, c.ctx.Err()
++	case <-c.closed:
++		return 0, net.ErrClosed
++	}
++}
++
++func (c *readAfterHeadersConn) Close() error {
++	c.closeOnce.Do(func() { close(c.closed) })
++	return c.Conn.Close()
+--- a/http2/transport_wrap.go
++++ b/http2/transport_wrap.go
+@@ -1 +1,4 @@
+-//go:build go1.27 && !http2legacy
++//go:build go1.27 && !go1.27
++
++// MASQUE requires the patched legacy implementation on every toolchain.
++// Retain this upstream wrapper for review, but never select it for a build.
+--- a/http2/wrap_test.go
++++ b/http2/wrap_test.go
+@@ -1 +1,4 @@
+-//go:build go1.27 && !http2legacy
++//go:build go1.27 && !go1.27
++
++// MASQUE requires the patched legacy implementation on every toolchain.
++// Retain this upstream wrapper for review, but never select it for a build.
+--- a/http2/writesched.go
++++ b/http2/writesched.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/writesched_benchmarks_test.go
++++ b/http2/writesched_benchmarks_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/writesched_priority_rfc7540.go
++++ b/http2/writesched_priority_rfc7540.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/writesched_priority_rfc7540_test.go
++++ b/http2/writesched_priority_rfc7540_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/writesched_priority_rfc9218.go
++++ b/http2/writesched_priority_rfc9218.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/writesched_priority_rfc9218_test.go
++++ b/http2/writesched_priority_rfc9218_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/writesched_random.go
++++ b/http2/writesched_random.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/writesched_random_test.go
++++ b/http2/writesched_random_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/writesched_roundrobin.go
++++ b/http2/writesched_roundrobin.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/writesched_roundrobin_test.go
++++ b/http2/writesched_roundrobin_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-
+--- a/http2/writesched_test.go
++++ b/http2/writesched_test.go
+@@ -1,2 +0,0 @@
+-//go:build !(go1.27 && !http2legacy)
+-

@@ -1,7 +1,3 @@
-// Copyright 2018 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // Package socks provides a SOCKS version 5 client implementation.
 //
 // SOCKS protocol version 5 is defined in RFC 1928.

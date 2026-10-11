@@ -1,0 +1,17 @@
+[package]
+name = "caddy-wrapper-compat"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+masque-vpn = { path = __MASQUE_CORE_PATH__ }
+masque-vpn-mac = { path = __MASQUE_MAC_PATH__ }
+masque-vpn-killswitch = { path = __MASQUE_KILLSWITCH_PATH__ }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"

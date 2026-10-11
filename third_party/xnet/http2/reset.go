@@ -1,9 +1,10 @@
-// Copyright 2026 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style license in LICENSE.
-
 package http2
 
 import "net/http"
+
+// Keep the reset API and the selected server implementation together.
+// A build must fail if a dependency update bypasses the patched writer.
+var _ interface{ ResetStream(uint32) error } = (*responseWriter)(nil)
 
 // ResetStream terminates an HTTP/2 response stream using code. It unwraps
 // middleware response writers and returns http.ErrNotSupported on other
