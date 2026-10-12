@@ -110,7 +110,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 	connCtx := c.serverContext
 	maxHeaderBytes := c.requestMaxHeaderBytes()
 
-	fp := &frameParser{closeConn: conn.CloseWithError, r: str, streamID: str.StreamID()}
+	fp := &frameParser{request: true, closeConn: conn.CloseWithError, r: str, streamID: str.StreamID()}
 	frame, err := fp.ParseNext(qlogger)
 	if err != nil {
 		if errors.Is(err, errPriorityUpdateForPush) {
