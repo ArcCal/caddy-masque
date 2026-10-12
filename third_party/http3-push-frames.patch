@@ -1,0 +1,282 @@
+--- a/http3/client.go
++++ b/http3/client.go
+@@ -177,15 +177,17 @@
+ 	hstr := c.rawConn.TrackStream(str)
+ 	rsp := &http.Response{}
+ 	trace := httptrace.ContextClientTrace(ctx)
++	s := newStream(hstr, c.rawConn, trace, func(r io.Reader, hf *headersFrame) error {
++		hdr, err := decodeTrailers(r, hf, maxHeaderBytes, c.decoder, c.qlogger, str.StreamID())
++		if err != nil {
++			return err
++		}
++		rsp.Trailer = hdr
++		return nil
++	}, c.qlogger)
++	s.frameParser.client = true
+ 	return newRequestStream(
+-		newStream(hstr, c.rawConn, trace, func(r io.Reader, hf *headersFrame) error {
+-			hdr, err := decodeTrailers(r, hf, maxHeaderBytes, c.decoder, c.qlogger, str.StreamID())
+-			if err != nil {
+-				return err
+-			}
+-			rsp.Trailer = hdr
+-			return nil
+-		}, c.qlogger),
++		s,
+ 		requestWriter,
+ 		reqDone,
+ 		c.decoder,
+@@ -215,6 +217,12 @@
+ 			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameError), "")
+ 			return
+ 		}
++		// This client never sends MAX_PUSH_ID, so a CANCEL_PUSH references a
++		// push ID greater than currently allowed (RFC 9114 section 7.2.3).
++		if _, ok := f.(*cancelPushFrame); ok {
++			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "")
++			return
++		}
+ 		// GOAWAY is the only frame allowed at this point:
+ 		// * unexpected frames are ignored by the frame parser
+ 		// * we don't support any extension that might add support for more frames
+--- a/http3/frames.go
++++ b/http3/frames.go
+@@ -48,6 +48,9 @@
+ }
+ 
+ type frameParser struct {
++	// client is set on a client's request streams: the client never sends
++	// MAX_PUSH_ID, so any PUSH_PROMISE has a push ID larger than it advertised.
++	client    bool
+ 	r         io.Reader
+ 	streamID  quic.StreamID
+ 	closeConn func(quic.ApplicationErrorCode, string) error
+@@ -85,7 +88,7 @@
+ 			}, nil
+ 		case 0x4: // SETTINGS
+ 			return parseSettingsFrame(r, l, p.streamID, qlogger)
+-		case 0x3: // unsupported: CANCEL_PUSH
++		case 0x3: // CANCEL_PUSH; push is unsupported, but callers must reject it
+ 			if qlogger != nil {
+ 				qlogger.RecordEvent(qlog.FrameParsed{
+ 					StreamID: p.streamID,
+@@ -93,7 +96,12 @@
+ 					Frame:    qlog.Frame{Frame: qlog.CancelPushFrame{}},
+ 				})
+ 			}
+-		case 0x5: // unsupported: PUSH_PROMISE
++			id, err := parsePushID(r, l)
++			if err != nil {
++				return nil, err
++			}
++			return &cancelPushFrame{PushID: id}, nil
++		case 0x5: // PUSH_PROMISE; push is unsupported, but callers must reject it
+ 			if qlogger != nil {
+ 				qlogger.RecordEvent(qlog.FrameParsed{
+ 					StreamID: p.streamID,
+@@ -101,13 +109,22 @@
+ 					Frame:    qlog.Frame{Frame: qlog.PushPromiseFrame{}},
+ 				})
+ 			}
++			if p.client {
++				// RFC 9114 section 7.2.5
++				p.closeConn(quic.ApplicationErrorCode(ErrCodeIDError), "")
++				return nil, errors.New("http3: PUSH_PROMISE without MAX_PUSH_ID")
++			}
++			if _, err := io.CopyN(io.Discard, r, int64(l)); err != nil {
++				return nil, err
++			}
++			return &pushPromiseFrame{}, nil
+ 		case 0x7: // GOAWAY
+ 			return parseGoAwayFrame(r, l, p.streamID, qlogger)
+ 		case 0xf0700: // PRIORITY_UPDATE for a request stream
+ 			return parsePriorityUpdateFrame(r, l, p.streamID, qlogger)
+ 		case 0xf0701: // PRIORITY_UPDATE for a push stream
+ 			return nil, errPriorityUpdateForPush
+-		case 0xd: // unsupported: MAX_PUSH_ID
++		case 0xd: // MAX_PUSH_ID; push is unsupported, but callers must check it
+ 			if qlogger != nil {
+ 				qlogger.RecordEvent(qlog.FrameParsed{
+ 					StreamID: p.streamID,
+@@ -115,6 +132,11 @@
+ 					Frame:    qlog.Frame{Frame: qlog.MaxPushIDFrame{}},
+ 				})
+ 			}
++			id, err := parsePushID(r, l)
++			if err != nil {
++				return nil, err
++			}
++			return &maxPushIDFrame{PushID: id}, nil
+ 		case 0x2, 0x6, 0x8, 0x9: // reserved frame types
+ 			if qlogger != nil {
+ 				qlogger.RecordEvent(qlog.FrameParsed{
+@@ -299,6 +321,32 @@
+ 	return b
+ }
+ 
++// Server push frames. Push is not supported, so a server never sends
++// PUSH_PROMISE and a client never sends MAX_PUSH_ID; these frames are returned
++// so that callers can reject them as RFC 9114 sections 7.2.3, 7.2.5 and 7.2.7
++// require, rather than being skipped.
++type cancelPushFrame struct {
++	PushID uint64
++}
++
++type pushPromiseFrame struct{}
++
++type maxPushIDFrame struct {
++	PushID uint64
++}
++
++func parsePushID(r *countingByteReader, l uint64) (uint64, error) {
++	startLen := r.NumRead
++	id, err := quicvarint.Read(r)
++	if err != nil {
++		return 0, err
++	}
++	if r.NumRead-startLen != int(l) {
++		return 0, errors.New("push ID frame: inconsistent length")
++	}
++	return id, nil
++}
++
+ type goAwayFrame struct {
+ 	StreamID quic.StreamID
+ }
+--- a/http3/frames_test.go
++++ b/http3/frames_test.go
+@@ -96,58 +96,75 @@
+ 	require.Equal(t, []byte("foo"), payload)
+ }
+ 
+-func TestParserUnsupportedFrameTypes(t *testing.T) {
++// Push is not supported, but push frames are returned rather than skipped so
++// that callers can reject them (RFC 9114 sections 7.2.3, 7.2.5 and 7.2.7).
++func TestParserPushFrames(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name string
+ 		ft   uint64
+ 		qf   any
++		want frame
+ 	}{
+-		{name: "CANCEL_PUSH", ft: 0x3, qf: qlog.CancelPushFrame{}},
+-		{name: "PUSH_PROMISE", ft: 0x5, qf: qlog.PushPromiseFrame{}},
+-		{name: "MAX_PUSH_ID", ft: 0xd, qf: qlog.MaxPushIDFrame{}},
++		{name: "CANCEL_PUSH", ft: 0x3, qf: qlog.CancelPushFrame{}, want: &cancelPushFrame{PushID: 7}},
++		{name: "MAX_PUSH_ID", ft: 0xd, qf: qlog.MaxPushIDFrame{}, want: &maxPushIDFrame{PushID: 7}},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			var eventRecorder events.Recorder
+ 
+ 			data := quicvarint.Append(nil, tc.ft)
+-			data = quicvarint.Append(data, 6)
+-			data = append(data, []byte("foobar")...)
+-			df := &dataFrame{Length: 3}
+-			data = df.Append(data)
+-			data = append(data, []byte("foo")...)
+-
+-			r := bytes.NewReader(data)
+-			fp := frameParser{streamID: 42, r: r}
+-
++			data = quicvarint.Append(data, 1)
++			data = quicvarint.Append(data, 7)
++			fp := frameParser{streamID: 42, r: bytes.NewReader(data)}
+ 			f, err := fp.ParseNext(&eventRecorder)
+ 			require.NoError(t, err)
+-			require.IsType(t, &dataFrame{}, f)
+-			df = f.(*dataFrame)
+-			require.Equal(t, uint64(3), df.Length)
+-			payload := make([]byte, 3)
+-			_, err = io.ReadFull(r, payload)
+-			require.NoError(t, err)
+-			require.Equal(t, []byte("foo"), payload)
+-
+-			headerLen := quicvarint.Len(tc.ft) + quicvarint.Len(6)
+-			dfLen, _ := expectedFrameLength(t, df)
++			require.Equal(t, tc.want, f)
+ 			require.Equal(t,
+ 				[]qlogwriter.Event{
+ 					qlog.FrameParsed{
+ 						StreamID: 42,
+-						Raw:      qlog.RawInfo{Length: headerLen, PayloadLength: 6},
++						Raw:      qlog.RawInfo{Length: quicvarint.Len(tc.ft) + quicvarint.Len(1), PayloadLength: 1},
+ 						Frame:    qlog.Frame{Frame: tc.qf},
+ 					},
+-					qlog.FrameParsed{
+-						StreamID: 42,
+-						Raw:      qlog.RawInfo{Length: dfLen, PayloadLength: 3},
+-						Frame:    qlog.Frame{Frame: qlog.DataFrame{}},
+-					},
+ 				},
+ 				eventRecorder.Events(qlog.FrameParsed{}),
+ 			)
++
++			// A push ID that does not fill the frame payload is malformed.
++			data = quicvarint.Append(nil, tc.ft)
++			data = quicvarint.Append(data, 2)
++			data = append(quicvarint.Append(data, 7), 0)
++			fp = frameParser{r: bytes.NewReader(data)}
++			_, err = fp.ParseNext(nil)
++			require.Error(t, err)
+ 		})
+ 	}
++
++	t.Run("PUSH_PROMISE", func(t *testing.T) {
++		data := quicvarint.Append(nil, 0x5)
++		data = quicvarint.Append(data, 6)
++		data = append(data, []byte("foobar")...)
++		data = (&dataFrame{Length: 3}).Append(data)
++
++		fp := frameParser{r: bytes.NewReader(data)}
++		f, err := fp.ParseNext(nil)
++		require.NoError(t, err)
++		require.IsType(t, &pushPromiseFrame{}, f)
++		f, err = fp.ParseNext(nil)
++		require.NoError(t, err)
++		require.Equal(t, &dataFrame{Length: 3}, f)
++
++		// A client never sends MAX_PUSH_ID, so any PUSH_PROMISE on its request
++		// streams is H3_ID_ERROR (section 7.2.5).
++		var code quic.ApplicationErrorCode
++		fp = frameParser{
++			client:    true,
++			r:         bytes.NewReader(data),
++			closeConn: func(c quic.ApplicationErrorCode, _ string) error { code = c; return nil },
++		}
++		_, err = fp.ParseNext(nil)
++		require.Error(t, err)
++		require.Equal(t, quic.ApplicationErrorCode(ErrCodeIDError), code)
++	})
+ }
+ 
+ func TestParserHeadersFrame(t *testing.T) {
+--- a/http3/server_conn.go
++++ b/http3/server_conn.go
+@@ -267,6 +267,8 @@
+ }
+ 
+ func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *frameParser) {
++	var maxPushID uint64
++	var gotMaxPushID bool
+ 	for {
+ 		f, err := fp.ParseNext(c.qlogger)
+ 		if err != nil {
+@@ -295,6 +297,18 @@
+ 			c.rawConn.UpdateStreamPriority(quic.StreamID(frame.ElementID), urgency, incremental)
+ 		case *goAwayFrame:
+ 			// Server push is not supported, so there is no push state to update.
++		case *maxPushIDFrame:
++			// RFC 9114 section 7.2.7: MAX_PUSH_ID cannot reduce the maximum push ID.
++			if gotMaxPushID && frame.PushID < maxPushID {
++				c.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "")
++				return
++			}
++			maxPushID, gotMaxPushID = frame.PushID, true
++		case *cancelPushFrame:
++			// Server push is not supported. Since we never send PUSH_PROMISE frames,
++			// the client can't reference a mentioned push ID (RFC 9114 section 7.2.3).
++			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "")
++			return
+ 		default:
+ 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "")
+ 			return

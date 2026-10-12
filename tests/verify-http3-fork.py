@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that the HTTP/3 dependency differs only by its documented patch."""
+"""Verify that the HTTP/3 dependency differs only by its documented patches."""
 from pathlib import Path
 import tempfile
 
@@ -14,5 +14,6 @@ with tempfile.TemporaryDirectory(prefix="masque-http3-") as temp:
     upstream = Path(temp) / "quic-go"
     notices = prepare_upstream(module, upstream)
     apply_patch(upstream, root / "third_party/http3-datagram-rejection.patch")
+    apply_patch(upstream, root / "third_party/http3-push-frames.patch")
     compare_tree(upstream, root / "third_party/quic-go", "HTTP/3")
-print("HTTP/3 fork matches verified upstream v0.63.0 plus documented patch; " + summarize_notices(notices))
+print("HTTP/3 fork matches verified upstream v0.63.0 plus documented patches; " + summarize_notices(notices))

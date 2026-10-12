@@ -89,6 +89,20 @@ Datagrams, concurrent classification, closed receive-side drops, exact
 wire errors, website bodies and trailers, and other streams on the same
 connection. Refresh and verify the patch when updating quic-go or Go.
 
+## HTTP/3 push frames
+
+`http3-push-frames.patch`, applied after the Datagram patch, makes the frame
+parser return CANCEL_PUSH, PUSH_PROMISE and MAX_PUSH_ID instead of skipping
+them, so they are rejected as RFC 9114 requires. Push is not supported, so on
+the server's control stream a CANCEL_PUSH names a push ID never mentioned by a
+PUSH_PROMISE (section 7.2.3) and is H3_ID_ERROR, as is a MAX_PUSH_ID smaller
+than one received before (section 7.2.7). PUSH_PROMISE (section 7.2.5) and push
+frames on a request stream are H3_FRAME_UNEXPECTED. The client, which never
+sends MAX_PUSH_ID, treats CANCEL_PUSH and a PUSH_PROMISE on a request stream
+as H3_ID_ERROR. The upstream parser test that required these frames to be
+skipped is replaced by one for this behavior; `h3_push_frames_test.go` checks
+the wire errors against the server.
+
 ## English source presentation
 
 `english-unicode-fixtures.json` records the ASCII presentation changes separately
