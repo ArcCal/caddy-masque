@@ -177,15 +177,17 @@ func (c *ClientConn) openRequestStream(
 	hstr := c.rawConn.TrackStream(str)
 	rsp := &http.Response{}
 	trace := httptrace.ContextClientTrace(ctx)
+	s := newStream(hstr, c.rawConn, trace, func(r io.Reader, hf *headersFrame) error {
+		hdr, err := decodeTrailers(r, hf, maxHeaderBytes, c.decoder, c.qlogger, str.StreamID())
+		if err != nil {
+			return err
+		}
+		rsp.Trailer = hdr
+		return nil
+	}, c.qlogger)
+	s.frameParser.client = true
 	return newRequestStream(
-		newStream(hstr, c.rawConn, trace, func(r io.Reader, hf *headersFrame) error {
-			hdr, err := decodeTrailers(r, hf, maxHeaderBytes, c.decoder, c.qlogger, str.StreamID())
-			if err != nil {
-				return err
-			}
-			rsp.Trailer = hdr
-			return nil
-		}, c.qlogger),
+		s,
 		requestWriter,
 		reqDone,
 		c.decoder,
@@ -213,6 +215,12 @@ func (c *ClientConn) handleControlStream(str *quic.ReceiveStream, fp *frameParse
 				return
 			}
 			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameError), "")
+			return
+		}
+		// This client never sends MAX_PUSH_ID, so a CANCEL_PUSH references a
+		// push ID greater than currently allowed (RFC 9114 section 7.2.3).
+		if _, ok := f.(*cancelPushFrame); ok {
+			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "")
 			return
 		}
 		// GOAWAY is the only frame allowed at this point:

@@ -96,58 +96,75 @@ func TestParserUnknownFrameType(t *testing.T) {
 	require.Equal(t, []byte("foo"), payload)
 }
 
-func TestParserUnsupportedFrameTypes(t *testing.T) {
+// Push is not supported, but push frames are returned rather than skipped so
+// that callers can reject them (RFC 9114 sections 7.2.3, 7.2.5 and 7.2.7).
+func TestParserPushFrames(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		ft   uint64
 		qf   any
+		want frame
 	}{
-		{name: "CANCEL_PUSH", ft: 0x3, qf: qlog.CancelPushFrame{}},
-		{name: "PUSH_PROMISE", ft: 0x5, qf: qlog.PushPromiseFrame{}},
-		{name: "MAX_PUSH_ID", ft: 0xd, qf: qlog.MaxPushIDFrame{}},
+		{name: "CANCEL_PUSH", ft: 0x3, qf: qlog.CancelPushFrame{}, want: &cancelPushFrame{PushID: 7}},
+		{name: "MAX_PUSH_ID", ft: 0xd, qf: qlog.MaxPushIDFrame{}, want: &maxPushIDFrame{PushID: 7}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var eventRecorder events.Recorder
 
 			data := quicvarint.Append(nil, tc.ft)
-			data = quicvarint.Append(data, 6)
-			data = append(data, []byte("foobar")...)
-			df := &dataFrame{Length: 3}
-			data = df.Append(data)
-			data = append(data, []byte("foo")...)
-
-			r := bytes.NewReader(data)
-			fp := frameParser{streamID: 42, r: r}
-
+			data = quicvarint.Append(data, 1)
+			data = quicvarint.Append(data, 7)
+			fp := frameParser{streamID: 42, r: bytes.NewReader(data)}
 			f, err := fp.ParseNext(&eventRecorder)
 			require.NoError(t, err)
-			require.IsType(t, &dataFrame{}, f)
-			df = f.(*dataFrame)
-			require.Equal(t, uint64(3), df.Length)
-			payload := make([]byte, 3)
-			_, err = io.ReadFull(r, payload)
-			require.NoError(t, err)
-			require.Equal(t, []byte("foo"), payload)
-
-			headerLen := quicvarint.Len(tc.ft) + quicvarint.Len(6)
-			dfLen, _ := expectedFrameLength(t, df)
+			require.Equal(t, tc.want, f)
 			require.Equal(t,
 				[]qlogwriter.Event{
 					qlog.FrameParsed{
 						StreamID: 42,
-						Raw:      qlog.RawInfo{Length: headerLen, PayloadLength: 6},
+						Raw:      qlog.RawInfo{Length: quicvarint.Len(tc.ft) + quicvarint.Len(1), PayloadLength: 1},
 						Frame:    qlog.Frame{Frame: tc.qf},
-					},
-					qlog.FrameParsed{
-						StreamID: 42,
-						Raw:      qlog.RawInfo{Length: dfLen, PayloadLength: 3},
-						Frame:    qlog.Frame{Frame: qlog.DataFrame{}},
 					},
 				},
 				eventRecorder.Events(qlog.FrameParsed{}),
 			)
+
+			// A push ID that does not fill the frame payload is malformed.
+			data = quicvarint.Append(nil, tc.ft)
+			data = quicvarint.Append(data, 2)
+			data = append(quicvarint.Append(data, 7), 0)
+			fp = frameParser{r: bytes.NewReader(data)}
+			_, err = fp.ParseNext(nil)
+			require.Error(t, err)
 		})
 	}
+
+	t.Run("PUSH_PROMISE", func(t *testing.T) {
+		data := quicvarint.Append(nil, 0x5)
+		data = quicvarint.Append(data, 6)
+		data = append(data, []byte("foobar")...)
+		data = (&dataFrame{Length: 3}).Append(data)
+
+		fp := frameParser{r: bytes.NewReader(data)}
+		f, err := fp.ParseNext(nil)
+		require.NoError(t, err)
+		require.IsType(t, &pushPromiseFrame{}, f)
+		f, err = fp.ParseNext(nil)
+		require.NoError(t, err)
+		require.Equal(t, &dataFrame{Length: 3}, f)
+
+		// A client never sends MAX_PUSH_ID, so any PUSH_PROMISE on its request
+		// streams is H3_ID_ERROR (section 7.2.5).
+		var code quic.ApplicationErrorCode
+		fp = frameParser{
+			client:    true,
+			r:         bytes.NewReader(data),
+			closeConn: func(c quic.ApplicationErrorCode, _ string) error { code = c; return nil },
+		}
+		_, err = fp.ParseNext(nil)
+		require.Error(t, err)
+		require.Equal(t, quic.ApplicationErrorCode(ErrCodeIDError), code)
+	})
 }
 
 func TestParserHeadersFrame(t *testing.T) {
