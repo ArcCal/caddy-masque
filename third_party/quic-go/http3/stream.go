@@ -65,6 +65,7 @@ func newStream(
 		qlogger:        qlogger,
 		parseTrailer:   parseTrailer,
 		frameParser: &frameParser{
+			request:   true,
 			r:         &tracingReader{Reader: str, trace: trace},
 			streamID:  str.StreamID(),
 			closeConn: conn.CloseWithError,

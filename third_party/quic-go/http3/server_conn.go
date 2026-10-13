@@ -110,7 +110,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 	connCtx := c.serverContext
 	maxHeaderBytes := c.requestMaxHeaderBytes()
 
-	fp := &frameParser{closeConn: conn.CloseWithError, r: str, streamID: str.StreamID()}
+	fp := &frameParser{request: true, closeConn: conn.CloseWithError, r: str, streamID: str.StreamID()}
 	frame, err := fp.ParseNext(qlogger)
 	if err != nil {
 		if errors.Is(err, errPriorityUpdateForPush) {
@@ -267,6 +267,8 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 }
 
 func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *frameParser) {
+	var maxPushID uint64
+	var gotMaxPushID bool
 	for {
 		f, err := fp.ParseNext(c.qlogger)
 		if err != nil {
@@ -295,6 +297,18 @@ func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *framePars
 			c.rawConn.UpdateStreamPriority(quic.StreamID(frame.ElementID), urgency, incremental)
 		case *goAwayFrame:
 			// Server push is not supported, so there is no push state to update.
+		case *maxPushIDFrame:
+			// RFC 9114 section 7.2.7: MAX_PUSH_ID cannot reduce the maximum push ID.
+			if gotMaxPushID && frame.PushID < maxPushID {
+				c.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "")
+				return
+			}
+			maxPushID, gotMaxPushID = frame.PushID, true
+		case *cancelPushFrame:
+			// Server push is not supported. Since we never send PUSH_PROMISE frames,
+			// the client can't reference a mentioned push ID (RFC 9114 section 7.2.3).
+			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "")
+			return
 		default:
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "")
 			return
