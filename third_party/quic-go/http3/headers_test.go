@@ -39,6 +39,8 @@ func TestRequestHeaderParsing(t *testing.T) {
 		// see https://github.com/quic-go/quic-go/pull/1898
 		{name: "path starting with //", path: "//foo", scheme: "https"},
 		{name: "upper-case scheme", path: "/foo", scheme: "HTTPS"},
+		{name: "single-letter scheme", path: "/foo", scheme: "a"},
+		{name: "custom scheme", path: "/foo", scheme: "My+1.-Scheme"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			headers := []qpack.HeaderField{

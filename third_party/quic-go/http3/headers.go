@@ -111,6 +111,9 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
 			case ":scheme":
 				_, isDuplicatePseudoHeader = hdr.Headers[h.Name]
 				hdr.Headers[h.Name] = nil
+				if h.Value != "" && !validURIScheme(h.Value) {
+					return header{}, fmt.Errorf("invalid :scheme: %q", h.Value)
+				}
 				// URI schemes are case-insensitive and canonically lowercase, see section 3.1 of RFC 3986
 				hdr.Scheme = strings.ToLower(h.Value)
 			case ":status":
@@ -170,6 +173,20 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
 		hdr.ContentLength = int64(cl)
 	}
 	return hdr, nil
+}
+
+// RFC 3986 section 3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
+func validURIScheme(scheme string) bool {
+	for i := range len(scheme) {
+		c := scheme[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' {
+			continue
+		}
+		if i == 0 || !(c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return len(scheme) > 0
 }
 
 // connectionHeaderFields returns the fields nominated by a legacy Connection

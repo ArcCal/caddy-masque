@@ -1,12 +1,13 @@
 diff --git a/http2/conformance_test.go b/http2/conformance_test.go
 new file mode 100644
-index 0000000..05c043d
+index 0000000..7482679
 --- /dev/null
 +++ b/http2/conformance_test.go
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,293 @@
 +package http2_test
 +
 +import (
++	"fmt"
 +	"io"
 +	"net/http"
 +	"testing"
@@ -73,6 +74,22 @@ index 0000000..05c043d
 +	for _, value := range []string{"gzip", "gzip, trailers"} {
 +		tests = append(tests, requestCase{"te-" + value, append(append([]string(nil), get...), "te", value), false})
 +	}
++	for _, value := range []string{"HTTP", "HTTPS", "custom", "custom+1.2-foo"} {
++		tests = append(tests,
++			requestCase{"ordinary-valid-scheme-" + value, replace(get, ":scheme", value, false), true},
++			requestCase{"connect-valid-scheme-" + value, replace(connect, ":scheme", value, false), true})
++	}
++	for _, value := range []string{"1https", "+https", "https:", "http s", "http/s", "h\tttp", "h\xc3\xa9", "\xe2\x84\xaa"} {
++		tests = append(tests,
++			requestCase{"ordinary-invalid-scheme-" + value, replace(get, ":scheme", value, false), false},
++			requestCase{"connect-invalid-scheme-" + value, replace(connect, ":scheme", value, false), false})
++	}
++	for _, value := range []string{"get", "CUSTOM", "!#$%&'*+-.^_`|~9"} {
++		tests = append(tests, requestCase{"valid-method-" + value, replace(get, ":method", value, false), true})
++	}
++	for _, value := range []string{"", "BAD METHOD", "BAD\tMETHOD", "BAD/METHOD", "BAD:METHOD", "M\xc3\x89THOD"} {
++		tests = append(tests, requestCase{"invalid-method-" + value, replace(get, ":method", value, false), false})
++	}
 +	for _, value := range []string{" leading", "\tleading", "trailing ", "trailing\t", " ", "\t", "inner \t space", ""} {
 +		tests = append(tests, requestCase{"field-value-" + value, append(append([]string(nil), get...), "x-test", value), value == "" || value == "inner \t space"})
 +	}
@@ -101,6 +118,84 @@ index 0000000..05c043d
 +				st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
 +			})
 +		})
++	}
++}
++
++func TestServerConnectFrameConformance(t *testing.T) {
++	requests := []struct {
++		name   string
++		fields []string
++	}{
++		{"ordinary", []string{":method", "GET", ":scheme", "https", ":authority", "example.com", ":path", "/"}},
++		{"classic-connect", []string{":method", "CONNECT", ":authority", "example.com:443"}},
++		{"connect-ip", []string{":method", "CONNECT", ":protocol", "connect-ip", ":scheme", "https", ":authority", "example.com", ":path", "/vpn"}},
++	}
++	for _, request := range requests {
++		for _, response := range []struct {
++			name   string
++			status int
++		}{
++			{"accepted", 200},
++			{"accepted-other-2xx", 299},
++			{"refused", 403},
++			{"before-final-response", 0},
++			{"after-informational", 103},
++		} {
++			for _, ending := range []string{"trailers", "empty-trailers", "data-fin"} {
++				t.Run(request.name+"/"+response.name+"/"+ending, func(t *testing.T) {
++					SetDisableExtendedConnectProtocol(t, false)
++					synctestTest(t, func(t testing.TB) {
++						st := newServerTester(t, nil)
++						defer st.Close()
++						st.greet()
++						fields := append(append([]string(nil), request.fields...), "trailer", "X-End")
++						st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeaderRaw(fields...), EndHeaders: true})
++						call := st.nextHandlerCall()
++						if response.status != 0 {
++							call.do(func(w http.ResponseWriter, r *http.Request) {
++								w.WriteHeader(response.status)
++								if response.status >= 200 {
++									w.(http.Flusher).Flush()
++								}
++							})
++							st.wantHeaders(wantHeader{streamID: 1, header: http.Header{":status": {fmt.Sprint(response.status)}}})
++						}
++						if ending == "data-fin" {
++							st.writeData(1, true, nil)
++						} else {
++							var trailers []string
++							if ending == "trailers" {
++								trailers = []string{"x-end", "ok"}
++							}
++							st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeaderRaw(trailers...), EndHeaders: true, EndStream: true})
++						}
++						rejected := request.name != "ordinary" && response.status >= 200 && response.status < 300 && ending != "data-fin"
++						if rejected {
++							st.wantRSTStream(1, ErrCodeProtocol)
++						}
++						call.do(func(w http.ResponseWriter, r *http.Request) {
++							_, err := io.ReadAll(r.Body)
++							if (err != nil) != rejected {
++								t.Errorf("body error = %v, rejected = %v", err, rejected)
++							}
++						})
++						call.exit()
++						if !rejected {
++							if response.status < 200 {
++								st.wantHeaders(wantHeader{streamID: 1, endStream: true, header: http.Header{":status": {"200"}}})
++							} else {
++								st.wantData(wantData{streamID: 1, endStream: true})
++							}
++						}
++						st.writeHeaders(HeadersFrameParam{StreamID: 3, BlockFragment: st.encodeHeader(":path", "/control"), EndHeaders: true, EndStream: true})
++						control := st.nextHandlerCall()
++						control.do(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
++						control.exit()
++						st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
++					})
++				})
++			}
++		}
 +	}
 +}
 +
@@ -214,13 +309,29 @@ index a6bffd1..c75411b 100644
 +		if !httpguts.ValidHeaderFieldValue(v) || len(v) > 0 &&
 +			(v[0] == ' ' || v[0] == '\t' || v[len(v)-1] == ' ' || v[len(v)-1] == '\t') {
 diff --git a/http2/server.go b/http2/server.go
-index 74ba441..8044677 100644
+index 74ba441..400ca6c 100644
 --- a/http2/server.go
 +++ b/http2/server.go
-@@ -1982 +1982 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
+@@ -520,0 +521 @@ type stream struct {
++	isConnect bool        // request method is CONNECT
+@@ -533,0 +535 @@ type stream struct {
++	connectAccepted  bool        // a successful CONNECT response has started
+@@ -1157,0 +1160,5 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
++		if h, ok := wr.write.(*writeResHeaders); ok && st.isConnect && h.httpResCode >= 200 && h.httpResCode < 300 {
++			// Set this on the serve goroutine before response bytes can reach
++			// the peer, including when the write runs asynchronously.
++			st.connectAccepted = true
++		}
+@@ -1982 +1989 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
 -		handler = new400Handler(err)
 +		return sc.countError("bad_headers", StreamError{StreamID: id, Code: ErrCodeProtocol, Cause: err})
-@@ -2038,9 +2038,8 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
+@@ -2026,0 +2034,5 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
++	if st.connectAccepted {
++		// RFC 9113 section 8.5 allows only DATA and stream-management
++		// frames on an established CONNECT stream, not HTTP trailers.
++		return sc.countError("connect_trailers", streamError(st.id, ErrCodeProtocol))
++	}
+@@ -2038,9 +2050,8 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
 -	if st.trailer != nil {
 -		for _, hf := range f.RegularFields() {
 -			key := sc.canonicalHeader(hf.Name)
@@ -238,7 +349,7 @@ index 74ba441..8044677 100644
 +			return sc.countError("trailers_bogus", streamError(st.id, ErrCodeProtocol))
 +		}
 +		if st.trailer != nil {
-@@ -2138,0 +2138,13 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+@@ -2138,0 +2150,13 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 +	var hasProtocol, hasScheme, hasPath, hasAuthority bool
 +	for _, hf := range f.PseudoFields() {
 +		switch hf.Name {
@@ -252,12 +363,20 @@ index 74ba441..8044677 100644
 +			hasAuthority = true
 +		}
 +	}
-@@ -2141 +2153 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+@@ -2141 +2165 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 -	if disableExtendedConnectProtocol && rp.Protocol != "" {
 +	if disableExtendedConnectProtocol && hasProtocol {
-@@ -2146,2 +2158,10 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+@@ -2146,2 +2170,18 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 -	if isConnect {
 -		if rp.Protocol == "" && (rp.Path != "" || rp.Scheme != "" || rp.Authority == "") {
++	if !httpguts.ValidHeaderFieldName(rp.Method) {
++		// Methods use the token grammar (RFC 9110 section 9.1).
++		return nil, nil, sc.countError("bad_method", streamError(f.StreamID, ErrCodeProtocol))
++	}
++	if (hasScheme || !isConnect) && !validURIScheme(rp.Scheme) {
++		return nil, nil, sc.countError("bad_scheme", streamError(f.StreamID, ErrCodeProtocol))
++	}
++	rp.Scheme, _ = asciiToLower(rp.Scheme)
 +	if hasProtocol {
 +		// RFC 8441 section 4 extends CONNECT only, and requires the target
 +		// URI's scheme and path. CONNECT-IP additionally requires an explicit
@@ -268,7 +387,10 @@ index 74ba441..8044677 100644
 +		}
 +	} else if isConnect {
 +		if hasPath || hasScheme || rp.Authority == "" {
-@@ -2169 +2189,6 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+@@ -2150 +2190 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+-	} else if rp.Method == "" || rp.Path == "" || (rp.Scheme != "https" && rp.Scheme != "http") {
++	} else if rp.Path == "" {
+@@ -2169 +2209,6 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 -	if rp.Authority == "" {
 +	if hasAuthority && rp.Authority == "" && header.Get("Host") != "" {
 +		// RFC 9113 section 8.3.1 forbids using Host in place of a present
@@ -276,10 +398,28 @@ index 74ba441..8044677 100644
 +		return nil, nil, sc.countError("authority_host_mismatch", streamError(f.StreamID, ErrCodeProtocol))
 +	}
 +	if !hasAuthority {
-@@ -3182 +3207 @@ var connHeaders = []string{
+@@ -2197,0 +2243,15 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
++// validURIScheme applies RFC 3986 section 3.1. RFC 9113 section 8.3.1
++// permits schemes other than http and https.
++func validURIScheme(s string) bool {
++	if len(s) == 0 || !('A' <= s[0] && s[0] <= 'Z' || 'a' <= s[0] && s[0] <= 'z') {
++		return false
++	}
++	for i := 1; i < len(s); i++ {
++		c := s[i]
++		if !('A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '+' || c == '-' || c == '.') {
++			return false
++		}
++	}
++	return true
++}
++
+@@ -2234,0 +2295 @@ func (sc *serverConn) newResponseWriter(st *stream, req *http.Request) *response
++	st.isConnect = req.Method == "CONNECT"
+@@ -3182 +3243 @@ var connHeaders = []string{
 -// per RFC 7540 Section 8.1.2.2.
 +// per RFC 9113 Section 8.2.2.
-@@ -3190,3 +3215,10 @@ func checkValidHTTP2RequestHeaders(h http.Header) error {
+@@ -3190,3 +3251,10 @@ func checkValidHTTP2RequestHeaders(h http.Header) error {
 -	te := h["Te"]
 -	if len(te) > 0 && (len(te) > 1 || (te[0] != "trailers" && te[0] != "")) {
 -		return errors.New(`request header "TE" may only be "trailers" in HTTP/2`)
@@ -293,7 +433,7 @@ index 74ba441..8044677 100644
 +		if !valid {
 +			return errors.New(`request header "TE" may only be "trailers" in HTTP/2`)
 +		}
-@@ -3197,6 +3228,0 @@ func checkValidHTTP2RequestHeaders(h http.Header) error {
+@@ -3197,6 +3264,0 @@ func checkValidHTTP2RequestHeaders(h http.Header) error {
 -func new400Handler(err error) http.HandlerFunc {
 -	return func(w http.ResponseWriter, r *http.Request) {
 -		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -318,7 +458,7 @@ index feab790..a22e9f5 100644
 +			want: errors.New(`request header "TE" may only be "trailers" in HTTP/2`),
 +		},
 diff --git a/http2/server_test.go b/http2/server_test.go
-index b7e4d62..6d92c64 100644
+index b7e4d62..41d1fab 100644
 --- a/http2/server_test.go
 +++ b/http2/server_test.go
 @@ -452,2 +452,4 @@ func testServer_Request_Get_Host(t testing.TB) {
@@ -328,6 +468,9 @@ index b7e4d62..6d92c64 100644
 +			// Host fallback is permitted only when :authority is absent,
 +			// not when an explicitly empty value was sent (RFC 9113 8.3.1).
 +			BlockFragment: st.encodeHeaderRaw(":method", "GET", ":scheme", "https", ":path", "/", "host", host),
+@@ -627 +629 @@ func TestServer_Request_Reject_Pseudo_scheme_invalid(t *testing.T) {
+-	testRejectRequest(t, func(st *serverTester) { st.bodylessReq1(":scheme", "bogus") })
++	testRejectRequest(t, func(st *serverTester) { st.bodylessReq1(":scheme", "1bogus") })
 @@ -3053,10 +3055,2 @@ func testServer_Rejects_ConnHeaders(t testing.TB) {
 -	st.wantHeaders(wantHeader{
 -		streamID:  1,

@@ -272,6 +272,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *frameParser) {
 	var maxPushID uint64
 	var gotMaxPushID bool
+	lastGoAwayID := quic.StreamID(1<<62 - 1)
 	for {
 		f, err := fp.ParseNext(c.qlogger)
 		if err != nil {
@@ -299,7 +300,13 @@ func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *framePars
 			urgency, incremental := parsePriority(frame.PriorityFieldValue)
 			c.rawConn.UpdateStreamPriority(quic.StreamID(frame.ElementID), urgency, incremental)
 		case *goAwayFrame:
-			// Server push is not supported, so there is no push state to update.
+			// Even without server push, client GOAWAY IDs cannot increase
+			// (RFC 9114 section 5.2).
+			if frame.StreamID > lastGoAwayID {
+				c.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "increasing GOAWAY ID")
+				return
+			}
+			lastGoAwayID = frame.StreamID
 		case *maxPushIDFrame:
 			// RFC 9114 section 7.2.7: MAX_PUSH_ID cannot reduce the maximum push ID.
 			if gotMaxPushID && frame.PushID < maxPushID {
