@@ -1329,7 +1329,7 @@ func testServer_Rejects_PriorityUnparsable(t testing.TB) {
 	defer st.Close()
 	st.greet()
 	st.writePriorityUpdate(1, "Invalid dictionary: ((((")
-	st.wantRSTStream(1, ErrCodeProtocol)
+	st.wantGoAway(0, ErrCodeProtocol)
 }
 
 // No HEADERS frame with a self-dependence.
@@ -1509,12 +1509,12 @@ func TestServerRejectsContentLengthWithSignNewRequests(t *testing.T) {
 			wantCL: 3,
 		},
 		{
-			name:   "ignore cl with plus sign",
+			name:   "reject cl with plus sign",
 			cl:     "+3",
 			wantCL: 0,
 		},
 		{
-			name:   "ignore cl with minus sign",
+			name:   "reject cl with minus sign",
 			cl:     "-3",
 			wantCL: 0,
 		},
@@ -1524,7 +1524,7 @@ func TestServerRejectsContentLengthWithSignNewRequests(t *testing.T) {
 			wantCL: 9223372036854775807,
 		},
 		{
-			name:   "overflows int64, so ignored",
+			name:   "reject unrepresentable cl",
 			cl:     "9223372036854775808",
 			wantCL: 0,
 		},
@@ -1533,6 +1533,14 @@ func TestServerRejectsContentLengthWithSignNewRequests(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		synctestSubtest(t, tt.name, func(t testing.TB) {
+			if tt.wantCL == 0 {
+				st := newServerTester(t, nil)
+				defer st.Close()
+				st.greet()
+				st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeader("content-length", tt.cl), EndHeaders: true})
+				st.wantRSTStream(1, ErrCodeProtocol)
+				return
+			}
 			writeReq := func(st *serverTester) {
 				st.writeHeaders(HeadersFrameParam{
 					StreamID:      1, // clients send odd numbers
@@ -2328,6 +2336,7 @@ func testServer_HeaderTableSizeDuringWrite(t testing.TB) {
 	}
 	st.cc.(*synctestNetConn).SetReadBufferSize(math.MaxInt)
 	st.wantHeaders(wantHeader{streamID: 1, endStream: true})
+	st.wantSettingsAck()
 	st.wantSettingsAck()
 
 	st.writeHeaders(HeadersFrameParam{

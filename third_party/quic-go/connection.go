@@ -54,6 +54,9 @@ type receivedPacket struct {
 	ecn protocol.ECN
 
 	info packetInfo // only valid if the contained IP address is valid
+	// Retrying buffered packets must not create another UDP receipt or
+	// amplification allowance. Coalesced packet clones inherit this state.
+	bytesAccounted bool
 }
 
 type receivedPacketWithChecksum struct {
@@ -65,12 +68,13 @@ func (p *receivedPacket) Size() protocol.ByteCount { return protocol.ByteCount(l
 
 func (p *receivedPacket) Clone() *receivedPacket {
 	return &receivedPacket{
-		remoteAddr: p.remoteAddr,
-		rcvTime:    p.rcvTime,
-		data:       p.data,
-		buffer:     p.buffer,
-		ecn:        p.ecn,
-		info:       p.info,
+		remoteAddr:     p.remoteAddr,
+		rcvTime:        p.rcvTime,
+		data:           p.data,
+		buffer:         p.buffer,
+		ecn:            p.ecn,
+		info:           p.info,
+		bytesAccounted: p.bytesAccounted,
 	}
 }
 
@@ -139,9 +143,14 @@ type Conn struct {
 	sendQueue sender
 
 	// lazily initialzed: most connections never migrate
-	pathManager         *pathManager
-	largestRcvdAppData  protocol.PacketNumber
-	pathManagerOutgoing atomic.Pointer[pathManagerOutgoing]
+	pathManager                  *pathManager
+	largestRcvdAppData           protocol.PacketNumber
+	largestRcvdNonProbingAppData protocol.PacketNumber
+	latestNonProbingRemoteAddr   net.Addr
+	pathManagerOutgoing          atomic.Pointer[pathManagerOutgoing]
+	boundPathControls            []boundPathControl
+	pathControlCredits           []*pathControlCredit
+	previousPathProbes           []*previousPathProbe
 
 	streamsMap      *streamsMap
 	connIDManager   *connIDManager
@@ -510,6 +519,7 @@ var newClientConnection = func(
 
 func (c *Conn) preSetup() {
 	c.largestRcvdAppData = protocol.InvalidPacketNumber
+	c.largestRcvdNonProbingAppData = protocol.InvalidPacketNumber
 	c.initialStream = newInitialCryptoStream(c.perspective == protocol.PerspectiveClient)
 	c.handshakeStream = newCryptoStream()
 	c.sendQueue = newSendQueue(c.conn)
@@ -1047,7 +1057,10 @@ func (c *Conn) handlePackets() (wasProcessed bool, _ error) {
 }
 
 func (c *Conn) handleOnePacket(rp receivedPacket, datagramPayloadChecksum qlog.DatagramPayloadChecksum) (wasProcessed bool, _ error) {
-	c.sentPacketHandler.ReceivedBytes(rp.Size(), rp.rcvTime)
+	if !rp.bytesAccounted {
+		c.sentPacketHandler.ReceivedBytes(rp.Size(), rp.rcvTime)
+		rp.bytesAccounted = true
+	}
 
 	if wire.IsVersionNegotiationPacket(rp.data) {
 		return false, c.handleVersionNegotiationPacket(rp)
@@ -1252,9 +1265,17 @@ func (c *Conn) handleShortHeaderPacket(
 			})
 		}
 	}
-	isNonProbing, pathChallenge, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log)
+	isNonProbing, pathChallenges, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log)
 	if err != nil {
 		return false, err
+	}
+	if isNonProbing && pn > c.largestRcvdNonProbingAppData {
+		c.largestRcvdNonProbingAppData = pn
+		c.latestNonProbingRemoteAddr = p.remoteAddr
+	}
+
+	if err := c.flushPathMTUProbes(p.rcvTime); err != nil {
+		return true, err
 	}
 
 	// In RFC 9000, only the client can migrate between paths.
@@ -1262,7 +1283,8 @@ func (c *Conn) handleShortHeaderPacket(
 		return true, nil
 	}
 	if addrsEqual(p.remoteAddr, c.RemoteAddr()) {
-		return true, nil
+		c.queueBoundPathResponses(pathChallenges, p.remoteAddr, p.info)
+		return true, c.flushBoundPathControls(p.rcvTime)
 	}
 
 	var shouldSwitchPath bool
@@ -1273,23 +1295,29 @@ func (c *Conn) handleShortHeaderPacket(
 			c.logger,
 		)
 	}
-	destConnID, frames, shouldSwitchPath := c.pathManager.HandlePacket(p.remoteAddr, p.rcvTime, pathChallenge, isNonProbing)
-	if len(frames) > 0 {
-		probe, buf, err := c.packer.PackPathProbePacket(destConnID, frames, c.version)
-		if err != nil {
-			return true, err
-		}
-		c.logger.Debugf("sending path probe packet to %s", p.remoteAddr)
-		c.logShortHeaderPacketWithDatagramPayloadChecksum(probe, protocol.ECNNon, buf.Len(), false, datagramPayloadChecksum)
-		c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, p.rcvTime)
-		c.sendQueue.SendProbe(buf, p.remoteAddr, p.info)
+	destConnID, frames, shouldSwitchPath := c.pathManager.HandlePacket(p.remoteAddr, p.rcvTime, pathChallenges, isNonProbing, p.Size(), p.info)
+	if isNonProbing && pn == c.largestRcvdNonProbingAppData {
+		c.probePreviousPath(p.remoteAddr)
+	}
+	if err := c.flushBoundPathControls(p.rcvTime); err != nil {
+		return true, err
+	}
+	if err := c.sendPathProbeFrames(destConnID, frames, p.remoteAddr, p.info, p.rcvTime, datagramPayloadChecksum); err != nil {
+		return true, err
 	}
 	// We only switch paths in response to the highest-numbered non-probing packet,
 	// see section 9.3 of RFC 9000.
-	if !shouldSwitchPath || pn != c.largestRcvdAppData {
+	if !shouldSwitchPath || !addrsEqual(p.remoteAddr, c.latestNonProbingRemoteAddr) {
+		return true, nil
+	}
+	pathID, ok := c.pathManager.IDForPath(p.remoteAddr)
+	if !ok || !c.connIDManager.PromotePathConnectionID(pathID) {
 		return true, nil
 	}
 	c.pathManager.SwitchToPath(p.remoteAddr)
+	for _, credit := range c.pathControlCredits {
+		credit.inFlight = false // migration discards old probe history
+	}
 	maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
 	if c.peerParams.MaxUDPPayloadSize > 0 && c.peerParams.MaxUDPPayloadSize < maxPacketSize {
 		maxPacketSize = c.peerParams.MaxUDPPayloadSize
@@ -1744,12 +1772,12 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
 	ecn protocol.ECN,
 	rcvTime monotime.Time,
 	log func([]qlog.Frame),
-) (isNonProbing bool, pathChallenge *wire.PathChallengeFrame, _ error) {
+) (isNonProbing bool, pathChallenges []*wire.PathChallengeFrame, _ error) {
 	c.lastPacketReceivedTime = rcvTime
 	c.firstAckElicitingPacketAfterIdleSentTime = 0
 	c.keepAlivePingSent = false
 
-	isAckEliciting, isNonProbing, pathChallenge, err := c.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
+	isAckEliciting, isNonProbing, pathChallenges, err := c.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
 	if err != nil {
 		return false, nil, err
 	}
@@ -1757,18 +1785,18 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
 	if err := c.receivedPacketHandler.ReceivedPacket(pn, ecn, protocol.Encryption1RTT, rcvTime, isAckEliciting); err != nil {
 		return false, nil, err
 	}
-	return isNonProbing, pathChallenge, nil
+	return isNonProbing, pathChallenges, nil
 }
 
 // handleFrames parses the frames, one after the other, and handles them.
-// It returns the last PATH_CHALLENGE frame contained in the packet, if any.
+// It returns the PATH_CHALLENGE frames contained in the packet, if any.
 func (c *Conn) handleFrames(
 	data []byte,
 	destConnID protocol.ConnectionID,
 	encLevel protocol.EncryptionLevel,
 	log func([]qlog.Frame),
 	rcvTime monotime.Time,
-) (isAckEliciting, isNonProbing bool, pathChallenge *wire.PathChallengeFrame, _ error) {
+) (isAckEliciting, isNonProbing bool, pathChallenges []*wire.PathChallengeFrame, _ error) {
 	// Only used for tracing.
 	// If we're not tracing, this slice will always remain empty.
 	var frames []qlog.Frame
@@ -1863,7 +1891,7 @@ func (c *Conn) handleFrames(
 			}
 			pc, err := c.handleFrame(frame, encLevel, destConnID, rcvTime)
 			if pc != nil {
-				pathChallenge = pc
+				pathChallenges = append(pathChallenges, pc)
 			}
 			handleErr = err
 		}
@@ -2076,6 +2104,12 @@ func (c *Conn) handlePathResponseFrameClient(f *wire.PathResponseFrame) error {
 }
 
 func (c *Conn) handlePathResponseFrameServer(f *wire.PathResponseFrame) error {
+	for _, probe := range c.previousPathProbes {
+		if f.Data == probe.data {
+			probe.validated = true
+			return nil
+		}
+	}
 	if c.pathManager == nil {
 		// since we didn't send PATH_CHALLENGEs yet, we don't expect PATH_RESPONSEs
 		return &qerr.TransportError{
@@ -2460,6 +2494,10 @@ func (c *Conn) applyTransportParameters() {
 
 func (c *Conn) triggerSending(now monotime.Time) error {
 	c.pacingDeadline = 0
+	if !c.connIDManager.HasActiveConnectionID() {
+		c.blocked = blockModeHardBlocked
+		return c.flushBoundPathControls(now)
+	}
 
 	sendMode := c.sentPacketHandler.SendMode(now)
 	switch sendMode {
@@ -2499,11 +2537,14 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 }
 
 func (c *Conn) sendPackets(now monotime.Time) error {
+	if err := c.flushBoundPathControls(now); err != nil {
+		return err
+	}
 	if c.perspective == protocol.PerspectiveClient && c.handshakeConfirmed {
 		if pm := c.pathManagerOutgoing.Load(); pm != nil {
 			connID, frame, tr, ok := pm.NextPathToProbe()
 			if ok {
-				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, c.version)
+				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, protocol.MinInitialPacketSize, c.version)
 				if err != nil {
 					return err
 				}
@@ -2852,6 +2893,9 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 }
 
 func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
+	if !c.connIDManager.HasActiveConnectionID() {
+		return nil, nil
+	}
 	maxSize := c.maxSendPacketSize()
 	if maxSize < protocol.MinCoalescedPacketSize {
 		return nil, nil

@@ -44,6 +44,20 @@ index 252a288..4714ede 100644
 +	require.NoError(t, err)
 +	require.Equal(t, "tunnel bytes", string(got))
 +}
+diff --git a/http3/client_test.go b/http3/client_test.go
+index 19f3106..3d3e0ee 100644
+--- a/http3/client_test.go
++++ b/http3/client_test.go
+@@ -413,0 +414,9 @@ func testClient1xxHandling(t *testing.T, numEarlyHints int, terminalStatus int,
++	if terminalStatus == http.StatusSwitchingProtocols {
++		// A conforming server writer cannot generate 101; inject it to test the receiver.
++		rspBuf.Write(conformanceHeaders(t, ":status", "101"))
++		require.ErrorContains(t,
++			testClientResponseValidation(t, &Transport{}, rspBuf.Bytes(), quic.StreamErrorCode(ErrCodeMessageError)),
++			`invalid status code: "101"`,
++		)
++		return
++	}
 diff --git a/http3/conformance_test.go b/http3/conformance_test.go
 new file mode 100644
 index 0000000..ebc6090
@@ -789,7 +803,7 @@ index 0000000..305b1d1
 +	require.Equal(t, "private", trailers.Get("X-Hop"))
 +}
 diff --git a/http3/headers.go b/http3/headers.go
-index 26bf168..182c89c 100644
+index 26bf168..3450275 100644
 --- a/http3/headers.go
 +++ b/http3/headers.go
 @@ -29,0 +30,7 @@ var errHeaderTooLarge = errors.New("http3: headers too large")
@@ -910,24 +924,38 @@ index 26bf168..182c89c 100644
 -	hdr, err := parseHeaders(decodeFn, false, sizeLimit, headerFields)
 +func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField, isConnect bool) error {
 +	hdr, err := parseHeaders(decodeFn, false, sizeLimit, headerFields, isConnect)
-@@ -400,0 +483 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+@@ -367,0 +450,3 @@ func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, si
++	if len(hdr.Status) != 3 || status < 100 || status == http.StatusSwitchingProtocols {
++		return fmt.Errorf("invalid status code: %q", hdr.Status)
++	}
+@@ -400,0 +486 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
 +	hopFields := connectionHeaderFields(trailers)
-@@ -403 +486,2 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+@@ -403 +489,2 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
 -		if httpguts.ValidTrailerHeader(k) && len(vals) > 0 {
 +		_, hop := hopFields[strings.ToLower(k)]
 +		if validTrailerHeader(k) && !hop && len(vals) > 0 {
-@@ -423 +507,2 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+@@ -423 +510,2 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
 -		if !httpguts.ValidTrailerHeader(k) {
 +		lowercaseKey := strings.ToLower(k)
 +		if _, hop := hopFields[lowercaseKey]; !validTrailerHeader(k) || hop {
-@@ -426 +510,0 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+@@ -426 +513,0 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
 -		lowercaseKey := strings.ToLower(k)
-@@ -427,0 +512 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+@@ -427,0 +515,4 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
 +			v = strings.Trim(v, " \t")
-@@ -450 +535 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
++			if !httpguts.ValidHeaderFieldValue(v) {
++				continue
++			}
+@@ -435,0 +527,3 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
++	if buf.Len() == 0 {
++		return false, nil
++	}
+@@ -450 +544 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
 -		return nil, fmt.Errorf("http3: HEADERS frame too large: %d bytes (max: %d)", hf.Length, maxHeaderBytes)
 +		return nil, &trailerError{fmt.Errorf("%w: HEADERS frame too large: %d bytes (max: %d)", errHeaderTooLarge, hf.Length, maxHeaderBytes)}
-@@ -467 +552 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
+@@ -457 +551 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
+-	decodeFn := decoder.Decode(b)
++	decodeFn := decodeFieldSection(decoder, b)
+@@ -467 +561 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
 -		return nil, err
 +		return nil, &trailerError{err}
 diff --git a/http3/headers_test.go b/http3/headers_test.go
@@ -991,6 +1019,479 @@ index ba1df9c..3f62165 100644
 +				member = strings.Trim(member, " \t")
 +				require.Truef(t, member == "" || len(member) == len("trailers") && strings.EqualFold(member, "trailers"), "%s contains invalid TE member: %q", context, member)
 +			}
+diff --git a/http3/outgoing_content_length_test.go b/http3/outgoing_content_length_test.go
+new file mode 100644
+index 0000000..b204d5e
+--- /dev/null
++++ b/http3/outgoing_content_length_test.go
+@@ -0,0 +1,120 @@
++package http3
++
++import (
++	"io"
++	"net/http"
++	"strconv"
++	"testing"
++
++	"github.com/quic-go/quic-go"
++	"github.com/stretchr/testify/require"
++)
++
++func TestResponseWriterContentLengthByStatus(t *testing.T) {
++	for _, tc := range []struct {
++		status int
++		wantCL bool
++	}{
++		{http.StatusContinue, false},
++		{http.StatusEarlyHints, false},
++		{http.StatusNoContent, false},
++		{http.StatusOK, true},
++		{http.StatusNotModified, true},
++	} {
++		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
++			w := newTestResponseWriter(t)
++			w.Header().Set("Content-Length", "7")
++			w.WriteHeader(tc.status)
++			fields := w.DecodeHeaders(t, 0)
++			require.Equal(t, []string{strconv.Itoa(tc.status)}, fields[":status"])
++			if tc.wantCL {
++				require.Equal(t, []string{"7"}, fields["content-length"])
++			} else {
++				require.NotContains(t, fields, "content-length")
++			}
++			// Informational headers must not erase the final response's length.
++			if tc.status < 200 {
++				final := w.DecodeHeaders(t, 1)
++				require.Equal(t, []string{"200"}, final[":status"])
++				require.Equal(t, []string{"7"}, final["content-length"])
++			}
++		})
++	}
++}
++
++func TestConformanceResponseContentLengthByStatus(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		method     string
++		status     int
++		configured string
++		body       string
++		wantCL     []string
++	}{
++		{"204 automatic", "GET", http.StatusNoContent, "", "", nil},
++		{"204 configured", "GET", http.StatusNoContent, "0", "", nil},
++		{"304 automatic", "GET", http.StatusNotModified, "", "", nil},
++		{"304 configured", "GET", http.StatusNotModified, "7", "", []string{"7"}},
++		{"200 empty", "GET", http.StatusOK, "", "", []string{"0"}},
++		{"HEAD configured", "HEAD", http.StatusOK, "7", "", []string{"7"}},
++		{"HEAD written", "HEAD", http.StatusOK, "", "content", []string{"7"}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			conn := conformanceServer(t, func(w http.ResponseWriter, r *http.Request) {
++				if tc.configured != "" {
++					w.Header().Set("Content-Length", tc.configured)
++				}
++				w.WriteHeader(tc.status)
++				if tc.body != "" {
++					if _, err := w.Write([]byte(tc.body)); err != nil {
++						panic(err)
++					}
++				}
++			})
++			str := conformanceRequest(t, conn, conformanceHeaders(t, ":method", tc.method, ":scheme", "https", ":authority", "localhost", ":path", "/"), true)
++			fields := decodeHeader(t, str)
++			require.Equal(t, []string{strconv.Itoa(tc.status)}, fields[":status"])
++			if tc.wantCL == nil {
++				require.NotContains(t, fields, "content-length")
++			} else {
++				require.Equal(t, tc.wantCL, fields["content-length"])
++			}
++			body, err := io.ReadAll(str)
++			require.NoError(t, err)
++			require.Empty(t, body)
++		})
++	}
++}
++
++func TestResponseWriterRejectsSwitchingProtocols(t *testing.T) {
++	w := newTestResponseWriter(t)
++	require.PanicsWithValue(t, "invalid WriteHeader code 101", func() { w.WriteHeader(http.StatusSwitchingProtocols) })
++	require.Empty(t, w.buf.Bytes())
++	require.False(t, w.headerComplete)
++	w.WriteHeader(http.StatusEarlyHints)
++	w.WriteHeader(http.StatusOK)
++	require.Equal(t, []string{"103"}, w.DecodeHeaders(t, 0)[":status"])
++	require.Equal(t, []string{"200"}, w.DecodeHeaders(t, 1)[":status"])
++}
++
++func TestConformanceRejectsSwitchingProtocols(t *testing.T) {
++	conn := conformanceServer(t, func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/switch" {
++			w.WriteHeader(http.StatusSwitchingProtocols)
++			return
++		}
++		w.WriteHeader(http.StatusContinue)
++		w.WriteHeader(http.StatusEarlyHints)
++		w.WriteHeader(http.StatusOK)
++	})
++	bad := conformanceRequest(t, conn, conformanceHeaders(t, ":method", "GET", ":scheme", "https", ":authority", "localhost", ":path", "/switch"), true)
++	data, err := io.ReadAll(bad)
++	require.Empty(t, data, "the invalid 101 response must not reach the peer")
++	require.ErrorIs(t, err, &quic.StreamError{Remote: true, StreamID: bad.StreamID(), ErrorCode: quic.StreamErrorCode(ErrCodeInternalError)})
++	good := conformanceRequest(t, conn, conformanceHeaders(t, ":method", "GET", ":scheme", "https", ":authority", "localhost", ":path", "/"), true)
++	for _, status := range []string{"100", "103", "200"} {
++		require.Equal(t, []string{status}, decodeHeader(t, good)[":status"])
++	}
++	_, err = io.ReadAll(good)
++	require.NoError(t, err)
++}
+diff --git a/http3/outgoing_field_validation_test.go b/http3/outgoing_field_validation_test.go
+new file mode 100644
+index 0000000..c27e10f
+--- /dev/null
++++ b/http3/outgoing_field_validation_test.go
+@@ -0,0 +1,121 @@
++package http3
++
++import (
++	"bytes"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestResponseWriterOmitsInvalidFields(t *testing.T) {
++	for _, tc := range []struct {
++		name  string
++		value string
++	}{
++		{"", "value"},
++		{"Bad Name", "value"},
++		{"Bad:Name", "value"},
++		{":status", "599"},
++		{":path", "/injected"},
++		{"X-\u212aey", "value"},
++		{"X-Test", "before\rafter"},
++		{"X-Test", "before\nafter"},
++		{"X-Test", "before\x00after"},
++		{"X-Test", "before\x7fafter"},
++	} {
++		t.Run(tc.name+"/"+tc.value, func(t *testing.T) {
++			w := newTestResponseWriter(t)
++			w.Header()[tc.name] = []string{tc.value}
++			w.Header()["X-Valid"] = []string{"", " \ttrimmed\t ", "a\tb", "\x80\xff"}
++			w.Header()["Content-Type"] = nil // Preserve the standard suppression sentinel.
++			fields := w.DecodeHeaders(t, 0)
++			require.Equal(t, []string{"200"}, fields[":status"])
++			if tc.name != ":status" {
++				require.NotContains(t, fields, strings.ToLower(tc.name))
++			}
++			require.NotContains(t, fields, "content-type")
++			require.Equal(t, []string{"", "trimmed", "a\tb", "\x80\xff"}, fields["x-valid"])
++			require.Equal(t, []string{tc.value}, w.Header()[tc.name], "filtering must not mutate the handler's map")
++		})
++	}
++}
++
++func TestOutgoingTrailersOmitInvalidValues(t *testing.T) {
++	trailers := http.Header{
++		"X-Mixed": {"first", "bad\rvalue", "bad\nvalue", "bad\x00value", "bad\x7fvalue", " \tlast\t "},
++		"X-Empty": {""},
++		"X-Obs":   {"\x80\xff"},
++	}
++	var b bytes.Buffer
++	written, err := writeTrailers(&b, trailers, 0, nil)
++	require.NoError(t, err)
++	require.True(t, written)
++	fields := decodeHeader(t, &b)
++	require.Equal(t, []string{"first", "last"}, fields["x-mixed"])
++	require.Equal(t, []string{""}, fields["x-empty"])
++	require.Equal(t, []string{"\x80\xff"}, fields["x-obs"])
++	require.Equal(t, "bad\rvalue", trailers["X-Mixed"][1])
++}
++
++func TestOutgoingTrailersAllInvalidValues(t *testing.T) {
++	var b bytes.Buffer
++	written, err := writeTrailers(&b, http.Header{"X-Trailer": {"bad\rvalue", "bad\nvalue", "bad\x00value"}}, 0, nil)
++	require.NoError(t, err)
++	require.False(t, written)
++	require.Empty(t, b.Bytes(), "do not emit a HEADERS frame with an empty QPACK payload")
++}
++
++func TestConformanceResponseOmitsInvalidFields(t *testing.T) {
++	conn := conformanceServer(t, func(w http.ResponseWriter, r *http.Request) {
++		w.Header()[":path"] = []string{"/injected"}
++		w.Header()["X-Mixed"] = []string{"valid", "bad\r\nvalue"}
++		w.Header().Set("Trailer", "X-Trailer")
++		_, err := w.Write([]byte("body"))
++		if err != nil {
++			panic(err)
++		}
++		w.Header()["X-Trailer"] = []string{"valid-trailer", "bad\x00value"}
++	})
++	str := conformanceRequest(t, conn, conformanceHeaders(t, ":method", "GET", ":scheme", "https", ":authority", "localhost", ":path", "/"), true)
++	fields := decodeHeader(t, str)
++	require.Equal(t, []string{"200"}, fields[":status"])
++	require.NotContains(t, fields, ":path")
++	require.Equal(t, []string{"valid"}, fields["x-mixed"])
++	fp := &frameParser{r: str}
++	f, err := fp.ParseNext(nil)
++	require.NoError(t, err)
++	require.IsType(t, &dataFrame{}, f)
++	body := make([]byte, f.(*dataFrame).Length)
++	_, err = io.ReadFull(str, body)
++	require.NoError(t, err)
++	require.Equal(t, "body", string(body))
++	require.Equal(t, []string{"valid-trailer"}, decodeHeader(t, str)["x-trailer"])
++	_, err = io.ReadAll(str)
++	require.NoError(t, err)
++}
++
++func TestConformanceResponseAllInvalidTrailerValues(t *testing.T) {
++	conn := conformanceServer(t, func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Trailer", "X-Trailer")
++		_, err := w.Write([]byte("body"))
++		if err != nil {
++			panic(err)
++		}
++		w.Header()["X-Trailer"] = []string{"bad\rvalue", "bad\nvalue", "bad\x00value"}
++	})
++	str := conformanceRequest(t, conn, conformanceHeaders(t, ":method", "GET", ":scheme", "https", ":authority", "localhost", ":path", "/"), true)
++	require.Equal(t, []string{"200"}, decodeHeader(t, str)[":status"])
++	fp := &frameParser{r: str}
++	f, err := fp.ParseNext(nil)
++	require.NoError(t, err)
++	require.IsType(t, &dataFrame{}, f)
++	body := make([]byte, f.(*dataFrame).Length)
++	_, err = io.ReadFull(str, body)
++	require.NoError(t, err)
++	require.Equal(t, "body", string(body))
++	_, err = fp.ParseNext(nil)
++	require.ErrorIs(t, err, io.EOF)
++}
+diff --git a/http3/qpack_field_section.go b/http3/qpack_field_section.go
+new file mode 100644
+index 0000000..948107a
+--- /dev/null
++++ b/http3/qpack_field_section.go
+@@ -0,0 +1,56 @@
++package http3
++
++import (
++	"errors"
++	"io"
++
++	"github.com/quic-go/qpack"
++)
++
++var errInvalidQPACKBase = errors.New("invalid QPACK Base")
++
++// decodeFieldSection validates the Base omitted by the static-only decoder.
++// RFC 9204 section 4.5.1.2 permits any nonnegative Base without dynamic
++// references, but a sign bit of 1 with Required Insert Count zero is invalid.
++func decodeFieldSection(decoder *qpack.Decoder, block []byte) qpack.DecodeFunc {
++	if len(block) < 2 || block[0] != 0 || block[1] == 0 {
++		return decoder.Decode(block)
++	}
++	if block[1]&0x80 != 0 {
++		return func() (qpack.HeaderField, error) { return qpack.HeaderField{}, errInvalidQPACKBase }
++	}
++	n, err := qpackBasePrefixLength(block[1:])
++	if err != nil {
++		return func() (qpack.HeaderField, error) { return qpack.HeaderField{}, err }
++	}
++	// Static field representations do not depend on Base. Normalize this
++	// uncommon prefix for the existing decoder, without mutating the input.
++	fields := block[1+n:]
++	normalized := make([]byte, 2+len(fields))
++	copy(normalized[2:], fields)
++	return decoder.Decode(normalized)
++}
++
++// qpackBasePrefixLength consumes a 7-bit prefixed integer. Support the full
++// 62-bit range required by RFC 9204 section 4.1.1, with bounded encoded length.
++func qpackBasePrefixLength(b []byte) (int, error) {
++	const maxBase = uint64(1<<62 - 1)
++	value := uint64(b[0] & 0x7f)
++	if value < 0x7f {
++		return 1, nil
++	}
++	for i, shift := 1, uint(0); shift <= 56; i, shift = i+1, shift+7 {
++		if i >= len(b) {
++			return 0, io.ErrUnexpectedEOF
++		}
++		digit := uint64(b[i] & 0x7f)
++		if digit > (maxBase-value)>>shift {
++			return 0, errInvalidQPACKBase
++		}
++		value += digit << shift
++		if b[i]&0x80 == 0 {
++			return i + 1, nil
++		}
++	}
++	return 0, errInvalidQPACKBase
++}
+diff --git a/http3/qpack_field_section_test.go b/http3/qpack_field_section_test.go
+new file mode 100644
+index 0000000..ebf2db8
+--- /dev/null
++++ b/http3/qpack_field_section_test.go
+@@ -0,0 +1,152 @@
++package http3
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/quic-go/qpack"
++	"github.com/stretchr/testify/require"
++)
++
++func qpackHeadersWithBase(t *testing.T, base []byte, fields ...string) []byte {
++	t.Helper()
++	var buf bytes.Buffer
++	enc := qpack.NewEncoder(&buf)
++	for i := 0; i < len(fields); i += 2 {
++		require.NoError(t, enc.WriteField(qpack.HeaderField{Name: fields[i], Value: fields[i+1]}))
++	}
++	require.NoError(t, enc.Close())
++	require.Equal(t, []byte{0, 0}, buf.Bytes()[:2])
++	block := append([]byte{0}, base...)
++	block = append(block, buf.Bytes()[2:]...)
++	return append((&headersFrame{Length: uint64(len(block))}).Append(nil), block...)
++}
++
++func TestQPACKFieldSectionPrefixBoundaries(t *testing.T) {
++	for _, tc := range []struct {
++		name  string
++		block []byte
++		valid bool
++		field bool
++	}{
++		{"empty field section", []byte{0, 0}, true, false},
++		{"empty section positive Base", []byte{0, 1}, true, false},
++		{"maximum nonminimal width", []byte{0, 0x7f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0}, true, false},
++		{"positive Base with static field", []byte{0, 1, 0xd9}, true, true},
++		{"maximum Base with static field", []byte{0, 0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f, 0xd9}, true, true},
++		{"missing Required Insert Count", nil, false, false},
++		{"missing Base", []byte{0}, false, false},
++		{"truncated Base", []byte{0, 0x7f}, false, false},
++		{"truncated continuation", []byte{0, 0x7f, 0x80}, false, false},
++		{"negative Base", []byte{0, 0x80, 0xd9}, false, false},
++		{"negative Base with extended delta", []byte{0, 0xff, 0}, false, false},
++		{"Base exceeds supported range", []byte{0, 0x7f, 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f, 0xd9}, false, false},
++		{"Base exceeds encoded length limit", []byte{0, 0x7f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0, 0xd9}, false, false},
++		{"nonzero Required Insert Count", []byte{1, 0, 0xd9}, false, false},
++		{"dynamic reference remains invalid", []byte{0, 1, 0x80}, false, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			original := bytes.Clone(tc.block)
++			decode := decodeFieldSection(qpack.NewDecoder(), tc.block)
++			field, err := decode()
++			if !tc.valid {
++				require.Error(t, err)
++				require.NotErrorIs(t, err, io.EOF, "invalid prefixes must not become an empty field section")
++			} else if tc.field {
++				require.NoError(t, err)
++				require.Equal(t, qpack.HeaderField{Name: ":status", Value: "200"}, field)
++				_, err = decode()
++				require.ErrorIs(t, err, io.EOF)
++			} else {
++				require.ErrorIs(t, err, io.EOF)
++			}
++			require.Equal(t, original, tc.block, "decoding must not mutate the received field section")
++		})
++	}
++}
++
++// Exercise the production request, response and trailer decode paths over
++// real QUIC pairs. Base does not affect static-table field representations.
++func TestQPACKFieldSectionBaseConformance(t *testing.T) {
++	for _, tc := range []struct {
++		name  string
++		base  []byte
++		valid bool
++	}{
++		{"zero", []byte{0}, true},
++		{"positive", []byte{1}, true},
++		{"prefixed", []byte{0x7f, 0}, true},
++		{"nonminimal", []byte{0x7f, 0x80, 0}, true},
++		{"maximum 62-bit Base", []byte{0x7f, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f}, true},
++		{"negative Base", []byte{0x80}, false},
++		{"negative Base with delta", []byte{0x81}, false},
++	} {
++		for _, trailers := range []bool{false, true} {
++			part := "headers"
++			if trailers {
++				part = "trailers"
++			}
++			t.Run("request/"+part+"/"+tc.name, func(t *testing.T) {
++				conn := conformanceServer(t, func(w http.ResponseWriter, r *http.Request) {
++					io.ReadAll(r.Body) // Ignore errors: enforcement belongs to the HTTP/3 layer.
++					w.WriteHeader(http.StatusOK)
++				})
++				fields := []string{":method", "POST", ":scheme", "https", ":authority", "localhost", ":path", "/"}
++				data := qpackHeadersWithBase(t, tc.base, fields...)
++				if trailers {
++					data = append(conformanceHeaders(t, fields...), qpackHeadersWithBase(t, tc.base, "x-trailer", "value")...)
++				}
++				str := conformanceRequest(t, conn, data, true)
++				if !tc.valid {
++					io.ReadAll(str)
++					conformanceConnectionError(t, conn, ErrCodeQPACKDecompressionFailed)
++					return
++				}
++				require.Equal(t, []string{"200"}, decodeHeader(t, str)[":status"])
++				_, err := io.ReadAll(str)
++				require.NoError(t, err)
++				ordinary := conformanceRequest(t, conn, conformanceHeaders(t, ":method", "GET", ":scheme", "https", ":authority", "localhost", ":path", "/"), true)
++				require.Equal(t, []string{"200"}, decodeHeader(t, ordinary)[":status"])
++				_, err = io.ReadAll(ordinary)
++				require.NoError(t, err)
++			})
++			t.Run("response/"+part+"/"+tc.name, func(t *testing.T) {
++				client, server := newConnPair(t)
++				cc := (&Transport{DisableCompression: true}).NewClientConn(client)
++				stream, err := cc.OpenRequestStream(context.Background())
++				require.NoError(t, err)
++				require.NoError(t, stream.SetDeadline(time.Now().Add(2*time.Second)))
++				require.NoError(t, stream.SendRequestHeader(httptest.NewRequest("GET", "https://localhost/", nil)))
++				peer, err := server.AcceptStream(context.Background())
++				require.NoError(t, err)
++				data := qpackHeadersWithBase(t, tc.base, ":status", "200")
++				if trailers {
++					data = append(conformanceHeaders(t, ":status", "200"), qpackHeadersWithBase(t, tc.base, "x-trailer", "value")...)
++				}
++				_, err = peer.Write(data)
++				require.NoError(t, err)
++				require.NoError(t, peer.Close())
++				rsp, err := stream.ReadResponse()
++				if err == nil {
++					_, err = io.ReadAll(rsp.Body)
++				}
++				if !tc.valid {
++					require.Error(t, err)
++					conformanceConnectionError(t, server, ErrCodeQPACKDecompressionFailed)
++					return
++				}
++				require.NoError(t, err)
++				require.Equal(t, http.StatusOK, rsp.StatusCode)
++				if trailers {
++					require.Equal(t, "value", rsp.Trailer.Get("X-Trailer"))
++				}
++				require.NoError(t, context.Cause(client.Context()))
++			})
++		}
++	}
++}
 diff --git a/http3/qpack_stream.go b/http3/qpack_stream.go
 new file mode 100644
 index 0000000..3e88f4b
@@ -1261,54 +1762,150 @@ index ec362c2..0856584 100644
 @@ -198 +198 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
 -				f(k, v)
 +				f(k, strings.Trim(v, " \t"))
+diff --git a/http3/response_status_conformance_test.go b/http3/response_status_conformance_test.go
+new file mode 100644
+index 0000000..82579f7
+--- /dev/null
++++ b/http3/response_status_conformance_test.go
+@@ -0,0 +1,76 @@
++package http3
++
++import (
++	"context"
++	"io"
++	"math"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"testing"
++	"time"
++
++	"github.com/quic-go/qpack"
++	"github.com/quic-go/quic-go"
++	"github.com/stretchr/testify/require"
++)
++
++func TestResponseStatusSyntax(t *testing.T) {
++	for _, status := range []string{"0", "20", "99", "000", "099", "+20", "-20", "+200", "0200", "2000", "20x", "2 0", "\u066200", "101"} {
++		t.Run("invalid/"+status, func(t *testing.T) {
++			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice([]qpack.HeaderField{{Name: ":status", Value: status}}), math.MaxInt, nil, false)
++			require.Error(t, err)
++		})
++	}
++	// Keep extension status codes and the existing policy for three-digit
++	// out-of-range codes; this repair is limited to field syntax and 101.
++	for _, status := range []string{"100", "103", "200", "204", "299", "304", "471", "599", "600", "999"} {
++		t.Run("three digits/"+status, func(t *testing.T) {
++			response := &http.Response{}
++			err := updateResponseFromHeaders(response, decodeFromSlice([]qpack.HeaderField{{Name: ":status", Value: status}}), math.MaxInt, nil, false)
++			require.NoError(t, err)
++			want, err := strconv.Atoi(status)
++			require.NoError(t, err)
++			require.Equal(t, want, response.StatusCode)
++		})
++	}
++}
++
++func TestConformanceMalformedResponseStatus(t *testing.T) {
++	for _, status := range []string{"99", "+200", "0200", "2000", "101"} {
++		t.Run(status, func(t *testing.T) {
++			client, server := newConnPair(t)
++			cc := (&Transport{DisableCompression: true}).NewClientConn(client)
++			stream, err := cc.OpenRequestStream(context.Background())
++			require.NoError(t, err)
++			require.NoError(t, stream.SetDeadline(time.Now().Add(time.Second)))
++			require.NoError(t, stream.SendRequestHeader(httptest.NewRequest("GET", "https://localhost/", nil)))
++			peer, err := server.AcceptStream(context.Background())
++			require.NoError(t, err)
++			_, err = peer.Write(conformanceHeaders(t, ":status", status))
++			require.NoError(t, err)
++			require.NoError(t, peer.Close())
++			_, err = stream.ReadResponse()
++			require.Error(t, err)
++			require.NoError(t, peer.SetReadDeadline(time.Now().Add(time.Second)))
++			_, err = io.ReadAll(peer)
++			require.ErrorIs(t, err, &quic.StreamError{Remote: true, StreamID: peer.StreamID(), ErrorCode: quic.StreamErrorCode(ErrCodeMessageError)})
++
++			// One bad response must not make a later extension status unusable.
++			good, err := cc.OpenRequestStream(context.Background())
++			require.NoError(t, err)
++			require.NoError(t, good.SetDeadline(time.Now().Add(time.Second)))
++			require.NoError(t, good.SendRequestHeader(httptest.NewRequest("GET", "https://localhost/", nil)))
++			goodPeer, err := server.AcceptStream(context.Background())
++			require.NoError(t, err)
++			_, err = goodPeer.Write(conformanceHeaders(t, ":status", "471"))
++			require.NoError(t, err)
++			require.NoError(t, goodPeer.Close())
++			response, err := good.ReadResponse()
++			require.NoError(t, err)
++			require.Equal(t, 471, response.StatusCode)
++			_, err = io.ReadAll(response.Body)
++			require.NoError(t, err)
++		})
++	}
++}
 diff --git a/http3/response_writer.go b/http3/response_writer.go
-index 453c2f4..cdf956e 100644
+index 453c2f4..a8a8ee8 100644
 --- a/http3/response_writer.go
 +++ b/http3/response_writer.go
-@@ -15,2 +14,0 @@ import (
+@@ -12,0 +13,2 @@ import (
++	"golang.org/x/net/http/httpguts"
++
+@@ -15,2 +16,0 @@ import (
 -
 -	"golang.org/x/net/http/httpguts"
-@@ -100,0 +99,4 @@ func (w *responseWriter) WriteHeader(status int) {
+@@ -87,2 +87,2 @@ func (w *responseWriter) WriteHeader(status int) {
+-	// http status must be 3 digits
+-	if status < 100 || status > 999 {
++	// HTTP status must be 3 digits; HTTP/3 does not support 101 (RFC 9114 section 4.5).
++	if status < 100 || status > 999 || status == http.StatusSwitchingProtocols {
+@@ -100,0 +101,4 @@ func (w *responseWriter) WriteHeader(status int) {
 +	if w.str.isConnect && status >= 200 && status < 300 {
 +		w.str.tunnel.Store(true)
 +		w.header.Del("Content-Length")
 +	}
-@@ -131 +133 @@ func (w *responseWriter) sniffContentType(p []byte) {
+@@ -131 +135 @@ func (w *responseWriter) sniffContentType(p []byte) {
 -	if !hasCE && !haveType && len(p) > 0 {
 +	if !w.str.tunnel.Load() && !hasCE && !haveType && len(p) > 0 {
-@@ -137 +139 @@ func (w *responseWriter) Write(p []byte) (int, error) {
+@@ -137 +141 @@ func (w *responseWriter) Write(p []byte) (int, error) {
 -	bodyAllowed := bodyAllowedForStatus(w.status)
 +	bodyAllowed := w.str.tunnel.Load() || bodyAllowedForStatus(w.status)
-@@ -139 +140,0 @@ func (w *responseWriter) Write(p []byte) (int, error) {
+@@ -139 +142,0 @@ func (w *responseWriter) Write(p []byte) (int, error) {
 -		w.sniffContentType(p)
-@@ -140,0 +142 @@ func (w *responseWriter) Write(p []byte) (int, error) {
+@@ -140,0 +144 @@ func (w *responseWriter) Write(p []byte) (int, error) {
 +		w.sniffContentType(p)
-@@ -232,0 +235 @@ func (w *responseWriter) writeHeader(status int) error {
+@@ -232,0 +237 @@ func (w *responseWriter) writeHeader(status int) error {
 +	hopFields := connectionHeaderFields(w.header)
-@@ -233,0 +237,9 @@ func (w *responseWriter) writeHeader(status int) error {
+@@ -233,0 +239,12 @@ func (w *responseWriter) writeHeader(status int) error {
++		if !httpguts.ValidHeaderFieldName(k) {
++			continue
++		}
 +		name := strings.ToLower(k)
 +		// HTTP/3 cannot carry Connection or other hop-by-hop response fields,
 +		// including those explicitly nominated by a legacy Connection value.
 +		if _, hop := hopFields[name]; isConnectionSpecificHeader(name) || hop {
 +			continue
 +		}
-+		if w.str.tunnel.Load() && strings.EqualFold(k, "Content-Length") {
++		if strings.EqualFold(k, "Content-Length") && (w.str.tunnel.Load() || status < 200 || status == http.StatusNoContent) {
 +			continue
 +		}
-@@ -242,2 +254 @@ func (w *responseWriter) writeHeader(status int) error {
+@@ -242,2 +259,4 @@ func (w *responseWriter) writeHeader(status int) error {
 -			name := strings.ToLower(k)
 -			value := v[index]
 +			value := strings.Trim(v[index], " \t")
-@@ -295 +306 @@ func (w *responseWriter) declareTrailer(k string) {
++			if !httpguts.ValidHeaderFieldValue(value) {
++				continue
++			}
+@@ -295 +314 @@ func (w *responseWriter) declareTrailer(k string) {
 -	if !httpguts.ValidTrailerHeader(k) {
 +	if !validTrailerHeader(k) {
-@@ -309,0 +321,3 @@ func (w *responseWriter) writeTrailers() error {
+@@ -309,0 +329,3 @@ func (w *responseWriter) writeTrailers() error {
 +	if w.str.tunnel.Load() {
 +		return nil
 +	}
-@@ -321,0 +336 @@ func (w *responseWriter) writeTrailers() error {
+@@ -321,0 +344 @@ func (w *responseWriter) writeTrailers() error {
 +	hopFields := connectionHeaderFields(w.header)
-@@ -323,0 +339,3 @@ func (w *responseWriter) writeTrailers() error {
+@@ -323,0 +347,3 @@ func (w *responseWriter) writeTrailers() error {
 +		if _, hop := hopFields[strings.ToLower(strings.TrimPrefix(trailer, http.TrailerPrefix))]; hop {
 +			continue
 +		}
@@ -1432,11 +2029,14 @@ index 0000000..6bed417
 +	require.Equal(t, 3, calls)
 +}
 diff --git a/http3/server_conn.go b/http3/server_conn.go
-index 1f9e143..464efd5 100644
+index 1f9e143..cf88c43 100644
 --- a/http3/server_conn.go
 +++ b/http3/server_conn.go
 @@ -139,0 +140 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 +		truncatedFrame(conn.CloseWithError, err)
+@@ -144 +145 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
+-	decodeFn := decoder.Decode(headerBlock)
++	decodeFn := decodeFieldSection(decoder, headerBlock)
 @@ -162 +162,0 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 -		errCode := ErrCodeMessageError
 @@ -164 +164,4 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
@@ -1453,7 +2053,7 @@ index 1f9e143..464efd5 100644
 +
 @@ -257 +260 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 -		if _, haveCL := r.header["Content-Length"]; !haveCL {
-+		if _, haveCL := r.header["Content-Length"]; !haveCL && !hstr.tunnel.Load() {
++		if _, haveCL := r.header["Content-Length"]; !haveCL && !hstr.tunnel.Load() && bodyAllowedForStatus(r.status) {
 @@ -271,0 +275 @@ func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *framePars
 +	lastGoAwayID := quic.StreamID(1<<62 - 1)
 @@ -299 +303,7 @@ func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *framePars
@@ -1466,7 +2066,7 @@ index 1f9e143..464efd5 100644
 +			}
 +			lastGoAwayID = frame.StreamID
 diff --git a/http3/stream.go b/http3/stream.go
-index 3f66e0a..20a619c 100644
+index 3f66e0a..176a0ee 100644
 --- a/http3/stream.go
 +++ b/http3/stream.go
 @@ -9,0 +10 @@ import (
@@ -1526,6 +2126,9 @@ index 3f66e0a..20a619c 100644
 +	s.isHead = req.Method == http.MethodHead
 @@ -384,0 +424 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
 +		err = truncatedFrame(s.str.conn.CloseWithError, err)
+@@ -389 +429 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
+-	decodeFn := s.decoder.Decode(headerBlock)
++	decodeFn := decodeFieldSection(s.decoder, headerBlock)
 @@ -395 +435 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
 -	err = updateResponseFromHeaders(res, decodeFn, s.maxHeaderBytes, &hfs)
 +	err = updateResponseFromHeaders(res, decodeFn, s.maxHeaderBytes, &hfs, s.isConnect)

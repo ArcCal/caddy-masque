@@ -142,7 +142,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 		str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
 		return
 	}
-	decodeFn := decoder.Decode(headerBlock)
+	decodeFn := decodeFieldSection(decoder, headerBlock)
 	var hfs []qpack.HeaderField
 	if qlogger != nil {
 		hfs = make([]qpack.HeaderField, 0, 16)
@@ -257,7 +257,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 
 	// response not written to the client yet, set Content-Length
 	if !r.headerWritten {
-		if _, haveCL := r.header["Content-Length"]; !haveCL && !hstr.tunnel.Load() {
+		if _, haveCL := r.header["Content-Length"]; !haveCL && !hstr.tunnel.Load() && bodyAllowedForStatus(r.status) {
 			r.header.Set("Content-Length", strconv.FormatInt(r.numWritten, 10))
 		}
 	}

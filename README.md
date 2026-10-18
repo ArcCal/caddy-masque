@@ -31,6 +31,7 @@ contract, the independent gateway client fixture, and confirmed client-side RFC 
 establish native Network.framework or GUI acceptance.
 The separate [client IETF conformance audit](docs/client-ietf-conformance-2026-10-18.md) details each client finding, affected implementations, pinned source and RFC evidence, reproduction boundaries, and private WARP/SOCKS limitations.
 The [independent IETF reassessment](docs/ietf-reassessment-2026-10-18.md) checks those interpretations against original RFCs, verified errata and other implementations, and records corrections and narrowly scoped follow-up repairs.
+The [comprehensive follow-up review](docs/comprehensive-recheck-2026-10-18.md) expands the protocol, forwarding and interoperability checks, with additional reproductions, targeted repairs and explicit validation limits.
 
 ## One-step install
 

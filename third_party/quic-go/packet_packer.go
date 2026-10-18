@@ -24,7 +24,7 @@ type packer interface {
 	PackPTOProbePacket(_ protocol.EncryptionLevel, _ protocol.ByteCount, addPingIfEmpty bool, now monotime.Time, v protocol.Version) (*coalescedPacket, error)
 	PackConnectionClose(*qerr.TransportError, protocol.ByteCount, protocol.Version) (*coalescedPacket, error)
 	PackApplicationClose(*qerr.ApplicationError, protocol.ByteCount, protocol.Version) (*coalescedPacket, error)
-	PackPathProbePacket(protocol.ConnectionID, []ackhandler.Frame, protocol.Version) (shortHeaderPacket, *packetBuffer, error)
+	PackPathProbePacket(protocol.ConnectionID, []ackhandler.Frame, protocol.ByteCount, protocol.Version) (shortHeaderPacket, *packetBuffer, error)
 	PackMTUProbePacket(ping ackhandler.Frame, size protocol.ByteCount, v protocol.Version) (shortHeaderPacket, *packetBuffer, error)
 
 	SetToken([]byte)
@@ -814,7 +814,7 @@ func (p *packetPacker) PackMTUProbePacket(ping ackhandler.Frame, size protocol.B
 	return packet, buffer, err
 }
 
-func (p *packetPacker) PackPathProbePacket(connID protocol.ConnectionID, frames []ackhandler.Frame, v protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+func (p *packetPacker) PackPathProbePacket(connID protocol.ConnectionID, frames []ackhandler.Frame, maxSize protocol.ByteCount, v protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
 	pn, pnLen := p.pnManager.PeekPacketNumber(protocol.Encryption1RTT)
 	buf := getPacketBuffer()
 	s, err := p.cryptoSetup.Get1RTTSealer()
@@ -829,8 +829,8 @@ func (p *packetPacker) PackPathProbePacket(connID protocol.ConnectionID, frames 
 		frames: frames,
 		length: l,
 	}
-	padding := protocol.MinInitialPacketSize - p.shortHeaderPacketLength(connID, pnLen, payload) - protocol.ByteCount(s.Overhead())
-	packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, s.KeyPhase(), payload, padding, protocol.MinInitialPacketSize, s, false, v)
+	padding := max(0, maxSize-p.shortHeaderPacketLength(connID, pnLen, payload)-protocol.ByteCount(s.Overhead()))
+	packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, s.KeyPhase(), payload, padding, maxSize, s, false, v)
 	if err != nil {
 		return shortHeaderPacket{}, nil, err
 	}
@@ -922,6 +922,14 @@ func (p *packetPacker) appendShortHeaderPacket(
 		return shortHeaderPacket{}, err
 	}
 	payloadOffset := protocol.ByteCount(len(raw))
+	if maxPacketSize >= protocol.MinInitialPacketSize {
+		for _, frame := range pl.frames {
+			switch frame.Frame.(type) {
+			case *wire.PathChallengeFrame, *wire.PathResponseFrame:
+				paddingLen = max(paddingLen, protocol.MinInitialPacketSize-payloadOffset-pl.length-protocol.ByteCount(sealer.Overhead()))
+			}
+		}
+	}
 
 	raw, err = p.appendPacketPayload(raw, pl, paddingLen, v)
 	if err != nil {
