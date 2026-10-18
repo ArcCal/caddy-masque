@@ -675,8 +675,8 @@ func TestAddressRequestsAreAnswered(t *testing.T) {
 	want := []proto.AssignedAddress{
 		{RequestID: 7, Prefix: proto.Host(netip.MustParseAddr(r.addr(false)))},
 		{RequestID: 8, Prefix: proto.Host(netip.MustParseAddr(r.addr(true)))},
-		// A specific address is not granted; the client gets its own.
-		{RequestID: 9, Prefix: proto.Host(netip.MustParseAddr(r.addr(false)))},
+		// A different specific address is not granted (§4.7.2).
+		{RequestID: 9, Prefix: proto.Unspecified(false)},
 	}
 	if !slices.Equal(reply, want) {
 		t.Errorf("reply %v, want %v", reply, want)

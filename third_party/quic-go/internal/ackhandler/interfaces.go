@@ -20,6 +20,10 @@ type SentPacketHandler interface {
 
 	// The SendMode determines if and what kind of packets can be sent.
 	SendMode(now monotime.Time) SendMode
+	// AmplificationBudget is the remaining byte allowance before address validation.
+	AmplificationBudget() protocol.ByteCount
+	// HasCongestionBudget checks a packet size, including larger PMTU probes.
+	HasCongestionBudget(protocol.ByteCount) bool
 	// TimeUntilSend is the time when the next packet should be sent.
 	// It is used for pacing packets.
 	TimeUntilSend() monotime.Time

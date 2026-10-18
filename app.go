@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/caddy-dns/cloudflare"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyevents"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -249,10 +250,6 @@ func (a *App) parse() error {
 		}
 		allowed.Remove(p)
 	}
-	// RFC 9484 §7.2: link-local traffic never leaves the tunnel's link,
-	// whatever the configuration says.
-	allowed.Remove(netip.MustParsePrefix("169.254.0.0/16"))
-	allowed.Remove(netip.MustParsePrefix("fe80::/10"))
 	// The client pool: reachable only when clients may reach each other,
 	// whatever the blocked list says about the space it is in.
 	pools := []netip.Prefix{a.cfg.ipv4.Masked()}
@@ -270,6 +267,10 @@ func (a *App) parse() error {
 	if a.cfg.ipv6.IsValid() {
 		allowed.Insert(netip.PrefixFrom(a.cfg.ipv6.Addr(), 128))
 	}
+	// Apply this after pool/gateway additions: no configuration may turn
+	// link-local destinations into routes between separate HTTP tunnels.
+	allowed.Remove(netip.MustParsePrefix("169.254.0.0/16"))
+	allowed.Remove(netip.MustParsePrefix("fe80::/10"))
 	a.allowed = allowed
 	return nil
 }
@@ -285,6 +286,11 @@ func hostPrefix(s string, v6 bool) (netip.Prefix, error) {
 	}
 	if p.Addr() == p.Masked().Addr() {
 		return netip.Prefix{}, fmt.Errorf("masque: %q must name the server's own address in the prefix, such as 10.89.0.1/24", s)
+	}
+	for _, linkLocal := range []netip.Prefix{netip.MustParsePrefix("169.254.0.0/16"), netip.MustParsePrefix("fe80::/10")} {
+		if p.Overlaps(linkLocal) {
+			return netip.Prefix{}, fmt.Errorf("masque: tunnel pool %q overlaps link-local space", s)
+		}
 	}
 	return p, nil
 }
@@ -337,14 +343,13 @@ func (a *App) takeOverHTTP3() error {
 	return nil
 }
 
-// Start implements caddy.App. The shared state (users, allowed
-// destinations, HTTP/3 handlers) becomes this configuration's; Cleanup
-// gives it back to the previous one if this one fails to start.
+// Start implements caddy.App. Policy changes on a shared core are staged
+// until Caddy commits the configuration; a failed candidate cannot revoke
+// sessions belonging to the previous configuration.
 func (a *App) Start() error {
 	if err := a.core.startOnce(); err != nil {
 		return err
 	}
-	a.core.activate(a)
 	for _, h := range a.h3Addrs {
 		srv := a.httpApp.Servers[h.server]
 		if err := a.serveHTTP3(h.network, h.hostport, srv, srv.TLSConnPolicies.TLSConfig(a.ctx)); err != nil {
@@ -352,6 +357,9 @@ func (a *App) Start() error {
 		}
 		a.log.Info("serving HTTP/3 with HTTP datagrams", zap.String("server", h.server), zap.String("addr", h.hostport))
 	}
+	// Listener setup can fail. Do not irreversibly revoke old sessions
+	// until all of this app's fallible startup work has succeeded.
+	a.core.activate(a)
 	a.log.Info("masque ready", zap.String("interface", a.cfg.iface), zap.Stringer("ipv4", a.cfg.ipv4),
 		zap.String("ipv6", func() string {
 			if a.cfg.ipv6.IsValid() {
@@ -362,8 +370,18 @@ func (a *App) Start() error {
 	return nil
 }
 
-// Stop implements caddy.App.
-func (a *App) Stop() error { return nil }
+// Stop implements caddy.App. Caddy swaps its active context only after the
+// entire new configuration starts successfully, then stops the old apps.
+// That is the commit point for changes that can revoke existing sessions.
+func (a *App) Stop() error {
+	current, err := caddy.ActiveContext().AppIfConfigured("masque")
+	if err == nil {
+		if next, ok := current.(*App); ok && next != a && next.core == a.core {
+			a.core.commit(next)
+		}
+	}
+	return nil
+}
 
 // Cleanup implements caddy.CleanerUpper: the configuration is unloaded, or
 // failed to load or start. The tunnel and the HTTP/3 listeners stay if
@@ -404,12 +422,14 @@ type h3Listener struct {
 	// request.
 	handler atomic.Pointer[http.Handler]
 	tls     atomic.Pointer[tls.Config]
+	config  atomic.Pointer[http3.ConnectionConfig]
 }
 
 type h3Owner struct {
 	app     *App
 	handler http.Handler
 	tls     *tls.Config
+	config  http3.ConnectionConfig
 }
 
 func (l *h3Listener) activate(o h3Owner) {
@@ -433,6 +453,7 @@ func (l *h3Listener) apply() {
 	o := l.owners[len(l.owners)-1]
 	l.handler.Store(&o.handler)
 	l.tls.Store(o.tls)
+	l.config.Store(&o.config)
 }
 
 func (l *h3Listener) Destruct() error {
@@ -442,8 +463,10 @@ func (l *h3Listener) Destruct() error {
 
 // quicOverhead is the worst-case QUIC overhead around a DATAGRAM frame in
 // a 1-RTT packet, plus the HTTP Datagram's quarter stream ID and context
-// ID: so a full tunnel-MTU packet fits one datagram from the start.
-const quicOverhead = (1 + 20 + 4 + 16 + 1 + 2) + (2 + 1)
+// ID. The quarter stream ID can occupy eight bytes even on a long-lived
+// connection. The configured initial packet size is also capped to the
+// supported path size; larger packets still depend on MTU discovery.
+const quicOverhead = (1 + 20 + 4 + 16 + 1 + 2) + (8 + 1)
 
 // listenUDP binds with SO_REUSEPORT, as Caddy does: when HTTP/3 moves to
 // this app by a reload, Caddy's own socket on the port is still open.
@@ -462,7 +485,9 @@ func listenUDP(network, hostport string) (net.PacketConn, error) {
 
 func (a *App) serveHTTP3(network, hostport string, srv *caddyhttp.Server, tlsCfg *tls.Config) error {
 	key := "masque-h3/" + network + "/" + hostport
-	owner := h3Owner{app: a, handler: srv, tls: tlsCfg}
+	owner := h3Owner{app: a, handler: srv, tls: tlsCfg, config: http3.ConnectionConfig{
+		MaxHeaderBytes: srv.MaxHeaderBytes, IdleTimeout: time.Duration(srv.IdleTimeout),
+	}}
 	val, loaded, err := listeners.LoadOrNew(key, func() (caddy.Destructor, error) {
 		conn, err := listenUDP(network, hostport)
 		if err != nil {
@@ -512,16 +537,23 @@ func (a *App) serveHTTP3(network, hostport string, srv *caddyhttp.Server, tlsCfg
 			TLSConfig:       http3.ConfigureTLSConfig(base),
 			MaxHeaderBytes:  srv.MaxHeaderBytes,
 			EnableDatagrams: true,
+			GetConnectionConfig: func(*quic.Conn) http3.ConnectionConfig {
+				return *l.config.Load()
+			},
 			// Connections without requests or tunnels are closed, as web
 			// servers close idle keep-alive connections.
-			IdleTimeout: 120 * time.Second,
+			IdleTimeout: time.Duration(srv.IdleTimeout),
 			QUICConfig: &quic.Config{
 				EnableDatagrams:   true,
 				InitialPacketSize: uint16(min(max(a.cfg.mtu+quicOverhead, 1200), 1452)),
 				MaxIdleTimeout:    60 * time.Second,
 			},
 		}
-		go func() { _ = l.server.Serve(conn) }()
+		go func() {
+			if err := l.server.Serve(conn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				a.log.Error("HTTP/3 listener stopped", zap.String("addr", hostport), zap.Error(err))
+			}
+		}()
 		return l, nil
 	})
 	if err != nil {

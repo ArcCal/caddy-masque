@@ -98,6 +98,10 @@ func (w *responseWriter) WriteHeader(status int) {
 
 	// We're done with headers once we write a status >= 200.
 	w.headerComplete = true
+	if w.str.isConnect && status >= 200 && status < 300 {
+		w.str.tunnel.Store(true)
+		w.header.Del("Content-Length")
+	}
 	// Add Date header.
 	// This is what the standard library does.
 	// Can be disabled by setting the Date header to nil.
@@ -128,16 +132,16 @@ func (w *responseWriter) sniffContentType(p []byte) {
 
 	// If the Content-Encoding was set and is non-blank, we shouldn't sniff the body.
 	hasCE := w.header.Get("Content-Encoding") != ""
-	if !hasCE && !haveType && len(p) > 0 {
+	if !w.str.tunnel.Load() && !hasCE && !haveType && len(p) > 0 {
 		w.header.Set("Content-Type", http.DetectContentType(p))
 	}
 }
 
 func (w *responseWriter) Write(p []byte) (int, error) {
-	bodyAllowed := bodyAllowedForStatus(w.status)
+	bodyAllowed := w.str.tunnel.Load() || bodyAllowedForStatus(w.status)
 	if !w.headerComplete {
-		w.sniffContentType(p)
 		w.WriteHeader(http.StatusOK)
+		w.sniffContentType(p)
 		bodyAllowed = true
 	}
 	if !bodyAllowed {
@@ -231,6 +235,9 @@ func (w *responseWriter) writeHeader(status int) error {
 	}
 
 	for k, v := range w.header {
+		if w.str.tunnel.Load() && strings.EqualFold(k, "Content-Length") {
+			continue
+		}
 		if _, excluded := w.trailers[k]; excluded {
 			continue
 		}
@@ -307,6 +314,9 @@ func (w *responseWriter) declareTrailer(k string) {
 
 // writeTrailers will write trailers to the stream if there are any.
 func (w *responseWriter) writeTrailers() error {
+	if w.str.tunnel.Load() {
+		return nil
+	}
 	// promote headers added via "Trailer:" convention as trailers, these can be added after
 	// streaming the status/headers have been written.
 	for k := range w.header {

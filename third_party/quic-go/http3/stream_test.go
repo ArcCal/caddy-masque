@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -263,4 +264,25 @@ func TestRequestStream(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 6, n)
 	require.Equal(t, []byte("foobar"), b[:n])
+}
+
+func TestStreamTrailerReadDeadline(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	str := NewMockDatagramStream(ctrl)
+	str.EXPECT().StreamID().Return(quic.StreamID(0)).AnyTimes()
+	data := bytes.NewReader((&headersFrame{Length: 5}).Append(nil))
+	str.EXPECT().Read(gomock.Any()).DoAndReturn(func(p []byte) (int, error) {
+		if data.Len() == 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+		return data.Read(p)
+	}).AnyTimes()
+	stream := newStream(str, nil, nil, func(r io.Reader, hf *headersFrame) error {
+		_, err := decodeTrailers(r, hf, 100, qpack.NewDecoder(), nil, 0)
+		return err
+	}, nil)
+	_, err := stream.Read(make([]byte, 10))
+	// A local read deadline is not a malformed peer message and must not
+	// reset either stream direction with H3_MESSAGE_ERROR.
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 }

@@ -506,7 +506,9 @@ func (s *session) clientPacket(payload []byte) error {
 			h.Protocol = p
 		}
 	}
-	if !s.current.Load().allows(h) {
+	// Each tunnel is its own IP link. Link-local unicast must not cross
+	// interfaces (§7.2), but can receive local ICMP error feedback (§8).
+	if h.Src.IsLinkLocalUnicast() || h.Dst.IsLinkLocalUnicast() || !s.current.Load().allows(h) {
 		s.dropped()
 		if e := ip.DestUnreachable(pkt, s.core.gateway(!h.IsIPv4()), ip.AdminProhibited); e != nil && s.icmpAllow() {
 			return s.sendToClient(append([]byte{0}, e...))
@@ -567,7 +569,10 @@ func addressAssignReply(addrs []netip.Addr, requests proto.AddressRequest) proto
 	for _, r := range requests {
 		prefix := proto.Unspecified(r.Prefix.Addr().Is6())
 		for _, a := range addrs {
-			if a.Is6() == r.Prefix.Addr().Is6() {
+			// An explicit address/prefix was granted only if it is our
+			// actual assignment. Otherwise §4.7.2 requires the all-zero
+			// rejection, and the existing address is included with ID zero.
+			if a.Is6() == r.Prefix.Addr().Is6() && (r.Prefix.Addr().IsUnspecified() || r.Prefix == proto.Host(a)) {
 				prefix = proto.Host(a)
 				break
 			}

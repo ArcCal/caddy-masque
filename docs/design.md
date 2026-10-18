@@ -4,6 +4,10 @@
 
 Serve CONNECT-IP according to RFC 9484, with HTTP Datagrams and Capsules
 (RFC 9297) and extended CONNECT over HTTP/2 and HTTP/3 (RFC 8441, RFC 9220).
+Mandatory IETF requirements take precedence when they conflict with camouflage or other design goals.
+A refused extended CONNECT must never become a successful website 2xx response. Ordinary website bodies and
+error pages may be reused within those protocol rules; exact endpoint indistinguishability is not a goal.
+
 Keep HTTP/1.1 Upgrade support and all four client modes: HTTP/3 Datagrams,
 HTTP/2, HTTP/1.1 and HTTP/3 DATAGRAM Capsules.
 
@@ -12,9 +16,14 @@ masque-vpn-killswitch. Existing configuration, authentication, certificate
 verification, packet framing, address assignment and reconnect behavior must
 remain compatible. NF and Swift are outside this acceptance scope.
 
-The VPN and ordinary Caddy websites share TCP/UDP port 443. Unauthenticated
-requests follow the configured website behavior. Website routing, bodies,
+The VPN and ordinary Caddy websites share TCP/UDP port 443. Unauthenticated requests use the configured website response where protocol rules allow it;
+refused HTTP/2 and HTTP/3 CONNECT-IP responses use non-2xx status codes. Website routing, bodies,
 trailers, TLS and reverse proxies must continue to work.
+
+Every build must include the pinned `github.com/caddy-dns/cloudflare` module, currently v0.2.4.
+The MASQUE package registers the provider so normal builds, custom mains, the installer and all CI artifacts
+include it. Build validation must require `dns.providers.cloudflare`, `masque` and `http.handlers.masque`.
+Cloudflare DNS credentials remain an optional deployment setting, not a build prerequisite.
 
 ## Integration
 
@@ -30,7 +39,11 @@ streams. Main-module replacements are mandatory, including in xcaddy builds;
 see [the patch contracts and verification](../third_party/README.md).
 Go 1.26 and Go 1.27 select the patched HTTP/2 implementation without an extra
 build tag. Tunnel deadlines and lifecycle must remain independent of website
-idle timeouts, while normal requests retain Caddy's protections.
+idle timeouts, while normal requests retain Caddy's protections. HTTP/3 header limits and HTTP idle lifetime are snapshotted
+from the current Caddy configuration for each new connection, without mutating settings of existing tunnels.
+Changes to shared authentication and routing policy are staged while a candidate configuration starts.
+They apply after Caddy publishes the new active context, before the old MASQUE app is cleaned up;
+failed startup must leave the previous configuration's live sessions intact.
 
 ## Caddy update maintenance
 
@@ -48,7 +61,7 @@ Every proposed upgrade requires these checks:
 2. Build the exact final server artifact on both supported Go lines, currently
    1.26 and 1.27, using their current patch releases and the documented
    replacements. Verify its Caddy version and module registrations, including
-   custom-main or xcaddy variants being shipped. A supported-toolchain change
+   custom-main or xcaddy variants being shipped. Require the bundled Cloudflare provider in each artifact. A supported-toolchain change
    must be reviewed explicitly.
 3. Run strict fork verification, module verification, vet and the main and
    patched HTTP/2, HPACK and HTTP/3 race suites. Retain frame-level RFC checks:
@@ -66,7 +79,8 @@ Every proposed upgrade requires these checks:
    conformance checks against the final artifact. Cover TLS trust and refusal,
    authentication, idle survival, reload/revocation, failure recovery and
    reconnect, plus ordinary website bodies, trailers and routing. Release
-   checks use optimized client builds and native supported server architectures.
+   checks use optimized client builds and native supported server architectures. Package the exact checksum-bound executable that passed these checks;
+   do not rebuild a different executable between validation and upload.
 5. Record exact versions, source revisions, artifact hashes, build/test commands
    and passed/failed/skipped counts. Require actual passing cases; zero-case
    runs and skipped required cases do not establish compatibility. Keep old
@@ -81,4 +95,6 @@ Neither cross-compilation nor Linux kernel tests substitute for those checks.
 Test evidence is not a claim of formal IETF or Apple certification. See the
 [current compatibility report](compatibility-2026-10-11.md) and
 [HTTP/2 security repair](http2-security-2026-10-11.md), plus the
-[wrapper harness scope](../tests/clients/README.md).
+[wrapper harness scope](../tests/clients/README.md). The
+[October 18 conformance repair report](conformance-repair-2026-10-18.md)
+records the subsequent standards audit, fixes and validation boundaries.

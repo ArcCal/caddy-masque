@@ -512,7 +512,12 @@ func TestCubicSenderSlowStartsUpToMaximumCongestionWindow(t *testing.T) {
 
 func TestCubicSenderMaximumPacketSizeReduction(t *testing.T) {
 	sender := newTestCubicSender(false)
-	require.Panics(t, func() { sender.sender.SetMaxDatagramSize(initialMaxDatagramSize - 1) })
+	originalWindow := sender.sender.GetCongestionWindow()
+	sender.sender.SetMaxDatagramSize(initialMaxDatagramSize - 1)
+	require.Equal(t, initialMaxDatagramSize-1, sender.sender.maxDatagramSize)
+	require.Equal(t, originalWindow, sender.sender.GetCongestionWindow())
+	require.True(t, sender.sender.CanSend(originalWindow-initialMaxDatagramSize+1))
+	require.False(t, sender.sender.CanSend(originalWindow-initialMaxDatagramSize+2))
 }
 
 func TestCubicSenderSlowStartsPacketSizeIncrease(t *testing.T) {
@@ -580,9 +585,9 @@ func TestCubicSenderLimitCwndIncreaseInCongestionAvoidance(t *testing.T) {
 		testSender.AckNPackets(1)
 		testSender.SendAvailableSendWindow()
 	}
-	// Bytes in flight may be larger than the CWND if the CWND isn't an exact
-	// multiple of the packet sizes being sent.
-	require.GreaterOrEqual(t, testSender.bytesInFlight, sender.GetCongestionWindow())
+	// A fractional final packet of credit cannot permit a full packet.
+	require.LessOrEqual(t, testSender.bytesInFlight, sender.GetCongestionWindow())
+	require.Less(t, sender.GetCongestionWindow()-testSender.bytesInFlight, maxDatagramSize)
 	savedCwnd = sender.GetCongestionWindow()
 
 	// Advance time 2 seconds waiting for an ack.

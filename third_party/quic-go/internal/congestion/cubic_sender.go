@@ -1,8 +1,6 @@
 package congestion
 
 import (
-	"fmt"
-
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/utils"
@@ -156,7 +154,8 @@ func (c *cubicSender) OnPacketSent(
 }
 
 func (c *cubicSender) CanSend(bytesInFlight protocol.ByteCount) bool {
-	return bytesInFlight < c.GetCongestionWindow()
+	// Reserve room for the entire next packet, as required by RFC 9002, section 7.
+	return c.maxDatagramSize <= c.GetCongestionWindow()-bytesInFlight
 }
 
 func (c *cubicSender) InRecovery() bool {
@@ -318,9 +317,7 @@ func (c *cubicSender) maybeQlogStateChange(new qlog.CongestionState) {
 }
 
 func (c *cubicSender) SetMaxDatagramSize(s protocol.ByteCount) {
-	if s < c.maxDatagramSize {
-		panic(fmt.Sprintf("congestion BUG: decreased max datagram size from %d to %d", c.maxDatagramSize, s))
-	}
+	// The peer may advertise a receiver limit below the configured initial size.
 	cwndIsMinCwnd := c.congestionWindow == c.minCongestionWindow()
 	c.maxDatagramSize = s
 	if cwndIsMinCwnd {

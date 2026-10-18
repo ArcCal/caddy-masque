@@ -20,6 +20,7 @@ type Settingser interface {
 }
 
 var errTooMuchData = errors.New("peer sent too much data")
+var errTooLittleData = errors.New("peer sent too little data")
 
 // The body is used in the requestBody (for a http.Request) and the responseBody (for a http.Response).
 type body struct {
@@ -57,6 +58,9 @@ func (r *body) checkContentLengthViolation() error {
 }
 
 func (r *body) Read(b []byte) (int, error) {
+	if r.str.tunnel.Load() {
+		r.hasContentLength = false
+	}
 	if err := r.checkContentLengthViolation(); err != nil {
 		return 0, err
 	}
@@ -64,9 +68,18 @@ func (r *body) Read(b []byte) (int, error) {
 		b = b[:min(int64(len(b)), r.remainingContentLength)]
 	}
 	n, err := r.str.Read(b)
+	// The response can establish a CONNECT tunnel while this read blocks.
+	if r.str.tunnel.Load() {
+		r.hasContentLength = false
+	}
 	r.remainingContentLength -= int64(n)
 	if err := r.checkContentLengthViolation(); err != nil {
 		return n, err
+	}
+	if err == io.EOF && r.hasContentLength && r.remainingContentLength > 0 {
+		r.str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
+		r.str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
+		return n, errTooLittleData
 	}
 	return n, err
 }

@@ -737,7 +737,7 @@ func TestPackRetransmissions(t *testing.T) {
 	tp.sealingManager.EXPECT().GetHandshakeSealer().Return(nil, handshake.ErrKeysNotYetAvailable)
 	tp.sealingManager.EXPECT().Get1RTTSealer().Return(nil, handshake.ErrKeysNotYetAvailable)
 	tp.ackFramer.EXPECT().GetAckFrame(protocol.EncryptionInitial, gomock.Any(), false)
-	p, err := tp.packer.PackCoalescedPacket(false, 1000, monotime.Now(), protocol.Version1)
+	p, err := tp.packer.PackCoalescedPacket(false, protocol.MinInitialPacketSize, monotime.Now(), protocol.Version1)
 	require.NoError(t, err)
 	require.Len(t, p.longHdrPackets, 1)
 	require.Equal(t, protocol.EncryptionInitial, p.longHdrPackets[0].EncryptionLevel())

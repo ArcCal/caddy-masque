@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -340,5 +341,23 @@ func TestAddressAssignReplyKeepsRequestIDs(t *testing.T) {
 	want := proto.AddressAssign{{RequestID: 1, Prefix: proto.Host(v6)}, {Prefix: proto.Host(v4)}}
 	if len(reply) != 2 || reply[0] != want[0] || reply[1] != want[1] {
 		t.Errorf("reply %v", reply)
+	}
+}
+
+func TestBundledCloudflareDNS(t *testing.T) {
+	if _, err := caddy.GetModule("dns.providers.cloudflare"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLinkLocalPoolsAreRejected(t *testing.T) {
+	for _, cfg := range []App{
+		{IPv4: "169.254.1.1/24", AllowClientToClient: true},
+		{IPv4: "10.89.0.1/24", IPv6: "fe80::1/64", AllowClientToClient: true},
+		{IPv4: "128.0.0.1/1", AllowClientToClient: true},
+	} {
+		if err := cfg.parse(); err == nil {
+			t.Errorf("accepted link-local-overlapping pool: %+v", cfg)
+		}
 	}
 }

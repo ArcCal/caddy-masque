@@ -343,7 +343,7 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
 		return nil, err
 	}
 	var size protocol.ByteCount
-	if initialSealer != nil {
+	if initialSealer != nil && maxSize >= protocol.MinInitialPacketSize {
 		initialHdr, initialPayload = p.maybeGetCryptoPacket(
 			maxSize-protocol.ByteCount(initialSealer.Overhead()),
 			protocol.EncryptionInitial,
@@ -716,6 +716,9 @@ func (p *packetPacker) PackPTOProbePacket(
 	now monotime.Time,
 	v protocol.Version,
 ) (*coalescedPacket, error) {
+	if encLevel == protocol.EncryptionInitial && maxPacketSize < protocol.MinInitialPacketSize {
+		return nil, nil
+	}
 	if encLevel == protocol.Encryption1RTT {
 		return p.packPTOProbePacket1RTT(maxPacketSize, addPingIfEmpty, now, v)
 	}

@@ -39,9 +39,9 @@ func init() {
 // Handler answers CONNECT-IP requests (RFC 9484): extended CONNECT with
 // :protocol connect-ip over HTTP/2 and HTTP/3, and GET with Upgrade:
 // connect-ip over HTTP/1.1. Every other request, and any CONNECT-IP request
-// without TLS or without valid credentials, goes to the next handler, so
-// visitors and probes see the site as usual and status codes only reach
-// authenticated users.
+// without TLS or without valid credentials, goes to the next handler.
+// Refused extended CONNECT requests retain the site's response body but
+// use a non-2xx status: a 2xx response would declare a working IP tunnel.
 type Handler struct {
 	// Path and query of the URI Template clients are configured with.
 	Template string `json:"template,omitempty"`
@@ -177,6 +177,70 @@ func (h *Handler) reject(w http.ResponseWriter, r *http.Request, rej rejection) 
 	return nil
 }
 
+// serveRefusal keeps the site's response for requests that do not establish
+// a tunnel. Unlike HTTP/1.1 Upgrade, any 2xx extended CONNECT response means
+// success (RFC 9484 §4.5); ordinary content must therefore have an error
+// status. Preserve a site's existing error or redirect status and stream its
+// body without buffering it.
+func serveRefusal(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if r.ProtoMajor < 2 {
+		return next.ServeHTTP(w, r)
+	}
+	rw := &refusalResponseWriter{ResponseWriter: w}
+	err := next.ServeHTTP(rw, r)
+	if !rw.wroteHeader {
+		status := http.StatusNotFound
+		if err != nil {
+			// Caddy invokes handle_errors with its original writer, outside
+			// this wrapper. Commit an error status before returning so its
+			// error page cannot turn the refusal into a successful tunnel.
+			status = http.StatusInternalServerError
+			var he caddyhttp.HandlerError
+			if errors.As(err, &he) && he.StatusCode >= 300 && he.StatusCode <= 599 {
+				status = he.StatusCode
+			}
+		}
+		rw.WriteHeader(status)
+	}
+	return err
+}
+
+type refusalResponseWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *refusalResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *refusalResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	if status >= 200 && status < 300 {
+		status = http.StatusNotFound
+	}
+	if status >= 200 {
+		w.wroteHeader = true
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *refusalResponseWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusNotFound)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *refusalResponseWriter) FlushError() error {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusNotFound)
+	}
+	return http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *refusalResponseWriter) Flush() { _ = w.FlushError() }
+
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	h.advertiseHTTP3(w, r)
@@ -184,15 +248,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if !ok {
 		return next.ServeHTTP(w, r)
 	}
+	// These requirements apply even when the proxy will refuse the
+	// request, including an anonymous HTTP/1.1 upgrade (RFC 9484 §4.2).
+	if !req.wellFormed || carriesContent(r) {
+		return h.reject(w, r, malformed)
+	}
 	// IP proxying runs over TLS or QUIC only (RFC 9484 §4): without it, the
-	// request is not ours.
+	// request cannot establish a tunnel.
 	if r.TLS == nil {
 		h.log.Debug("CONNECT-IP request without TLS", zap.String("remote", r.RemoteAddr))
-		return next.ServeHTTP(w, r)
+		return serveRefusal(w, r, next)
 	}
 	vars, ok := h.tpl.Match(r.URL.RequestURI())
 	if !ok {
-		return next.ServeHTTP(w, r)
+		return serveRefusal(w, r, next)
 	}
 	c := h.app.core
 	remote := r.RemoteAddr
@@ -206,7 +275,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if !ok && hasCredentials && haveClient && c.loginLimit.Blocked(client) {
 		c.counters.throttled.Add(1)
 		h.log.Debug("too many failed logins, not checking credentials", zap.String("remote", remote))
-		return next.ServeHTTP(w, r)
+		return serveRefusal(w, r, next)
 	}
 	if !ok {
 		var err error
@@ -237,27 +306,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		} else {
 			h.log.Debug("CONNECT-IP request without credentials", zap.String("remote", remote), zap.String("transport", req.transport))
 		}
-		return next.ServeHTTP(w, r)
+		return serveRefusal(w, r, next)
 	}
 	log := h.log.With(zap.String("user", user.Name), zap.String("remote", remote), zap.String("transport", req.transport))
 	rejectLogged := func(rej rejection) error {
 		log.Info("rejected request", zap.Int("status", rej.status), zap.String("error", rej.proxyError))
 		return h.reject(w, r, rej)
 	}
-	// The recognized upgrade or extended CONNECT selects the Capsule
-	// Protocol, so the Capsule-Protocol header is not required (RFC 9297
-	// §3.4 only recommends it); content header fields make the request
-	// malformed (§3.2).
-	if !req.wellFormed || carriesContent(r) {
-		return rejectLogged(malformed)
-	}
-	// A variable of the template missing, or not percent-encoded UTF-8,
-	// makes the request malformed (RFC 9484 §4.1).
-	for _, name := range []string{"target", "ipproto"} {
-		if _, has := vars[name]; h.tpl.HasVariable(name) && !has {
-			return rejectLogged(malformed)
-		}
-	}
+	// Omitted optional variables mean wildcard scope (§4.6). Empty or
+	// invalidly encoded values remain present and fail parsing below.
 	value := func(name string) string {
 		if v, has := vars[name]; has {
 			return v
@@ -277,7 +334,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	l := c.acquire(r.Context(), user, sc.routes.HasIPv4(), sc.routes.HasIPv6())
 	if l == nil {
 		if !c.auth.IsCurrent(user) {
-			return next.ServeHTTP(w, r)
+			return serveRefusal(w, r, next)
 		}
 		if c.tooManySessions(user) {
 			return rejectLogged(rejection{status: http.StatusTooManyRequests})

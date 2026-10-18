@@ -1,0 +1,576 @@
+diff --git a/connection.go b/connection.go
+index a1f327b..d6d1ded 100644
+--- a/connection.go
++++ b/connection.go
+@@ -915 +914,0 @@ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
+-	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
+@@ -919,0 +919,2 @@ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
++	initialPacketSize = min(initialPacketSize, maxPacketSize)
++	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
+@@ -920,0 +922 @@ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
++	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(c.mtuDiscoverer.CurrentSize())))
+@@ -1291 +1292,0 @@ func (c *Conn) handleShortHeaderPacket(
+-	c.sentPacketHandler.MigratedPath(p.rcvTime, protocol.ByteCount(c.config.InitialPacketSize))
+@@ -1296,5 +1297,4 @@ func (c *Conn) handleShortHeaderPacket(
+-	c.mtuDiscoverer.Reset(
+-		p.rcvTime,
+-		protocol.ByteCount(c.config.InitialPacketSize),
+-		maxPacketSize,
+-	)
++	initialPacketSize := min(protocol.ByteCount(c.config.InitialPacketSize), maxPacketSize)
++	c.sentPacketHandler.MigratedPath(p.rcvTime, initialPacketSize)
++	c.mtuDiscoverer.Reset(p.rcvTime, initialPacketSize, maxPacketSize)
++	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(c.mtuDiscoverer.CurrentSize())))
+@@ -2301,0 +2302,5 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
++	// The closed handler does not retain address-validation byte accounting.
++	// Do not give it a retransmittable close packet for an unvalidated address.
++	if c.sentPacketHandler.AmplificationBudget() != protocol.MaxByteCount {
++		connClosePacket = nil
++	}
+@@ -2442,0 +2448 @@ func (c *Conn) applyTransportParameters() {
++	initialPacketSize := min(protocol.ByteCount(c.config.InitialPacketSize), maxPacketSize)
+@@ -2445 +2451 @@ func (c *Conn) applyTransportParameters() {
+-		protocol.ByteCount(c.config.InitialPacketSize),
++		initialPacketSize,
+@@ -2448,0 +2455,4 @@ func (c *Conn) applyTransportParameters() {
++	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
++	if initialPacketSize < protocol.ByteCount(c.config.InitialPacketSize) {
++		c.sentPacketHandler.SetMaxDatagramSize(initialPacketSize)
++	}
+@@ -2515 +2525 @@ func (c *Conn) sendPackets(now monotime.Time) error {
+-	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.mtuDiscoverer.ShouldSendProbe(now) {
++	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.mtuDiscoverer.ShouldSendProbe(now) && c.sentPacketHandler.HasCongestionBudget(c.mtuDiscoverer.nextProbeSize()) {
+@@ -2538 +2548 @@ func (c *Conn) sendPackets(now monotime.Time) error {
+-		packet, err := c.packer.PackCoalescedPacket(false, c.maxPacketSize(), now, c.version)
++		packet, err := c.packer.PackCoalescedPacket(false, c.maxSendPacketSize(), now, c.version)
+@@ -2566 +2576 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
+-		if _, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now); err != nil {
++		if _, err := c.appendOneShortHeaderPacket(buf, c.maxSendPacketSize(), ecn, now); err != nil {
+@@ -2600 +2610 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
+-	maxSize := c.maxPacketSize()
++	maxSize := c.maxSendPacketSize()
+@@ -2673 +2683 @@ func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
+-		packet, err := c.packer.PackCoalescedPacket(true, c.maxPacketSize(), now, c.version)
++		packet, err := c.packer.PackCoalescedPacket(true, c.maxSendPacketSize(), now, c.version)
+@@ -2684 +2694 @@ func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
+-	p, buf, err := c.packer.PackAckOnlyPacket(c.maxPacketSize(), now, c.version)
++	p, buf, err := c.packer.PackAckOnlyPacket(c.maxSendPacketSize(), now, c.version)
+@@ -2718 +2728 @@ func (c *Conn) sendProbePacket(sendMode ackhandler.SendMode, now monotime.Time)
+-		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxPacketSize(), false, now, c.version)
++		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxSendPacketSize(), false, now, c.version)
+@@ -2725 +2735 @@ func (c *Conn) sendProbePacket(sendMode ackhandler.SendMode, now monotime.Time)
+-		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxPacketSize(), true, now, c.version)
++		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxSendPacketSize(), true, now, c.version)
+@@ -2844,0 +2855,4 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
++	maxSize := c.maxSendPacketSize()
++	if maxSize < protocol.MinCoalescedPacketSize {
++		return nil, nil
++	}
+@@ -2848 +2862 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
+-		packet, err = c.packer.PackConnectionClose(transportErr, c.maxPacketSize(), c.version)
++		packet, err = c.packer.PackConnectionClose(transportErr, maxSize, c.version)
+@@ -2850 +2864 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
+-		packet, err = c.packer.PackApplicationClose(applicationErr, c.maxPacketSize(), c.version)
++		packet, err = c.packer.PackApplicationClose(applicationErr, maxSize, c.version)
+@@ -2855 +2869 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
+-		}, c.maxPacketSize(), c.version)
++		}, maxSize, c.version)
+@@ -2859,0 +2874,4 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
++	if packet.buffer.Len() > maxSize {
++		packet.buffer.Release()
++		return nil, nil
++	}
+@@ -2864,0 +2883,6 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
++// maxSendPacketSize also applies the unvalidated-address byte budget to the
++// complete UDP datagram, including coalesced packets and Initial padding.
++func (c *Conn) maxSendPacketSize() protocol.ByteCount {
++	return min(c.maxPacketSize(), c.sentPacketHandler.AmplificationBudget())
++}
++
+@@ -3164,2 +3188,3 @@ func (c *Conn) NextConnection(ctx context.Context) (*Conn, error) {
+-// It is not very sophisticated: it just subtracts the size of header (assuming the maximum
+-// connection ID length), and the size of the encryption tag.
++// It reserves the largest short header and encryption tag, then subtracts
++// the DATAGRAM frame type and length field. The result is conservative even
++// after a connection ID or packet-number-length change.
+@@ -3167 +3192,2 @@ func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
+-	return mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 16 /* tag size */
++	packetPayload := mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 4 /* packet number */ - 16 /* tag size */
++	return (&wire.DatagramFrame{DataLenPresent: true}).MaxDataLen(packetPayload, protocol.Version1)
+diff --git a/connection_test.go b/connection_test.go
+index 6d3aa31..4647472 100644
+--- a/connection_test.go
++++ b/connection_test.go
+@@ -49,0 +50,4 @@ func connectionOptSentPacketHandler(sph ackhandler.SentPacketHandler) testConnec
++	if mock, ok := sph.(*mockackhandler.MockSentPacketHandler); ok {
++		mock.EXPECT().AmplificationBudget().Return(protocol.MaxByteCount).AnyTimes()
++		mock.EXPECT().HasCongestionBudget(gomock.Any()).Return(true).AnyTimes()
++	}
+@@ -133 +137 @@ func newServerTestConnection(
+-		false,
++		true, // address validation is tested separately with real packet handlers
+@@ -3493 +3497 @@ func testConnectionDatagrams(t *testing.T, enabled bool) {
+-		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.FrameEncodingError, FrameType: uint64(wire.FrameTypeDatagramWithLength)})
++		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation, FrameType: uint64(wire.FrameTypeDatagramWithLength)})
+diff --git a/integrationtests/self/mtu_test.go b/integrationtests/self/mtu_test.go
+index fc37635..8226711 100644
+--- a/integrationtests/self/mtu_test.go
++++ b/integrationtests/self/mtu_test.go
+@@ -181 +181 @@ func TestPathMTUDiscovery(t *testing.T) {
+-	const maxDiff = 40 // this includes the 21 bytes for the short header, 16 bytes for the encryption tag, and framing overhead
++	const maxDiff = 44 // flags (1), maximum CID (20), packet number (4), tag (16), and DATAGRAM framing (3)
+diff --git a/internal/ackhandler/interfaces.go b/internal/ackhandler/interfaces.go
+index 620a5e1..b3258cb 100644
+--- a/internal/ackhandler/interfaces.go
++++ b/internal/ackhandler/interfaces.go
+@@ -22,0 +23,4 @@ type SentPacketHandler interface {
++	// AmplificationBudget is the remaining byte allowance before address validation.
++	AmplificationBudget() protocol.ByteCount
++	// HasCongestionBudget checks a packet size, including larger PMTU probes.
++	HasCongestionBudget(protocol.ByteCount) bool
+diff --git a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sent_packet_handler.go
+index 9b539ea..8016870 100644
+--- a/internal/ackhandler/sent_packet_handler.go
++++ b/internal/ackhandler/sent_packet_handler.go
+@@ -1034 +1034 @@ func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
+-func (h *sentPacketHandler) isAmplificationLimited() bool {
++func (h *sentPacketHandler) AmplificationBudget() protocol.ByteCount {
+@@ -1036 +1036 @@ func (h *sentPacketHandler) isAmplificationLimited() bool {
+-		return false
++		return protocol.MaxByteCount
+@@ -1038 +1038,11 @@ func (h *sentPacketHandler) isAmplificationLimited() bool {
+-	return h.bytesSent >= amplificationFactor*h.bytesReceived
++	return max(0, amplificationFactor*h.bytesReceived-h.bytesSent)
++}
++
++func (h *sentPacketHandler) HasCongestionBudget(size protocol.ByteCount) bool {
++	return size <= max(0, h.congestion.GetCongestionWindow()-h.bytesInFlight)
++}
++
++func (h *sentPacketHandler) isAmplificationLimited() bool {
++	// Avoid trying to construct packets too small for the packer's headers.
++	budget := h.AmplificationBudget()
++	return budget < protocol.MinCoalescedPacketSize || (h.numProbesToSend > 0 && h.ptoMode == SendPTOInitial && budget < protocol.MinInitialPacketSize)
+diff --git a/internal/ackhandler/sent_packet_handler_test.go b/internal/ackhandler/sent_packet_handler_test.go
+index fedb5ef..16b59f8 100644
+--- a/internal/ackhandler/sent_packet_handler_test.go
++++ b/internal/ackhandler/sent_packet_handler_test.go
+@@ -472,2 +472 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
+-	// As long as we haven't sent out 3x the amount of bytes received, we can send out new packets,
+-	// even if we go above the 3x limit by sending the last packet.
++	// The packer must limit the last datagram to the exact remaining allowance.
+@@ -475 +474 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
+-	for i := range 4 {
++	for i := range 3 {
+@@ -476,0 +476,2 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
++		size := min(protocol.ByteCount(999), sph.AmplificationBudget())
++		require.Equal(t, protocol.ByteCount(3000-i*999), sph.AmplificationBudget())
+@@ -478,2 +479,2 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
+-		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, 999, false, false)
+-		if i != 3 {
++		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, size, false, false)
++		if i != 2 {
+@@ -490 +491 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
+-	for range 3 {
++	for i := range 3 {
+@@ -493 +494,5 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
+-		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, 1000, false, false)
++		size := protocol.ByteCount(1000)
++		if i == 2 {
++			size = sph.AmplificationBudget()
++		}
++		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, size, false, false)
+@@ -1772,0 +1778,49 @@ func benchmarkSendAndAcknowledge(b *testing.B, ackEvery, inFlight int) {
++
++func TestSentPacketHandlerExactAmplificationBudget(t *testing.T) {
++	h := NewSentPacketHandler(0, 1397, utils.NewRTTStats(), &utils.ConnectionStats{}, false, false, nil, protocol.PerspectiveServer, nil, utils.DefaultLogger).(*sentPacketHandler)
++	now := monotime.Now()
++	h.ReceivedBytes(1200, now)
++	for _, size := range []protocol.ByteCount{1397, 1397, 806} {
++		require.Equal(t, SendAny, h.SendMode(now))
++		require.GreaterOrEqual(t, h.AmplificationBudget(), size)
++		pn := h.PopPacketNumber(protocol.EncryptionHandshake)
++		h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionHandshake, protocol.ECNNon, size, false, false)
++		now = now.Add(time.Millisecond)
++	}
++	require.Equal(t, protocol.ByteCount(3600), h.bytesSent)
++	require.Zero(t, h.AmplificationBudget())
++	require.Equal(t, SendNone, h.SendMode(now))
++	h.ReceivedPacket(protocol.EncryptionHandshake, now)
++	require.Equal(t, protocol.MaxByteCount, h.AmplificationBudget())
++}
++
++func TestSentPacketHandlerInitialPTOAmplificationBudget(t *testing.T) {
++	h := NewSentPacketHandler(0, 1400, utils.NewRTTStats(), &utils.ConnectionStats{}, false, false, nil, protocol.PerspectiveServer, nil, utils.DefaultLogger).(*sentPacketHandler)
++	now := monotime.Now()
++	h.ReceivedBytes(1200, now)
++	h.bytesSent = 2800
++	h.numProbesToSend = 1
++	h.ptoMode = SendPTOInitial
++	// Initial PTOs cannot use a partial allowance to send an undersized Initial.
++	require.Equal(t, SendNone, h.SendMode(now))
++	h.ptoMode = SendPTOHandshake
++	require.Equal(t, SendPTOHandshake, h.SendMode(now))
++}
++
++func TestSentPacketHandlerStrictCongestionWindowBudget(t *testing.T) {
++	h := NewSentPacketHandler(0, 1400, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveServer, nil, utils.DefaultLogger).(*sentPacketHandler)
++	now := monotime.Now()
++	window := h.congestion.GetCongestionWindow()
++	for h.bytesInFlight < window-1 {
++		size := min(protocol.ByteCount(1400), window-1-h.bytesInFlight)
++		pn := h.PopPacketNumber(protocol.Encryption1RTT)
++		h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, size, false, false)
++		now = now.Add(time.Second)
++	}
++	require.Equal(t, SendAck, h.SendMode(now))
++	require.False(t, h.HasCongestionBudget(1400))
++	// PTO remains an explicit RFC 9002 exception to the congestion window.
++	h.numProbesToSend = 1
++	h.ptoMode = SendPTOAppData
++	require.Equal(t, SendPTOAppData, h.SendMode(now))
++}
+diff --git a/internal/congestion/cubic_sender.go b/internal/congestion/cubic_sender.go
+index e5457dd..52e6799 100644
+--- a/internal/congestion/cubic_sender.go
++++ b/internal/congestion/cubic_sender.go
+@@ -4,2 +3,0 @@ import (
+-	"fmt"
+-
+@@ -159 +157,2 @@ func (c *cubicSender) CanSend(bytesInFlight protocol.ByteCount) bool {
+-	return bytesInFlight < c.GetCongestionWindow()
++	// Reserve room for the entire next packet, as required by RFC 9002, section 7.
++	return c.maxDatagramSize <= c.GetCongestionWindow()-bytesInFlight
+@@ -321,3 +320 @@ func (c *cubicSender) SetMaxDatagramSize(s protocol.ByteCount) {
+-	if s < c.maxDatagramSize {
+-		panic(fmt.Sprintf("congestion BUG: decreased max datagram size from %d to %d", c.maxDatagramSize, s))
+-	}
++	// The peer may advertise a receiver limit below the configured initial size.
+diff --git a/internal/congestion/cubic_sender_test.go b/internal/congestion/cubic_sender_test.go
+index ea59b70..e90423f 100644
+--- a/internal/congestion/cubic_sender_test.go
++++ b/internal/congestion/cubic_sender_test.go
+@@ -515 +515,6 @@ func TestCubicSenderMaximumPacketSizeReduction(t *testing.T) {
+-	require.Panics(t, func() { sender.sender.SetMaxDatagramSize(initialMaxDatagramSize - 1) })
++	originalWindow := sender.sender.GetCongestionWindow()
++	sender.sender.SetMaxDatagramSize(initialMaxDatagramSize - 1)
++	require.Equal(t, initialMaxDatagramSize-1, sender.sender.maxDatagramSize)
++	require.Equal(t, originalWindow, sender.sender.GetCongestionWindow())
++	require.True(t, sender.sender.CanSend(originalWindow-initialMaxDatagramSize+1))
++	require.False(t, sender.sender.CanSend(originalWindow-initialMaxDatagramSize+2))
+@@ -583,3 +588,3 @@ func TestCubicSenderLimitCwndIncreaseInCongestionAvoidance(t *testing.T) {
+-	// Bytes in flight may be larger than the CWND if the CWND isn't an exact
+-	// multiple of the packet sizes being sent.
+-	require.GreaterOrEqual(t, testSender.bytesInFlight, sender.GetCongestionWindow())
++	// A fractional final packet of credit cannot permit a full packet.
++	require.LessOrEqual(t, testSender.bytesInFlight, sender.GetCongestionWindow())
++	require.Less(t, sender.GetCongestionWindow()-testSender.bytesInFlight, maxDatagramSize)
+diff --git a/internal/mocks/ackhandler/sent_packet_handler.go b/internal/mocks/ackhandler/sent_packet_handler.go
+index d4dc26e..38234b2 100644
+--- a/internal/mocks/ackhandler/sent_packet_handler.go
++++ b/internal/mocks/ackhandler/sent_packet_handler.go
+@@ -45,0 +46,38 @@ func (m *MockSentPacketHandler) EXPECT() *MockSentPacketHandlerMockRecorder {
++// AmplificationBudget mocks base method.
++func (m *MockSentPacketHandler) AmplificationBudget() protocol.ByteCount {
++	m.ctrl.T.Helper()
++	ret := m.ctrl.Call(m, "AmplificationBudget")
++	ret0, _ := ret[0].(protocol.ByteCount)
++	return ret0
++}
++
++// AmplificationBudget indicates an expected call of AmplificationBudget.
++func (mr *MockSentPacketHandlerMockRecorder) AmplificationBudget() *MockSentPacketHandlerAmplificationBudgetCall {
++	mr.mock.ctrl.T.Helper()
++	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AmplificationBudget", reflect.TypeOf((*MockSentPacketHandler)(nil).AmplificationBudget))
++	return &MockSentPacketHandlerAmplificationBudgetCall{Call: call}
++}
++
++// MockSentPacketHandlerAmplificationBudgetCall wrap *gomock.Call
++type MockSentPacketHandlerAmplificationBudgetCall struct {
++	*gomock.Call
++}
++
++// Return rewrite *gomock.Call.Return
++func (c *MockSentPacketHandlerAmplificationBudgetCall) Return(arg0 protocol.ByteCount) *MockSentPacketHandlerAmplificationBudgetCall {
++	c.Call = c.Call.Return(arg0)
++	return c
++}
++
++// Do rewrite *gomock.Call.Do
++func (c *MockSentPacketHandlerAmplificationBudgetCall) Do(f func() protocol.ByteCount) *MockSentPacketHandlerAmplificationBudgetCall {
++	c.Call = c.Call.Do(f)
++	return c
++}
++
++// DoAndReturn rewrite *gomock.Call.DoAndReturn
++func (c *MockSentPacketHandlerAmplificationBudgetCall) DoAndReturn(f func() protocol.ByteCount) *MockSentPacketHandlerAmplificationBudgetCall {
++	c.Call = c.Call.DoAndReturn(f)
++	return c
++}
++
+@@ -157,0 +196,38 @@ func (c *MockSentPacketHandlerGetLossDetectionTimeoutCall) DoAndReturn(f func()
++// HasCongestionBudget mocks base method.
++func (m *MockSentPacketHandler) HasCongestionBudget(arg0 protocol.ByteCount) bool {
++	m.ctrl.T.Helper()
++	ret := m.ctrl.Call(m, "HasCongestionBudget", arg0)
++	ret0, _ := ret[0].(bool)
++	return ret0
++}
++
++// HasCongestionBudget indicates an expected call of HasCongestionBudget.
++func (mr *MockSentPacketHandlerMockRecorder) HasCongestionBudget(arg0 any) *MockSentPacketHandlerHasCongestionBudgetCall {
++	mr.mock.ctrl.T.Helper()
++	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HasCongestionBudget", reflect.TypeOf((*MockSentPacketHandler)(nil).HasCongestionBudget), arg0)
++	return &MockSentPacketHandlerHasCongestionBudgetCall{Call: call}
++}
++
++// MockSentPacketHandlerHasCongestionBudgetCall wrap *gomock.Call
++type MockSentPacketHandlerHasCongestionBudgetCall struct {
++	*gomock.Call
++}
++
++// Return rewrite *gomock.Call.Return
++func (c *MockSentPacketHandlerHasCongestionBudgetCall) Return(arg0 bool) *MockSentPacketHandlerHasCongestionBudgetCall {
++	c.Call = c.Call.Return(arg0)
++	return c
++}
++
++// Do rewrite *gomock.Call.Do
++func (c *MockSentPacketHandlerHasCongestionBudgetCall) Do(f func(protocol.ByteCount) bool) *MockSentPacketHandlerHasCongestionBudgetCall {
++	c.Call = c.Call.Do(f)
++	return c
++}
++
++// DoAndReturn rewrite *gomock.Call.DoAndReturn
++func (c *MockSentPacketHandlerHasCongestionBudgetCall) DoAndReturn(f func(protocol.ByteCount) bool) *MockSentPacketHandlerHasCongestionBudgetCall {
++	c.Call = c.Call.DoAndReturn(f)
++	return c
++}
++
+diff --git a/internal/wire/frame_parser.go b/internal/wire/frame_parser.go
+index afc3bed..d7a8a88 100644
+--- a/internal/wire/frame_parser.go
++++ b/internal/wire/frame_parser.go
+@@ -54,0 +55,7 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
++		if ft.IsDatagramFrameType() && !p.supportsDatagrams {
++			return 0, parsed, &qerr.TransportError{
++				ErrorCode:    qerr.ProtocolViolation,
++				FrameType:    typ,
++				ErrorMessage: "DATAGRAM support not advertised",
++			}
++		}
+diff --git a/internal/wire/frame_parser_test.go b/internal/wire/frame_parser_test.go
+index c7aec86..4532ea8 100644
+--- a/internal/wire/frame_parser_test.go
++++ b/internal/wire/frame_parser_test.go
+@@ -526,7 +526,8 @@ func TestFrameParserDatagramUnsupported(t *testing.T) {
+-	parser := NewFrameParser(false, true, true)
+-	f := &DatagramFrame{Data: []byte("foobar")}
+-	b, err := f.Append(nil, protocol.Version1)
+-	require.NoError(t, err)
+-
+-	_, _, err = parser.ParseType(b, protocol.Encryption1RTT)
+-	checkFrameUnsupported(t, err, 0x30)
++	for _, withLength := range []bool{false, true} {
++		parser := NewFrameParser(false, true, true)
++		f := &DatagramFrame{Data: []byte("foobar"), DataLenPresent: withLength}
++		b, err := f.Append(nil, protocol.Version1)
++		require.NoError(t, err)
++		_, _, err = parser.ParseType(b, protocol.Encryption1RTT)
++		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation, FrameType: uint64(b[0])})
++	}
+diff --git a/mtu_discoverer.go b/mtu_discoverer.go
+index 76b28e7..a3a07e1 100644
+--- a/mtu_discoverer.go
++++ b/mtu_discoverer.go
+@@ -115 +115 @@ func (f *mtuFinder) init(start, max protocol.ByteCount) {
+-	f.min = start
++	f.min = min(start, max)
+@@ -152,2 +152 @@ func (f *mtuFinder) ShouldSendProbe(now monotime.Time) bool {
+-func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteCount) {
+-	var size protocol.ByteCount
++func (f *mtuFinder) nextProbeSize() protocol.ByteCount {
+@@ -155,3 +154 @@ func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteC
+-		size = (f.min + f.lost[0]) / 2
+-	} else {
+-		size = (f.min + f.max()) / 2
++		return (f.min + f.lost[0]) / 2
+@@ -158,0 +156,5 @@ func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteC
++	return (f.min + f.max()) / 2
++}
++
++func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteCount) {
++	size := f.nextProbeSize()
+diff --git a/packet_packer.go b/packet_packer.go
+index 332e23e..5effbd1 100644
+--- a/packet_packer.go
++++ b/packet_packer.go
+@@ -346 +346 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
+-	if initialSealer != nil {
++	if initialSealer != nil && maxSize >= protocol.MinInitialPacketSize {
+@@ -718,0 +719,3 @@ func (p *packetPacker) PackPTOProbePacket(
++	if encLevel == protocol.EncryptionInitial && maxPacketSize < protocol.MinInitialPacketSize {
++		return nil, nil
++	}
+diff --git a/packet_packer_test.go b/packet_packer_test.go
+index 331d099..20be5c7 100644
+--- a/packet_packer_test.go
++++ b/packet_packer_test.go
+@@ -740 +740 @@ func TestPackRetransmissions(t *testing.T) {
+-	p, err := tp.packer.PackCoalescedPacket(false, 1000, monotime.Now(), protocol.Version1)
++	p, err := tp.packer.PackCoalescedPacket(false, protocol.MinInitialPacketSize, monotime.Now(), protocol.Version1)
+diff --git a/transport_conformance_test.go b/transport_conformance_test.go
+new file mode 100644
+index 0000000..962e136
+--- /dev/null
++++ b/transport_conformance_test.go
+@@ -0,0 +1,149 @@
++package quic
++
++import (
++	"bytes"
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/quic-go/quic-go/internal/ackhandler"
++	"github.com/quic-go/quic-go/internal/handshake"
++	"github.com/quic-go/quic-go/internal/mocks"
++	"github.com/quic-go/quic-go/internal/monotime"
++	"github.com/quic-go/quic-go/internal/protocol"
++	"github.com/quic-go/quic-go/internal/utils"
++	"github.com/quic-go/quic-go/internal/wire"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/mock/gomock"
++)
++
++func TestConnectionPeerUDPPayloadSizeClamp(t *testing.T) {
++	for _, peerLimit := range []protocol.ByteCount{1200, 1201, 1396, 1397, 1399, 1400, 1452} {
++		t.Run(fmt.Sprint(peerLimit), func(t *testing.T) {
++			tc := newServerTestConnection(t, nil, &Config{InitialPacketSize: 1400, EnableDatagrams: true}, false)
++			require.NoError(t, tc.conn.handleTransportParameters(&wire.TransportParameters{
++				InitialSourceConnectionID: tc.conn.handshakeDestConnID,
++				ActiveConnectionIDLimit:   2,
++				MaxUDPPayloadSize:         peerLimit,
++				MaxDatagramFrameSize:      wire.MaxDatagramSize,
++			}))
++			require.Equal(t, min(protocol.ByteCount(1400), peerLimit), tc.conn.maxPacketSize())
++			require.Equal(t, uint32(estimateMaxPayloadSize(tc.conn.maxPacketSize())), tc.conn.maxPayloadSizeEstimate.Load())
++		})
++	}
++}
++
++func TestConnectionDatagramCapacityFitsPacket(t *testing.T) {
++	const mtu protocol.ByteCount = 1400
++	for _, cidLen := range []int{0, 4, 8, 20} {
++		for _, pnLen := range []protocol.PacketNumberLen{1, 2, 3, 4} {
++			t.Run(fmt.Sprintf("CID%d/PN%d", cidLen, pnLen), func(t *testing.T) {
++				ctrl := gomock.NewController(t)
++				tc := newServerTestConnection(t, ctrl, &Config{InitialPacketSize: uint16(mtu), EnableDatagrams: true}, false)
++				tc.conn.peerParams = &wire.TransportParameters{MaxDatagramFrameSize: wire.MaxDatagramSize}
++				capacity := int(tc.conn.maxPayloadSizeEstimate.Load())
++				var tooLarge *DatagramTooLargeError
++				require.ErrorAs(t, tc.conn.SendDatagram(make([]byte, capacity+1)), &tooLarge)
++				require.Equal(t, int64(capacity), tooLarge.MaxDatagramPayloadSize)
++				require.NoError(t, tc.conn.SendDatagram(make([]byte, capacity)))
++				frame := tc.conn.datagramQueue.Peek()
++				require.NotNil(t, frame)
++
++				tp := newTestPacketPacker(t, ctrl, protocol.PerspectiveServer)
++				tp.packer.getDestConnID = func() protocol.ConnectionID { return protocol.ParseConnectionID(make([]byte, cidLen)) }
++				require.NoError(t, tp.datagramQueue.Add(frame))
++				sealer := mocks.NewMockShortHeaderSealer(ctrl)
++				sealer.EXPECT().KeyPhase().Return(protocol.KeyPhaseOne).AnyTimes()
++				sealer.EXPECT().Overhead().Return(16).AnyTimes()
++				sealer.EXPECT().EncryptHeader(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
++				sealer.EXPECT().Seal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(dst, src []byte, pn protocol.PacketNumber, associatedData []byte) []byte {
++					return append(src, bytes.Repeat([]byte{'s'}, 16)...)
++				})
++				tp.sealingManager.EXPECT().Get1RTTSealer().Return(sealer, nil)
++				tp.pnManager.EXPECT().PeekPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x42), pnLen)
++				tp.pnManager.EXPECT().PopPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x42))
++				tp.framer.EXPECT().HasData().Return(false)
++				tp.ackFramer.EXPECT().GetAckFrame(protocol.Encryption1RTT, gomock.Any(), true).Return(nil)
++				buf := getPacketBuffer()
++				defer buf.Release()
++				p, err := tp.packer.AppendPacket(buf, mtu, monotime.Now(), protocol.Version1)
++				require.NoError(t, err)
++				require.Len(t, p.Frames, 1)
++				require.Same(t, frame, p.Frames[0].Frame)
++				require.LessOrEqual(t, buf.Len(), mtu)
++				require.Nil(t, tp.datagramQueue.Peek())
++			})
++		}
++	}
++}
++
++func TestConnectionMTUProbeRespectsCongestionBudget(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	tc := newServerTestConnection(t, ctrl, &Config{InitialPacketSize: 1400}, false, connectionOptHandshakeConfirmed())
++	now := monotime.Now()
++	h := ackhandler.NewSentPacketHandler(0, 1400, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveServer, nil, utils.DefaultLogger)
++	for range 31 {
++		pn := h.PopPacketNumber(protocol.Encryption1RTT)
++		h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []ackhandler.Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 1400, false, false)
++	}
++	tc.conn.sentPacketHandler = h
++	tc.conn.mtuDiscoverer = newMTUDiscoverer(tc.conn.rttStats, 1400, 1452, nil)
++	tc.conn.mtuDiscoverer.Start(now.Add(-time.Minute))
++	require.True(t, h.HasCongestionBudget(1400))
++	require.False(t, h.HasCongestionBudget(tc.conn.mtuDiscoverer.nextProbeSize()))
++	tc.packer.EXPECT().AppendPacket(gomock.Any(), protocol.ByteCount(1400), now, protocol.Version1).Return(shortHeaderPacket{}, errNothingToPack)
++	require.NoError(t, tc.conn.sendPackets(now))
++	// A rejected larger probe must not mark an unsent probe as in flight.
++	require.Equal(t, protocol.InvalidByteCount, tc.conn.mtuDiscoverer.inFlight)
++	require.True(t, tc.conn.mtuDiscoverer.ShouldSendProbe(now))
++}
++
++func TestMTUDiscovererClampsInitialAndReset(t *testing.T) {
++	d := newMTUDiscoverer(utils.NewRTTStats(), 1400, 1200, nil)
++	require.Equal(t, protocol.ByteCount(1200), d.CurrentSize())
++	now := monotime.Now()
++	d.Start(now.Add(-time.Minute))
++	require.False(t, d.ShouldSendProbe(now))
++	d.Reset(now, 1400, 1300)
++	require.Equal(t, protocol.ByteCount(1300), d.CurrentSize())
++	require.False(t, d.ShouldSendProbe(now.Add(time.Minute)))
++}
++
++func TestPackInitialRequiresMinimumDatagramSize(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	tp := newTestPacketPacker(t, ctrl, protocol.PerspectiveServer)
++	initial := &wire.CryptoFrame{Data: []byte("Initial")}
++	tp.retransmissionQueue.addInitial(initial)
++	tp.sealingManager.EXPECT().GetInitialSealer().Return(newMockShortHeaderSealer(ctrl), nil)
++	tp.sealingManager.EXPECT().GetHandshakeSealer().Return(nil, handshake.ErrKeysNotYetAvailable)
++	tp.sealingManager.EXPECT().Get1RTTSealer().Return(nil, handshake.ErrKeysNotYetAvailable)
++	p, err := tp.packer.PackCoalescedPacket(false, 800, monotime.Now(), protocol.Version1)
++	require.NoError(t, err)
++	require.Nil(t, p)
++	require.True(t, tp.retransmissionQueue.HasData(protocol.EncryptionInitial))
++	p, err = tp.packer.PackPTOProbePacket(protocol.EncryptionInitial, 800, true, monotime.Now(), protocol.Version1)
++	require.NoError(t, err)
++	require.Nil(t, p)
++	require.True(t, tp.retransmissionQueue.HasData(protocol.EncryptionInitial))
++}
++
++func TestPackPartialAmplificationBudgetSendsHandshakeOnly(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	tp := newTestPacketPacker(t, ctrl, protocol.PerspectiveServer)
++	tp.retransmissionQueue.addInitial(&wire.CryptoFrame{Data: []byte("Initial")})
++	tp.packer.handshakeStream.Write(make([]byte, 2000))
++	tp.sealingManager.EXPECT().GetInitialSealer().Return(newMockShortHeaderSealer(ctrl), nil)
++	tp.sealingManager.EXPECT().GetHandshakeSealer().Return(newMockShortHeaderSealer(ctrl), nil)
++	tp.pnManager.EXPECT().PeekPacketNumber(protocol.EncryptionHandshake).Return(protocol.PacketNumber(0x42), protocol.PacketNumberLen2)
++	tp.pnManager.EXPECT().PopPacketNumber(protocol.EncryptionHandshake).Return(protocol.PacketNumber(0x42))
++	tp.ackFramer.EXPECT().GetAckFrame(protocol.EncryptionHandshake, gomock.Any(), false).Return(nil)
++	p, err := tp.packer.PackCoalescedPacket(false, 806, monotime.Now(), protocol.Version1)
++	require.NoError(t, err)
++	require.NotNil(t, p)
++	defer p.buffer.Release()
++	require.LessOrEqual(t, p.buffer.Len(), protocol.ByteCount(806))
++	require.Len(t, p.longHdrPackets, 1)
++	require.Equal(t, protocol.EncryptionHandshake, p.longHdrPackets[0].EncryptionLevel())
++	require.True(t, tp.retransmissionQueue.HasData(protocol.EncryptionInitial))
++	require.True(t, tp.packer.handshakeStream.HasData())
++}

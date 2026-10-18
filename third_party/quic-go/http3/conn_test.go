@@ -171,12 +171,12 @@ func TestConnControlStreamFailures(t *testing.T) {
 	t.Run("missing SETTINGS", func(t *testing.T) {
 		testConnControlStreamFailures(t, (&dataFrame{}).Append(nil), nil, ErrCodeMissingSettings)
 	})
-	t.Run("frame error", func(t *testing.T) {
+	t.Run("settings error", func(t *testing.T) {
 		testConnControlStreamFailures(t,
 			// 1337 is invalid value for the Extended CONNECT setting
 			(&settingsFrame{Other: map[uint64]uint64{settingExtendedConnect: 1337}}).Append(nil),
 			nil,
-			ErrCodeFrameError,
+			ErrCodeSettingsError,
 		)
 	})
 	t.Run("control stream closed before SETTINGS", func(t *testing.T) {

@@ -26,7 +26,11 @@ func testFrameParserEOF(t *testing.T, data []byte) {
 		copy(b, data[:i])
 		fp := frameParser{r: bytes.NewReader(b)}
 		_, err := fp.ParseNext(nil)
-		require.ErrorIs(t, err, io.EOF)
+		if i == 0 {
+			require.ErrorIs(t, err, io.EOF)
+		} else {
+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+		}
 	}
 }
 
@@ -163,10 +167,10 @@ func TestParserPushFrames(t *testing.T) {
 		// A stream that ends inside the payload ends the frame early.
 		fp = frameParser{r: bytes.NewReader(quicvarint.Append(quicvarint.Append(nil, typ), 2)[:2])}
 		_, err = fp.ParseNext(nil)
-		require.ErrorIs(t, err, io.EOF)
+		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 		fp = frameParser{r: bytes.NewReader(append(quicvarint.Append(quicvarint.Append(nil, typ), 2), 0x40))}
 		_, err = fp.ParseNext(nil)
-		require.ErrorIs(t, err, io.EOF)
+		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 	}
 
 	// A one-byte payload that starts a two-byte integer is malformed at once;

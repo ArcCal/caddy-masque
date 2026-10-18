@@ -39,6 +39,8 @@ def main():
         "__MASQUE_CORE_PATH__": vpn / "crates" / "masque-vpn",
         "__MASQUE_MAC_PATH__": vpn / "masque-vpn-mac",
         "__MASQUE_KILLSWITCH_PATH__": vpn / "masque-vpn-killswitch",
+        "__MASQUE_H3_PATH__": vpn / "vendor" / "h3",
+        "__MASQUE_H3_QUINN_PATH__": vpn / "vendor" / "h3-quinn",
     }
     for dependency in paths.values():
         if not (dependency / "Cargo.toml").is_file():
@@ -59,6 +61,20 @@ def main():
         (workspace / "Cargo.toml").write_text(template, encoding="utf-8")
         shutil.copyfile(assets / "Cargo.lock", workspace / "Cargo.lock")
         shutil.copyfile(assets / "main.rs", workspace / "src" / "main.rs")
+
+        metadata = subprocess.run(
+            ["cargo", "metadata", "--locked", "--format-version=1", "--manifest-path", str(workspace / "Cargo.toml")],
+            cwd=workspace, env=environment, capture_output=True, text=True,
+        )
+        if metadata.returncode:
+            sys.stderr.write(metadata.stderr)
+            return metadata.returncode
+        packages = json.loads(metadata.stdout)["packages"]
+        for name, marker in (("h3", "__MASQUE_H3_PATH__"), ("h3-quinn", "__MASQUE_H3_QUINN_PATH__")):
+            selected = [package for package in packages if package["name"] == name]
+            expected_manifest = paths[marker] / "Cargo.toml"
+            if len(selected) != 1 or selected[0]["source"] is not None or Path(selected[0]["manifest_path"]).resolve() != expected_manifest.resolve():
+                raise SystemExit(f"Current client transport patch was not selected: {name} ({expected_manifest})")
 
         cargo = ["cargo", "build", "--locked", "--manifest-path", str(workspace / "Cargo.toml")]
         if args.release:

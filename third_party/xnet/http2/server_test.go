@@ -449,8 +449,10 @@ func testServer_Request_Get_Host(t testing.TB) {
 	const host = "example.com"
 	testServerRequest(t, func(st *serverTester) {
 		st.writeHeaders(HeadersFrameParam{
-			StreamID:      1, // clients send odd numbers
-			BlockFragment: st.encodeHeader(":authority", "", "host", host),
+			StreamID: 1, // clients send odd numbers
+			// Host fallback is permitted only when :authority is absent,
+			// not when an explicitly empty value was sent (RFC 9113 8.3.1).
+			BlockFragment: st.encodeHeaderRaw(":method", "GET", ":scheme", "https", ":path", "/", "host", host),
 			EndStream:     true,
 			EndHeaders:    true,
 		})
@@ -3050,16 +3052,8 @@ func testServer_Rejects_ConnHeaders(t testing.TB) {
 	defer st.Close()
 	st.greet()
 	st.bodylessReq1("connection", "foo")
-	st.wantHeaders(wantHeader{
-		streamID:  1,
-		endStream: false,
-		header: http.Header{
-			":status":                []string{"400"},
-			"content-type":           []string{"text/plain; charset=utf-8"},
-			"x-content-type-options": []string{"nosniff"},
-			"content-length":         []string{"51"},
-		},
-	})
+	// RFC 9113 sections 8.1.1 and 8.2.2 require a stream error.
+	st.wantRSTStream(1, ErrCodeProtocol)
 }
 
 type hpackEncoder struct {
