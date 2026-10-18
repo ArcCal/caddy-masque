@@ -1,17 +1,21 @@
 # caddy-masque
 
-The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as a Caddy module:
+The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as a Caddy module. Every build also bundles
+[Cloudflare DNS](https://github.com/caddy-dns/cloudflare) for DNS challenges and wildcard certificates:
 
 - **Standards**: IETF MASQUE IP proxying, CONNECT-IP (RFC 9484); HTTP Datagrams and Capsules (RFC 9297);
   extended CONNECT over HTTP/2 and HTTP/3 (RFC 8441, RFC 9220). HTTP/3, HTTP/2 and HTTP/1.1 are all supported.
-- **Clients unchanged**: masque-vpn's `masque-client` and IETF Masque on macOS 27 arm64 connect directly, without changing a single
-  line of their configuration (a client with the server's IP address in its `uri_template` needs the `:443` in the site
+- **Client compatibility**: the acceptance scope includes `masque-client`, IETF Masque, Mac, Killswitch and Masque NF,
+  using their existing credentials and configurations (a client with the server's IP address in its `uri_template` needs the `:443` in the site
   addresses shown below; over HTTP/3 with IPv6 on, older clients need the note on the MTU probe below). Password hashes made by `caddy masque-passwd` and by masque-vpn's `masque-passwd` are interchangeable.
 - **Caddy handles certificates and traffic**: certificates are obtained and renewed automatically; the VPN and the website
   share port 443 (TCP and UDP); the same Caddy can go on hosting other sites and reverse proxies as usual.
-- **Looks like just a website**: only CONNECT-IP requests with a correct user name and password become tunnels;
-  every other request (including ones with a wrong password, and probes) goes to the website, and the response is
-  exactly what an ordinary Caddy website gives.
+- **Website sharing within protocol rules**: only valid CONNECT-IP requests with correct credentials become tunnels.
+  Other traffic follows the website. Refused HTTP/2 and HTTP/3 CONNECT-IP requests keep the site's body and existing
+  error/redirect status, but a successful site status is changed to 404: a 2xx CONNECT response would falsely declare
+  an IP tunnel. Malformed requests receive the errors required by the RFCs. HTTP/1.1 Upgrade refusals can retain 200.
+- **Standards take priority** when camouflage or another design goal conflicts with mandatory IETF behavior.
+  Tests cover protocol errors and the unchanged masque-vpn clients; they are not formal conformance certification.
 
 Linux x86_64 and arm64 only (needs root: it creates a TUN device and sets up forwarding and NAT).
 
@@ -20,6 +24,12 @@ main for the [HTTP/2 security repair](docs/http2-security-2026-10-11.md).
 The differences between versions are in [CHANGELOG.md](CHANGELOG.md).
 Earlier review results and native-validation requirements are in [the October 4 production review](docs/review-2026-10-04-production.md).
 Design goals and the checks required for Caddy updates are in [the design document](docs/design.md).
+The [October 18 standards repair report](docs/conformance-repair-2026-10-18.md) records the audit findings,
+repairs, current-client results and remaining native/kernel validation limits.
+The [all-client compatibility follow-up](docs/all-client-compatibility-2026-10-18.md) includes NF, the GUI's CLI process
+contract, the independent gateway client fixture, and confirmed client-side RFC limitations. Protocol-core tests do not
+establish native Network.framework or GUI acceptance.
+The separate [client IETF conformance audit](docs/client-ietf-conformance-2026-10-18.md) details each client finding, affected implementations, pinned source and RFC evidence, reproduction boundaries, and private WARP/SOCKS limitations.
 
 ## One-step install
 
@@ -54,7 +64,10 @@ Needs Go 1.26.9 or 1.27.2, or a later reviewed patch of those lines:
 go build -o caddy ./cmd/caddy
 ```
 
-The resulting `caddy` includes all standard Caddy modules and MASQUE. Builds use
+The resulting `caddy` includes all standard Caddy modules, MASQUE and **Cloudflare DNS v0.2.4**.
+Cloudflare is registered by the MASQUE package itself, so custom main modules importing MASQUE include it too.
+Verify the required provider with `./caddy list-modules | grep -Fx dns.providers.cloudflare`.
+The installer and CI use this same default; rebuilding never removes Cloudflare. Builds use
 the pinned protocol patches in `third_party/xnet` and `third_party/quic-go`.
 The HTTP/2 fork retains its patched server and transport on both Go 1.26
 and Go 1.27; no extra build tag is needed. From this checkout, xcaddy uses
@@ -62,6 +75,7 @@ both dependencies:
 
 ```sh
 xcaddy build v2.11.7 --with github.com/ArcCal/caddy-masque=. \
+  --with github.com/caddy-dns/cloudflare@v0.2.4 \
   --replace golang.org/x/net=./third_party/xnet \
   --replace github.com/quic-go/quic-go=./third_party/quic-go
 ```
@@ -89,8 +103,8 @@ vpn.example.com, :443 {
 }
 ```
 
-The `masque` directive in the site takes the VPN requests; all other requests carry on as usual (here, to `file_server`
-for the web pages). It is ordered automatically before `file_server`, `reverse_proxy` and the like.
+The `masque` directive in the site takes the VPN requests; other requests continue to the site (here, `file_server`).
+Refused extended CONNECT uses a non-2xx status even when the site would normally return 200. It is ordered automatically before `file_server`, `reverse_proxy` and the like.
 
 ### Global option `masque { ... }`
 
@@ -245,11 +259,9 @@ example.com, *.example.com, :443 {
 }
 ```
 
-- **Build with the DNS plugin.** `dns cloudflare` needs the [caddy-dns/cloudflare](https://github.com/caddy-dns/cloudflare)
-  plugin, which `./cmd/caddy` and the one-step install leave out:
-  `xcaddy build v2.11.7 --with github.com/ArcCal/caddy-masque=. --with github.com/caddy-dns/cloudflare --replace golang.org/x/net=./third_party/xnet --replace github.com/quic-go/quic-go=./third_party/quic-go` (from this checkout), then install the result
-  as `/usr/local/bin/caddy`. Running `install-server.sh` again replaces it with a build without the plugin, and Caddy
-  then fails to load this Caddyfile.
+- **Cloudflare is already built in.** `./cmd/caddy`, the one-step installer, xcaddy commands above and every
+  CI artifact include `dns.providers.cloudflare`. No separate plugin build is needed. The manual Cloudflare workflow
+  packages the same executable that passed the required interoperability gates.
 - **The API token** is a Cloudflare token with the "Edit zone DNS" permission for the domain. Put it alone in
   `/etc/caddy/cloudflare-token` (`chmod 600`); `{file.PATH}` reads it when the configuration loads. The service does not dump its environment; a protected file also avoids exposing the token through environment inspection.
 - **Cloudflare's proxy must be off** for the VPN host name (DNS only, the grey cloud): Cloudflare does not pass CONNECT-IP
@@ -267,8 +279,8 @@ example.com, *.example.com, :443 {
   undo. These headers are on the website's responses only: `masque` runs before `header`, so a tunnel's own response
   (which only clients with a valid password ever get, never a browser) does not pass through it.
 
-Previously tested with Caddy v2.11.6 built with this module and caddy-dns/cloudflare: `caddy validate` accepts the file, and with
-Caddy's internal CA in place of Cloudflare, the website sends the headers above, TLS 1.2 is refused, and masque-vpn's
+The default Caddy build includes this module and caddy-dns/cloudflare: `caddy validate` accepts the file, and with
+Caddy's internal CA in place of Cloudflare, the website can send the headers above, TLS 1.2 is refused, and masque-vpn's
 `masque-client` brings tunnels up over HTTP/3, HTTP/2 and HTTP/1.1.
 
 ## Managing users
@@ -328,8 +340,11 @@ Caddy obtains by itself need nothing.
   applies.
 - **Clients without HTTP/3 Datagram support**: packets are carried on the stream in DATAGRAM capsules (RFC 9297 §3.5).
 - **Exit**: when Caddy exits it ends every tunnel itself, so open tunnels do not keep it from exiting.
-- **Failed reloads**: when the new configuration fails to start, users, reachable destinations and HTTP/3 all go back to
-  the old configuration.
+- **Failed reloads**: users, reachable destinations and HTTP/3 return to the previous configuration. User and route
+  changes on the shared tunnel are committed only after the entire new Caddy configuration starts successfully;
+  a failed candidate does not revoke existing sessions.
+- **HTTP/3 limits**: new connections snapshot the current Caddy header limit and HTTP idle timeout, including after
+  reload. Existing connections keep their negotiated limits; active tunnels remain independent of website idle timeouts.
 
 Known limitations:
 
@@ -366,17 +381,21 @@ in Go to do CONNECT-IP over HTTP/3, HTTP/2 and HTTP/1.1: sending and receiving p
 website, reloads (including failed ones), removed users, new blocks, idle timeouts and more.
 
 With the current sibling masque-vpn checkout available, also run the real Rust
-client and the current Mac/Killswitch public settings, packet and SOCKS APIs:
+client (file and GUI stdin configurations), Mac/Killswitch public APIs, the
+independent NF protocol/SOCKS core and the gateway's generic client fixture:
 
 ```sh
 MASQUE_CLIENT=../masque-vpn/target/release/masque-client go test -race -count=1 -run '^TestInteropMasqueClient$' -v .
 python3 tests/run-client-wrapper-interop.py --masque-vpn-root ../masque-vpn --release
+python3 tests/run-cf-client-interop.py --masque-vpn-root ../masque-vpn --release
 ```
 
-The wrapper check requires all 16 combinations: Mac and Killswitch, four
-transports, and IPv4-only or dual-stack servers. It validates protocol/core
-interoperability; native macOS utun, routes, DNS restoration and PF protection
-still require tests on a Mac. See [the harness and its scope](tests/clients/README.md).
+The wrapper check requires all 24 combinations: Mac, Killswitch and NF, four
+transports, and IPv4-only or dual-stack servers. The independent CF fixture
+requires another eight cases. These validate protocol/core interoperability;
+native macOS Network.framework, utun, routes, DNS restoration and PF protection
+still require tests on a Mac. See [the wrapper harness](tests/clients/README.md)
+and [the CF fixture](tests/cf-clients/README.md) for their scope.
 
 See the [Caddy 2.11.7 and Go 1.27 verification report](docs/compatibility-2026-10-11.md)
 for the tested artifacts, client coverage and remaining native-platform checks.
@@ -429,5 +448,5 @@ repository is public they also carry build provenance attestations
 end-to-end tests with masque-client must pass on both native architectures before downloadable builds or release
 uploads are produced. `MASQUE_VPN_TOKEN` must read masque-vpn; missing access fails the required job. Fork pull requests
 cannot use repository secrets, so a maintainer must validate their changes from a trusted repository branch.
-The manual Cloudflare build reuses these validation gates and also runs strict interoperability tests against its
-actual Caddy binary before uploading an artifact.
+The standard and manual Cloudflare workflows package the exact checksum-bound Caddy executable that passed the
+kernel and wire gates; they do not rebuild a different executable after testing. Every artifact includes Cloudflare DNS.

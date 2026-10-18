@@ -12,8 +12,6 @@ import (
 
 	"github.com/quic-go/qpack"
 	"github.com/quic-go/quic-go/http3/qlog"
-
-	"golang.org/x/net/http/httpguts"
 )
 
 // HTTPStreamer allows an HTTP handler to take over an HTTP/3 stream.
@@ -98,6 +96,10 @@ func (w *responseWriter) WriteHeader(status int) {
 
 	// We're done with headers once we write a status >= 200.
 	w.headerComplete = true
+	if w.str.isConnect && status >= 200 && status < 300 {
+		w.str.tunnel.Store(true)
+		w.header.Del("Content-Length")
+	}
 	// Add Date header.
 	// This is what the standard library does.
 	// Can be disabled by setting the Date header to nil.
@@ -128,16 +130,16 @@ func (w *responseWriter) sniffContentType(p []byte) {
 
 	// If the Content-Encoding was set and is non-blank, we shouldn't sniff the body.
 	hasCE := w.header.Get("Content-Encoding") != ""
-	if !hasCE && !haveType && len(p) > 0 {
+	if !w.str.tunnel.Load() && !hasCE && !haveType && len(p) > 0 {
 		w.header.Set("Content-Type", http.DetectContentType(p))
 	}
 }
 
 func (w *responseWriter) Write(p []byte) (int, error) {
-	bodyAllowed := bodyAllowedForStatus(w.status)
+	bodyAllowed := w.str.tunnel.Load() || bodyAllowedForStatus(w.status)
 	if !w.headerComplete {
-		w.sniffContentType(p)
 		w.WriteHeader(http.StatusOK)
+		w.sniffContentType(p)
 		bodyAllowed = true
 	}
 	if !bodyAllowed {
@@ -230,7 +232,17 @@ func (w *responseWriter) writeHeader(status int) error {
 		}
 	}
 
+	hopFields := connectionHeaderFields(w.header)
 	for k, v := range w.header {
+		name := strings.ToLower(k)
+		// HTTP/3 cannot carry Connection or other hop-by-hop response fields,
+		// including those explicitly nominated by a legacy Connection value.
+		if _, hop := hopFields[name]; isConnectionSpecificHeader(name) || hop {
+			continue
+		}
+		if w.str.tunnel.Load() && strings.EqualFold(k, "Content-Length") {
+			continue
+		}
 		if _, excluded := w.trailers[k]; excluded {
 			continue
 		}
@@ -239,8 +251,7 @@ func (w *responseWriter) writeHeader(status int) error {
 			continue
 		}
 		for index := range v {
-			name := strings.ToLower(k)
-			value := v[index]
+			value := strings.Trim(v[index], " \t")
 			if err := enc.WriteField(qpack.HeaderField{Name: name, Value: value}); err != nil {
 				return err
 			}
@@ -292,7 +303,7 @@ func (w *responseWriter) Flush() {
 // declareTrailer adds a trailer to the trailer list, while also validating that the trailer has a
 // valid name.
 func (w *responseWriter) declareTrailer(k string) {
-	if !httpguts.ValidTrailerHeader(k) {
+	if !validTrailerHeader(k) {
 		// Forbidden by RFC 9110, section 6.5.1.
 		if w.logger != nil {
 			w.logger.Debug("ignoring invalid trailer", slog.String("header", k))
@@ -307,6 +318,9 @@ func (w *responseWriter) declareTrailer(k string) {
 
 // writeTrailers will write trailers to the stream if there are any.
 func (w *responseWriter) writeTrailers() error {
+	if w.str.tunnel.Load() {
+		return nil
+	}
 	// promote headers added via "Trailer:" convention as trailers, these can be added after
 	// streaming the status/headers have been written.
 	for k := range w.header {
@@ -319,8 +333,12 @@ func (w *responseWriter) writeTrailers() error {
 		return nil
 	}
 
+	hopFields := connectionHeaderFields(w.header)
 	trailers := make(http.Header, len(w.trailers))
 	for trailer := range w.trailers {
+		if _, hop := hopFields[strings.ToLower(strings.TrimPrefix(trailer, http.TrailerPrefix))]; hop {
+			continue
+		}
 		if vals, ok := w.header[trailer]; ok {
 			trailers[strings.TrimPrefix(trailer, http.TrailerPrefix)] = vals
 		}

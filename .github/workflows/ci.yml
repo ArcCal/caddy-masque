@@ -59,7 +59,11 @@ jobs:
           # standard library security fixes (go.mod says 1.26.0, the first release).
           go-version: "1.26"
           check-latest: true
-      - name: Build
+      - uses: actions/download-artifact@v8
+        with:
+          name: tested-caddy-${{ matrix.os }}-${{ matrix.arch }}
+          path: tested
+      - name: Package the tested executable
         id: build
         env:
           CGO_ENABLED: "0"
@@ -76,7 +80,10 @@ jobs:
           fi
           name=caddy-masque-$version-${{ matrix.os }}-${{ matrix.arch }}
           mkdir -p "dist/$name"
-          go build -trimpath -ldflags "-s -w" -o "dist/$name/caddy" ./cmd/caddy
+          (cd tested && sha256sum -c caddy.sha256)
+          cp tested/caddy "dist/$name/caddy"
+          cp tested/caddy.sha256 "dist/$name/caddy.sha256"
+          chmod +x "dist/$name/caddy"
           # The program is for the platform in its name, and records the
           # commit it was built from (`caddy build-info`).
           case ${{ matrix.arch }} in amd64) machine=x86-64 ;; arm64) machine="ARM aarch64" ;; esac
@@ -91,7 +98,7 @@ jobs:
           # It runs on its architecture and has the MASQUE app and handler.
           "dist/$name/caddy" version
           "dist/$name/caddy" list-modules >"$RUNNER_TEMP/modules.txt"
-          for module in masque http.handlers.masque; do
+          for module in masque http.handlers.masque dns.providers.cloudflare; do
             grep -qFx "$module" "$RUNNER_TEMP/modules.txt"
           done
           cp -r deploy README.md "dist/$name/"
@@ -119,6 +126,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
+          pattern: caddy-masque-*
           path: dist
           merge-multiple: true
       # Signed (Sigstore) statement of which workflow run built each archive:

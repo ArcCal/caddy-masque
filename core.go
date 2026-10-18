@@ -144,10 +144,12 @@ type core struct {
 	forget func([]netip.Prefix) (int, error)
 
 	startOnce func() error
-	// The started configurations using the core, in start order; the
-	// last one's users and allowed destinations apply.
+	// Started configurations in start order, and the one Caddy has
+	// committed. A reload's startup may still fail in another app, so it
+	// must not change shared policy or revoke sessions until committed.
 	ownersMu sync.Mutex
 	owners   []*App
+	active   *App
 	// HTTP servers whose shutdown is watched (endOnExit).
 	watched sync.Map
 
@@ -301,6 +303,11 @@ func (c *core) readNetwork() {
 		if !ok {
 			continue
 		}
+		// A tunnel is a separate link, so link-local unicast traffic must
+		// never cross from the host network onto it (RFC 9484 §7.2).
+		if h.Src.IsLinkLocalUnicast() || h.Dst.IsLinkLocalUnicast() {
+			continue
+		}
 		c.sessMu.RLock()
 		s := c.sessions[h.Dst]
 		c.sessMu.RUnlock()
@@ -347,23 +354,45 @@ func (c *core) setUsers(users map[string]string) {
 	}
 }
 
-// activate applies a configuration that started.
+// activate registers a configuration that started. The first owner applies
+// immediately; later owners are staged until Caddy commits the reload.
 func (c *core) activate(a *App) {
 	c.ownersMu.Lock()
 	defer c.ownersMu.Unlock()
-	c.owners = append(c.owners, a)
+	if !slices.Contains(c.owners, a) {
+		c.owners = append(c.owners, a)
+	}
+	if c.active == nil {
+		c.active = a
+		c.apply(a)
+	}
+}
+
+// commit applies an owner only after Caddy publishes its configuration.
+// Stops during rollback can also name the already active old owner; those
+// calls and attempts to commit an unstarted candidate have no effect.
+func (c *core) commit(a *App) {
+	c.ownersMu.Lock()
+	defer c.ownersMu.Unlock()
+	if c.active == a || !slices.Contains(c.owners, a) {
+		return
+	}
+	c.active = a
 	c.apply(a)
 }
 
-// deactivate drops a configuration; if it was the one applied (it failed
-// after starting), the previous one applies again.
+// deactivate drops an owner. A discarded staged candidate has never changed
+// shared state, so removing it must not touch active users or sessions.
 func (c *core) deactivate(a *App) {
 	c.ownersMu.Lock()
 	defer c.ownersMu.Unlock()
-	last := len(c.owners) > 0 && c.owners[len(c.owners)-1] == a
 	c.owners = slices.DeleteFunc(c.owners, func(o *App) bool { return o == a })
-	if last && len(c.owners) > 0 {
-		c.apply(c.owners[len(c.owners)-1])
+	if c.active == a {
+		c.active = nil
+		if len(c.owners) > 0 {
+			c.active = c.owners[len(c.owners)-1]
+			c.apply(c.active)
+		}
 	}
 }
 

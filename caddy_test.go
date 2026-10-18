@@ -383,26 +383,43 @@ func (e *caddyEnv) dialH2(t *testing.T, password, path string) *tunnelClient {
 
 func (e *caddyEnv) dialH1(t *testing.T, password, path string) *tunnelClient {
 	t.Helper()
-	conn, err := e.dialTCP(context.Background(), e.tlsConfig("http/1.1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: vpn.test:%d\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\n"+
-		"Capsule-Protocol: ?1\r\nAuthorization: %s\r\n\r\n", path, e.port, authorization(password))
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := &tunnelClient{status: resp.StatusCode, header: resp.Header, close: func() { conn.Close() }}
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		b, _ := io.ReadAll(resp.Body)
-		c.body = string(b)
-		c.close()
+	for attempt := 0; ; attempt++ {
+		conn, err := e.dialTCP(context.Background(), e.tlsConfig("http/1.1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: vpn.test:%d\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\n"+
+			"Capsule-Protocol: ?1\r\nAuthorization: %s\r\n\r\n", path, e.port, authorization(password)); err != nil {
+			conn.Close()
+			t.Fatal(err)
+		}
+		br := bufio.NewReader(conn)
+		// A retiring Caddy listener can finish TLS and then close before
+		// its first HTTP response. Retry only when no response byte arrived;
+		// partial or malformed responses must still fail ReadResponse.
+		if first, err := br.Peek(1); err != nil {
+			conn.Close()
+			if len(first) == 0 && attempt < 4 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)) {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			t.Fatal(err)
+		}
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			conn.Close()
+			t.Fatal(err)
+		}
+		c := &tunnelClient{status: resp.StatusCode, header: resp.Header, close: func() { conn.Close() }}
+		if resp.StatusCode != http.StatusSwitchingProtocols {
+			b, _ := io.ReadAll(resp.Body)
+			c.body = string(b)
+			c.close()
+			return c
+		}
+		streamClient(c, br, conn)
 		return c
 	}
-	streamClient(c, br, conn)
-	return c
 }
 
 type dialer func(*caddyEnv, *testing.T, string, string) *tunnelClient
@@ -503,7 +520,7 @@ func waitNoSessions(t *testing.T) {
 	t.Error("a session or its handler is still running")
 }
 
-func TestCaddyRefusalsLookLikeTheSite(t *testing.T) {
+func TestCaddyRefusalsUseSiteBodyWithoutTunnelSuccess(t *testing.T) {
 	e := newCaddyEnv(t)
 	if err := e.load(masqueConfig("alice")); err != nil {
 		t.Fatal(err)
@@ -514,7 +531,11 @@ func TestCaddyRefusalsLookLikeTheSite(t *testing.T) {
 			{"other path", testPassword, "/not/the/template/"},
 		} {
 			got := tr.dial(e, t, c.password, c.path)
-			if got.status != http.StatusOK || got.body != "cover page" || got.header.Get("Capsule-Protocol") != "" {
+			want := http.StatusNotFound
+			if tr.name == "HTTP/1.1" {
+				want = http.StatusOK
+			}
+			if got.status != want || got.body != "cover page" || got.header.Get("Capsule-Protocol") != "" {
 				t.Errorf("%s, %s: %d %q %v", tr.name, c.name, got.status, got.body, got.header)
 			}
 		}
@@ -589,7 +610,7 @@ func TestCaddyRefusesTunnelsWithoutTLS(t *testing.T) {
 	}
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK || string(body) != "cover page" {
+	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusNotFound || string(body) != "cover page" {
 		t.Errorf("h2c: HTTP/%d %d %q", resp.ProtoMajor, resp.StatusCode, body)
 	}
 	waitNoSessions(t)
@@ -611,8 +632,12 @@ func TestCaddyBadlyEncodedVariablesAreMalformed(t *testing.T) {
 				if tr.name == "HTTP/3" && got.stopSending != h3MessageError {
 					t.Errorf("HTTP/3 %s: STOP_SENDING %#x, want H3_MESSAGE_ERROR", path, got.stopSending)
 				}
-				// Without the password, the site as for any other request.
-				if got := tr.dial(e, t, "wrong password!!", path); got.status != http.StatusOK || got.body != "cover page" {
+				// Refusal retains the site body, with non-2xx for extended CONNECT.
+				want := http.StatusNotFound
+				if tr.name == "HTTP/1.1" {
+					want = http.StatusOK
+				}
+				if got := tr.dial(e, t, "wrong password!!", path); got.status != want || got.body != "cover page" {
 					t.Errorf("%s %s without the password: %d %q", tr.name, path, got.status, got.body)
 				}
 			}
@@ -1064,6 +1089,18 @@ func TestCaddyFailedReloadKeepsThePreviousConfig(t *testing.T) {
 	if err := e.load(masqueConfig("alice")); err != nil {
 		t.Fatal(err)
 	}
+	var live []*tunnelClient
+	var addresses []netip.Addr
+	for _, tr := range transports {
+		c := tr.dial(e, t, testPassword, anyTarget)
+		if c.status != tr.ok {
+			t.Fatalf("%s: initial status %d", tr.name, c.status)
+		}
+		t.Cleanup(c.close)
+		addr, _ := opening(t, c)
+		live = append(live, c)
+		addresses = append(addresses, addr)
+	}
 	busy, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1074,8 +1111,19 @@ func TestCaddyFailedReloadKeepsThePreviousConfig(t *testing.T) {
 	servers := cfg["apps"].(map[string]any)["http"].(map[string]any)["servers"].(map[string]any)
 	servers["blocked"] = map[string]any{"listen": []string{busy.Addr().String()}}
 	b, _ := json.Marshal(cfg)
-	if err := caddy.Load(b, true); err == nil {
-		t.Fatal("a configuration with a busy port loaded")
+	// App startup order is unspecified. Repeat the failed candidate to
+	// exercise both orders; the core staging regression also checks the
+	// later-app failure deterministically.
+	for attempt := range 8 {
+		if err := caddy.Load(b, true); err == nil {
+			t.Fatal("a configuration with a busy port loaded")
+		}
+		for i, c := range live {
+			e.dev.fromHost <- udp("1.1.1.1", addresses[i].String(), 10)
+			if _, err := c.recv(); err != nil {
+				t.Fatalf("%s: existing tunnel lost after failed reload %d: %v", transports[i].name, attempt, err)
+			}
+		}
 	}
 	for _, tr := range transports {
 		c := tr.dial(e, t, testPassword, anyTarget)
@@ -1088,6 +1136,9 @@ func TestCaddyFailedReloadKeepsThePreviousConfig(t *testing.T) {
 		if _, err := c.recv(); err != nil {
 			t.Errorf("%s: %v", tr.name, err)
 		}
+		c.close()
+	}
+	for _, c := range live {
 		c.close()
 	}
 	waitNoSessions(t)
@@ -1187,10 +1238,10 @@ func TestCaddyMalformedHTTP1Requests(t *testing.T) {
 			t.Errorf("%s: %q", c.name, got)
 		}
 	}
-	// Without valid credentials, the site answers.
+	// Mandatory request-shape validation also applies without credentials.
 	got := send(fmt.Sprintf("POST %s HTTP/1.1\r\nHost: vpn.test\r\nUpgrade: connect-ip\r\nContent-Length: 0\r\n\r\n", anyTarget))
-	if got != "200 cover page" {
-		t.Errorf("anonymous: %q", got)
+	if !strings.HasPrefix(got, "400 ") {
+		t.Errorf("anonymous malformed request: %q", got)
 	}
 }
 

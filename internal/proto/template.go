@@ -344,8 +344,10 @@ func compile(parts []part) (*matcher, error) {
 
 // Match matches a request's path and query against the template and
 // returns the percent-decoded variables it carries, or nil and false. A
-// variable whose value is not percent-encoded UTF-8 is left out: the
-// request is for the template's resource, but malformed (RFC 9484 §4.1).
+// variable whose value is not percent-encoded UTF-8 is returned as empty:
+// the request is for the resource, but malformed (RFC 9484 §4.1). Absent
+// optional form-query variables are left out, so callers can apply their
+// wildcard defaults without accepting malformed values.
 func (t *Template) Match(pathAndQuery string) (map[string]string, bool) {
 	if t.m == nil {
 		return nil, false
@@ -377,7 +379,8 @@ func (t *Template) Match(pathAndQuery string) (map[string]string, bool) {
 		}
 		switch {
 		case q.formVar != "":
-			if d, ok := decode(value); found && ok {
+			if found {
+				d, _ := decode(value)
 				out[q.formVar] = d
 			}
 		case !found:
@@ -385,6 +388,11 @@ func (t *Template) Match(pathAndQuery string) (map[string]string, bool) {
 			// carries variables, they are missing.
 			if !hasVariables(q.value) {
 				return nil, false
+			}
+			for _, p := range q.value {
+				for _, name := range p.vars {
+					out[name] = ""
+				}
 			}
 		case !matchSegments(q.value, normalize(value), out):
 			return nil, false
@@ -479,9 +487,8 @@ func assign(vars []string, captured string, out map[string]string) bool {
 	}
 	for j, name := range names {
 		// Keep empty values so the protocol layer can reject them.
-		if d, ok := decode(values[j]); ok {
-			out[name] = d
-		}
+		d, _ := decode(values[j])
+		out[name] = d
 	}
 	return true
 }

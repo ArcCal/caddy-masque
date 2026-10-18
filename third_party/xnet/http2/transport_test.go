@@ -2197,12 +2197,12 @@ func TestTransportResponseContentLength(t *testing.T) {
 		{
 			name:     "extraneous whitespace",
 			clValues: []string{" 3"},
-			wantLen:  -1,
+			wantLen:  -2, // Invalid generic field syntax: RFC 9113 section 8.2.1.
 		},
 		{
 			name:     "identical duplicate values with extraneous whitespace",
 			clValues: []string{"3", "3", " 3"},
-			wantLen:  -1,
+			wantLen:  -2,
 		},
 		{
 			name:     "plus sign",
@@ -2242,6 +2242,14 @@ func TestTransportResponseContentLength(t *testing.T) {
 				EndHeaders:    true,
 				BlockFragment: tc.makeHeaderBlockFragment(headers...),
 			})
+			if tt.wantLen == -2 {
+				tc.wantRSTStream(rt.streamID(), ErrCodeProtocol)
+				var streamErr StreamError
+				if err := rt.err(); !errors.As(err, &streamErr) || streamErr.StreamID != rt.streamID() || streamErr.Code != ErrCodeProtocol {
+					t.Fatalf("got error %v; want stream PROTOCOL_ERROR", err)
+				}
+				return
+			}
 			body := slices.Repeat([]byte("a"), max(tt.wantLen, 1))
 			tc.writeData(rt.streamID(), true, body)
 

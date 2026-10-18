@@ -47,6 +47,10 @@ func connectionOptTracer(r qlogwriter.Recorder) testConnectionOpt {
 }
 
 func connectionOptSentPacketHandler(sph ackhandler.SentPacketHandler) testConnectionOpt {
+	if mock, ok := sph.(*mockackhandler.MockSentPacketHandler); ok {
+		mock.EXPECT().AmplificationBudget().Return(protocol.MaxByteCount).AnyTimes()
+		mock.EXPECT().HasCongestionBudget(gomock.Any()).Return(true).AnyTimes()
+	}
 	return func(conn *Conn) { conn.sentPacketHandler = sph }
 }
 
@@ -130,7 +134,7 @@ func newServerTestConnection(
 		populateConfig(config),
 		&tls.Config{},
 		handshake.NewTokenGenerator(handshake.TokenProtectorKey{}),
-		false,
+		true, // address validation is tested separately with real packet handlers
 		1337*time.Millisecond,
 		nil,
 		utils.DefaultLogger,
@@ -3490,7 +3494,7 @@ func testConnectionDatagrams(t *testing.T, enabled bool) {
 	_, _, _, err = tc.conn.handleFrames(data, protocol.ConnectionID{}, protocol.Encryption1RTT, nil, monotime.Now())
 
 	if !enabled {
-		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.FrameEncodingError, FrameType: uint64(wire.FrameTypeDatagramWithLength)})
+		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation, FrameType: uint64(wire.FrameTypeDatagramWithLength)})
 		return
 	}
 

@@ -9,6 +9,7 @@ replace golang.org/x/net => ./third_party/xnet
 replace github.com/quic-go/quic-go => ./third_party/quic-go
 
 require (
+	github.com/caddy-dns/cloudflare v0.2.4
 	github.com/caddyserver/caddy/v2 v2.11.7
 	github.com/prometheus/client_golang v1.24.1
 	github.com/quic-go/connect-ip-go v0.4.0
@@ -87,6 +88,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
+	github.com/libdns/cloudflare v0.2.2 // indirect
 	github.com/libdns/libdns v1.1.1 // indirect
 	github.com/manifoldco/promptui v0.9.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect

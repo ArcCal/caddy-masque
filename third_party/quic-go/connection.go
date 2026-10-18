@@ -912,12 +912,14 @@ func (c *Conn) idleTimeoutStartTime() monotime.Time {
 
 func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
 	initialPacketSize := protocol.ByteCount(c.config.InitialPacketSize)
-	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
 	maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
 	if c.peerParams.MaxUDPPayloadSize > 0 && c.peerParams.MaxUDPPayloadSize < maxPacketSize {
 		maxPacketSize = c.peerParams.MaxUDPPayloadSize
 	}
+	initialPacketSize = min(initialPacketSize, maxPacketSize)
+	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
 	c.mtuDiscoverer.Reset(now, initialPacketSize, maxPacketSize)
+	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(c.mtuDiscoverer.CurrentSize())))
 	c.conn = newSendConn(tr.conn, c.conn.RemoteAddr(), packetInfo{}, utils.DefaultLogger) // TODO: find a better way
 	c.sendQueue.Close()
 	c.sendQueue = newSendQueue(c.conn)
@@ -1288,16 +1290,14 @@ func (c *Conn) handleShortHeaderPacket(
 		return true, nil
 	}
 	c.pathManager.SwitchToPath(p.remoteAddr)
-	c.sentPacketHandler.MigratedPath(p.rcvTime, protocol.ByteCount(c.config.InitialPacketSize))
 	maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
 	if c.peerParams.MaxUDPPayloadSize > 0 && c.peerParams.MaxUDPPayloadSize < maxPacketSize {
 		maxPacketSize = c.peerParams.MaxUDPPayloadSize
 	}
-	c.mtuDiscoverer.Reset(
-		p.rcvTime,
-		protocol.ByteCount(c.config.InitialPacketSize),
-		maxPacketSize,
-	)
+	initialPacketSize := min(protocol.ByteCount(c.config.InitialPacketSize), maxPacketSize)
+	c.sentPacketHandler.MigratedPath(p.rcvTime, initialPacketSize)
+	c.mtuDiscoverer.Reset(p.rcvTime, initialPacketSize, maxPacketSize)
+	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(c.mtuDiscoverer.CurrentSize())))
 	c.conn.ChangeRemoteAddr(p.remoteAddr, p.info)
 	return true, nil
 }
@@ -2299,6 +2299,11 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
 	if err != nil {
 		c.logger.Debugf("Error sending CONNECTION_CLOSE: %s", err)
 	}
+	// The closed handler does not retain address-validation byte accounting.
+	// Do not give it a retransmittable close packet for an unvalidated address.
+	if c.sentPacketHandler.AmplificationBudget() != protocol.MaxByteCount {
+		connClosePacket = nil
+	}
 	c.connIDGenerator.ReplaceWithClosed(connClosePacket, 3*c.rttStats.PTO(false))
 }
 
@@ -2440,12 +2445,17 @@ func (c *Conn) applyTransportParameters() {
 	if params.MaxUDPPayloadSize > 0 && params.MaxUDPPayloadSize < maxPacketSize {
 		maxPacketSize = params.MaxUDPPayloadSize
 	}
+	initialPacketSize := min(protocol.ByteCount(c.config.InitialPacketSize), maxPacketSize)
 	c.mtuDiscoverer = newMTUDiscoverer(
 		c.rttStats,
-		protocol.ByteCount(c.config.InitialPacketSize),
+		initialPacketSize,
 		maxPacketSize,
 		c.qlogger,
 	)
+	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
+	if initialPacketSize < protocol.ByteCount(c.config.InitialPacketSize) {
+		c.sentPacketHandler.SetMaxDatagramSize(initialPacketSize)
+	}
 }
 
 func (c *Conn) triggerSending(now monotime.Time) error {
@@ -2512,7 +2522,7 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 	// Can't use GSO, since we need to send a single packet that's larger than our current maximum size.
 	// Performance-wise, this doesn't matter, since we only send a very small (<10) number of
 	// MTU probe packets per connection.
-	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.mtuDiscoverer.ShouldSendProbe(now) {
+	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.mtuDiscoverer.ShouldSendProbe(now) && c.sentPacketHandler.HasCongestionBudget(c.mtuDiscoverer.nextProbeSize()) {
 		ping, size := c.mtuDiscoverer.GetPing(now)
 		p, buf, err := c.packer.PackMTUProbePacket(ping, size, c.version)
 		if err != nil {
@@ -2535,7 +2545,7 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 	}
 
 	if !c.handshakeConfirmed {
-		packet, err := c.packer.PackCoalescedPacket(false, c.maxPacketSize(), now, c.version)
+		packet, err := c.packer.PackCoalescedPacket(false, c.maxSendPacketSize(), now, c.version)
 		if err != nil || packet == nil {
 			return err
 		}
@@ -2563,7 +2573,7 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 	for {
 		buf := getPacketBuffer()
 		ecn := c.sentPacketHandler.ECNMode(true)
-		if _, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now); err != nil {
+		if _, err := c.appendOneShortHeaderPacket(buf, c.maxSendPacketSize(), ecn, now); err != nil {
 			if err == errNothingToPack {
 				buf.Release()
 				return nil
@@ -2597,7 +2607,7 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 
 func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 	buf := getLargePacketBuffer()
-	maxSize := c.maxPacketSize()
+	maxSize := c.maxSendPacketSize()
 
 	ecn := c.sentPacketHandler.ECNMode(true)
 	for {
@@ -2670,7 +2680,7 @@ func (c *Conn) resetPacingDeadline() {
 func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
 	if !c.handshakeConfirmed {
 		ecn := c.sentPacketHandler.ECNMode(false)
-		packet, err := c.packer.PackCoalescedPacket(true, c.maxPacketSize(), now, c.version)
+		packet, err := c.packer.PackCoalescedPacket(true, c.maxSendPacketSize(), now, c.version)
 		if err != nil {
 			return err
 		}
@@ -2681,7 +2691,7 @@ func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
 	}
 
 	ecn := c.sentPacketHandler.ECNMode(true)
-	p, buf, err := c.packer.PackAckOnlyPacket(c.maxPacketSize(), now, c.version)
+	p, buf, err := c.packer.PackAckOnlyPacket(c.maxSendPacketSize(), now, c.version)
 	if err != nil {
 		if err == errNothingToPack {
 			return nil
@@ -2715,14 +2725,14 @@ func (c *Conn) sendProbePacket(sendMode ackhandler.SendMode, now monotime.Time) 
 			break
 		}
 		var err error
-		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxPacketSize(), false, now, c.version)
+		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxSendPacketSize(), false, now, c.version)
 		if err != nil {
 			return err
 		}
 	}
 	if packet == nil {
 		var err error
-		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxPacketSize(), true, now, c.version)
+		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxSendPacketSize(), true, now, c.version)
 		if err != nil {
 			return err
 		}
@@ -2842,24 +2852,38 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 }
 
 func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
+	maxSize := c.maxSendPacketSize()
+	if maxSize < protocol.MinCoalescedPacketSize {
+		return nil, nil
+	}
 	var packet *coalescedPacket
 	var err error
 	if transportErr, ok := errors.AsType[*qerr.TransportError](e); ok {
-		packet, err = c.packer.PackConnectionClose(transportErr, c.maxPacketSize(), c.version)
+		packet, err = c.packer.PackConnectionClose(transportErr, maxSize, c.version)
 	} else if applicationErr, ok := errors.AsType[*qerr.ApplicationError](e); ok {
-		packet, err = c.packer.PackApplicationClose(applicationErr, c.maxPacketSize(), c.version)
+		packet, err = c.packer.PackApplicationClose(applicationErr, maxSize, c.version)
 	} else {
 		packet, err = c.packer.PackConnectionClose(&qerr.TransportError{
 			ErrorCode:    qerr.InternalError,
 			ErrorMessage: fmt.Sprintf("connection BUG: unspecified error type (msg: %s)", e.Error()),
-		}, c.maxPacketSize(), c.version)
+		}, maxSize, c.version)
 	}
 	if err != nil {
 		return nil, err
 	}
+	if packet.buffer.Len() > maxSize {
+		packet.buffer.Release()
+		return nil, nil
+	}
 	ecn := c.sentPacketHandler.ECNMode(packet.IsOnlyShortHeaderPacket())
 	c.logCoalescedPacket(packet, ecn)
 	return packet.buffer.Data, c.conn.Write(packet.buffer.Data, 0, ecn)
+}
+
+// maxSendPacketSize also applies the unvalidated-address byte budget to the
+// complete UDP datagram, including coalesced packets and Initial padding.
+func (c *Conn) maxSendPacketSize() protocol.ByteCount {
+	return min(c.maxPacketSize(), c.sentPacketHandler.AmplificationBudget())
 }
 
 func (c *Conn) maxPacketSize() protocol.ByteCount {
@@ -3161,8 +3185,10 @@ func (c *Conn) NextConnection(ctx context.Context) (*Conn, error) {
 }
 
 // estimateMaxPayloadSize estimates the maximum payload size for short header packets.
-// It is not very sophisticated: it just subtracts the size of header (assuming the maximum
-// connection ID length), and the size of the encryption tag.
+// It reserves the largest short header and encryption tag, then subtracts
+// the DATAGRAM frame type and length field. The result is conservative even
+// after a connection ID or packet-number-length change.
 func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
-	return mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 16 /* tag size */
+	packetPayload := mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 4 /* packet number */ - 16 /* tag size */
+	return (&wire.DatagramFrame{DataLenPresent: true}).MaxDataLen(packetPayload, protocol.Version1)
 }

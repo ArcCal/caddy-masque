@@ -18,6 +18,18 @@ func TestCheckValidHTTP2Request(t *testing.T) {
 			want: nil,
 		},
 		{
+			h:    http.Header{"Te": {"Trailers, trailers", "TRAILERS"}},
+			want: nil,
+		},
+		{
+			h:    http.Header{"Te": {""}},
+			want: nil,
+		},
+		{
+			h:    http.Header{"Te": {"trailers, gzip"}},
+			want: errors.New(`request header "TE" may only be "trailers" in HTTP/2`),
+		},
+		{
 			h:    http.Header{"Te": {"trailers", "bogus"}},
 			want: errors.New(`request header "TE" may only be "trailers" in HTTP/2`),
 		},

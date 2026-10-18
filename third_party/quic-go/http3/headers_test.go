@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strings"
 	"testing"
 
 	ossfuzzseeds "github.com/quic-go/go-ossfuzz-seeds"
@@ -83,6 +84,7 @@ func TestRequestHeaderParsingWithHostHeader(t *testing.T) {
 func TestRequestHeadersContentLength(t *testing.T) {
 	t.Run("no content length", func(t *testing.T) {
 		headers := []qpack.HeaderField{
+			{Name: ":scheme", Value: "https"},
 			{Name: ":path", Value: "/"},
 			{Name: ":authority", Value: "quic-go.net"},
 			{Name: ":method", Value: http.MethodGet},
@@ -94,6 +96,7 @@ func TestRequestHeadersContentLength(t *testing.T) {
 
 	t.Run("multiple content lengths", func(t *testing.T) {
 		headers := []qpack.HeaderField{
+			{Name: ":scheme", Value: "https"},
 			{Name: ":path", Value: "/"},
 			{Name: ":authority", Value: "quic-go.net"},
 			{Name: ":method", Value: http.MethodGet},
@@ -392,6 +395,7 @@ func TestRequestHeadersValidation(t *testing.T) {
 
 func TestCookieHeader(t *testing.T) {
 	headers := []qpack.HeaderField{
+		{Name: ":scheme", Value: "https"},
 		{Name: ":path", Value: "/foo"},
 		{Name: ":authority", Value: "quic-go.net"},
 		{Name: ":method", Value: http.MethodGet},
@@ -407,6 +411,7 @@ func TestCookieHeader(t *testing.T) {
 
 func TestHeadersConcatenation(t *testing.T) {
 	headers := []qpack.HeaderField{
+		{Name: ":scheme", Value: "https"},
 		{Name: ":path", Value: "/foo"},
 		{Name: ":authority", Value: "quic-go.net"},
 		{Name: ":method", Value: http.MethodGet},
@@ -546,7 +551,7 @@ func TestResponseHeaderParsing(t *testing.T) {
 		{Name: "content-length", Value: "42"},
 	}
 	rsp := &http.Response{}
-	require.NoError(t, updateResponseFromHeaders(rsp, decodeFromSlice(headers), math.MaxInt, nil))
+	require.NoError(t, updateResponseFromHeaders(rsp, decodeFromSlice(headers), math.MaxInt, nil, false))
 	require.Equal(t, "HTTP/3.0", rsp.Proto)
 	require.Equal(t, 3, rsp.ProtoMajor)
 	require.Zero(t, rsp.ProtoMinor)
@@ -596,7 +601,7 @@ func TestResponseHeaderParsingValidation(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(tc.headers), math.MaxInt, nil)
+			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(tc.headers), math.MaxInt, nil, false)
 			if tc.errContains != "" {
 				require.ErrorContains(t, err, tc.errContains)
 			}
@@ -621,7 +626,7 @@ func TestResponseHeaderParsingValidation(t *testing.T) {
 				{Name: ":status", Value: "404"},
 				{Name: tc.invalidField, Value: "some-value"},
 			}
-			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil)
+			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false)
 			require.EqualError(t, err, fmt.Sprintf("invalid header field name: %q", tc.invalidField))
 		})
 	}
@@ -634,7 +639,7 @@ func TestResponseTrailerFields(t *testing.T) {
 		{Name: "trailer", Value: "TRAILER3"},
 	}
 	var rsp http.Response
-	require.NoError(t, updateResponseFromHeaders(&rsp, decodeFromSlice(headers), math.MaxInt, nil))
+	require.NoError(t, updateResponseFromHeaders(&rsp, decodeFromSlice(headers), math.MaxInt, nil, false))
 	require.Empty(t, rsp.Header)
 	require.Equal(t, http.Header(map[string][]string{
 		"Trailer1": nil,
@@ -643,18 +648,17 @@ func TestResponseTrailerFields(t *testing.T) {
 	}), rsp.Trailer)
 }
 
-func TestResponseTrailerParsingTE(t *testing.T) {
+func TestResponseHeaderTEIsNotPermitted(t *testing.T) {
 	headers := []qpack.HeaderField{
 		{Name: ":status", Value: "404"},
 		{Name: "te", Value: "trailers"},
 	}
-	require.NoError(t, updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil))
-	headers = []qpack.HeaderField{
-		{Name: ":status", Value: "404"},
-		{Name: "te", Value: "not-trailers"},
-	}
 	require.EqualError(t,
-		updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil),
+		updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false),
+		"TE header field is only permitted in request headers")
+	headers[1].Value = "not-trailers"
+	require.EqualError(t,
+		updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false),
 		`invalid TE header field value: "not-trailers"`)
 }
 
@@ -776,7 +780,7 @@ func TestQpackError(t *testing.T) {
 	t.Run("trailer parsing", func(t *testing.T) {
 		dec := qpack.NewDecoder()
 		decodeFn := dec.Decode(buf.Bytes()[:len(buf.Bytes())/2])
-		err := updateResponseFromHeaders(&http.Response{}, decodeFn, math.MaxInt, nil)
+		err := updateResponseFromHeaders(&http.Response{}, decodeFn, math.MaxInt, nil, false)
 		require.ErrorAs(t, err, new(*qpackError))
 	})
 }
@@ -911,7 +915,7 @@ func FuzzHeaderParsing(f *testing.F) {
 		}
 
 		rsp := &http.Response{}
-		if err := updateResponseFromHeaders(rsp, decodeFromSlice(headers), maxHeaderBytes, nil); err == nil {
+		if err := updateResponseFromHeaders(rsp, decodeFromSlice(headers), maxHeaderBytes, nil, false); err == nil {
 			require.Equalf(t, "HTTP/3.0", rsp.Proto, "expected Proto HTTP/3.0, got %q", rsp.Proto)
 			require.Equalf(t, 3, rsp.ProtoMajor, "expected ProtoMajor 3, got %d", rsp.ProtoMajor)
 			require.GreaterOrEqualf(t, rsp.ContentLength, int64(-1), "invalid ContentLength: %d", rsp.ContentLength)
@@ -935,14 +939,19 @@ func requireValidFuzzHeader(t *testing.T, h http.Header, context string) {
 		require.Truef(t, httpguts.ValidHeaderFieldName(name), "%s contains invalid header field name %q", context, name)
 		for _, value := range values {
 			require.Truef(t, httpguts.ValidHeaderFieldValue(value), "%s contains invalid header field value for %q: %q", context, name, value)
+			require.Equal(t, strings.Trim(value, " \t"), value, "field value contains edge whitespace")
 		}
 	}
 	for _, name := range invalidHeaderFields {
 		require.Emptyf(t, h.Get(name), "%s contains connection-specific header %q", context, name)
 	}
 	if te := h.Values("Te"); len(te) > 0 {
+		require.Equal(t, "request", context, "TE is only permitted in request headers")
 		for _, value := range te {
-			require.Equalf(t, "trailers", value, "%s contains invalid TE header field value: %q", context, value)
+			for _, member := range strings.Split(value, ",") {
+				member = strings.Trim(member, " \t")
+				require.Truef(t, member == "" || len(member) == len("trailers") && strings.EqualFold(member, "trailers"), "%s contains invalid TE member: %q", context, member)
+			}
 		}
 	}
 }

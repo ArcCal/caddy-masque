@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,6 +56,89 @@ func wrapperReflectUDP(packet []byte) []byte {
 	}
 	binary.BigEndian.PutUint16(u[6:8], csum)
 	return response
+}
+
+// NF has independent HTTP and SOCKS implementations. Its unchanged test host
+// supplies portable TLS/QUIC for the native I/O bridge; this is not a claim to
+// execute Network.framework. Destination TCP/IP runs in the Rust test helper.
+func TestInteropCurrentNF(t *testing.T) {
+	binary := os.Getenv("MASQUE_NF_COMPAT")
+	if binary == "" {
+		t.Fatal("MASQUE_NF_COMPAT must name the built current NF compatibility harness")
+	}
+	for _, family := range []string{"ipv4-only", "dual-stack"} {
+		for _, mode := range []struct{ name, transport string }{
+			{"h3", "h3"}, {"h2", "h2"}, {"http1.1", "http/1.1"}, {"h3-capsules", "h3-capsules"},
+		} {
+			t.Run(family+"/"+mode.name, func(t *testing.T) {
+				e := newCaddyEnv(t)
+				cert, caPEM := newTestChain(t)
+				e.cert = cert
+				cfg := masqueConfig("alice")
+				cfg["blocked_destinations"] = []string{}
+				if family == "ipv4-only" {
+					delete(cfg, "ipv6")
+				}
+				if mode.name == "h3-capsules" {
+					cfg["http3"] = false
+				}
+				if err := e.load(cfg); err != nil {
+					t.Fatal(err)
+				}
+				// Keep AF_UNIX paths below the operating system's short limit.
+				directory, err := os.MkdirTemp("", "caddy-nf-net-")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer os.RemoveAll(directory)
+				path := filepath.Join(directory, "host.sock")
+				socket, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: path, Net: "unixgram"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer socket.Close()
+				peer := &net.UnixAddr{Name: path + ".peer", Net: "unixgram"}
+				go func() {
+					for {
+						select {
+						case packet := <-e.dev.toHost:
+							_, _ = socket.WriteToUnix(packet, peer)
+						case <-e.dev.closed:
+							return
+						}
+					}
+				}()
+				go func() {
+					buffer := make([]byte, 65535)
+					for {
+						n, _, err := socket.ReadFromUnix(buffer)
+						if err != nil {
+							return
+						}
+						packet := append([]byte(nil), buffer[:n]...)
+						select {
+						case e.dev.fromHost <- packet:
+						case <-e.dev.closed:
+							return
+						}
+					}
+				}()
+				caFile := filepath.Join(directory, "ca.pem")
+				if err := os.WriteFile(caFile, []byte(caPEM), 0600); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+				defer cancel()
+				command := exec.CommandContext(ctx, binary, fmt.Sprint(e.port), caFile, mode.transport, family, path)
+				output, err := command.CombinedOutput()
+				if err != nil {
+					t.Fatalf("current NF harness: %v\n%s", err, output)
+				}
+				t.Logf("%s", output)
+				waitNoSessions(t)
+			})
+		}
+	}
 }
 
 func TestInteropCurrentMacAndKillswitch(t *testing.T) {

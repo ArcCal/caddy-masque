@@ -1979,7 +1979,7 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
 		// Their header list was too long. Send a 431 error.
 		handler = handleHeaderListTooLong
 	} else if err := checkValidHTTP2RequestHeaders(req.Header); err != nil {
-		handler = new400Handler(err)
+		return sc.countError("bad_headers", StreamError{StreamID: id, Code: ErrCodeProtocol, Cause: err})
 	}
 
 	// The net/http package sets the read deadline from the
@@ -2035,15 +2035,14 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
 	if len(f.PseudoFields()) > 0 {
 		return sc.countError("trailers_pseudo", streamError(st.id, ErrCodeProtocol))
 	}
-	if st.trailer != nil {
-		for _, hf := range f.RegularFields() {
-			key := sc.canonicalHeader(hf.Name)
-			if !httpguts.ValidTrailerHeader(key) {
-				// TODO: send more details to the peer somehow. But http2 has
-				// no way to send debug data at a stream level. Discuss with
-				// HTTP folk.
-				return sc.countError("trailers_bogus", streamError(st.id, ErrCodeProtocol))
-			}
+	for _, hf := range f.RegularFields() {
+		key := sc.canonicalHeader(hf.Name)
+		if !httpguts.ValidTrailerHeader(key) || key == "Upgrade" {
+			// Validate even undeclared trailers, which are not exposed to
+			// the handler. RFC 9113 section 8.2 applies to the entire message.
+			return sc.countError("trailers_bogus", streamError(st.id, ErrCodeProtocol))
+		}
+		if st.trailer != nil {
 			st.trailer[key] = append(st.trailer[key], hf.Value)
 		}
 	}
@@ -2136,15 +2135,36 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		Path:      f.PseudoValue("path"),
 		Protocol:  f.PseudoValue("protocol"),
 	}
+	var hasProtocol, hasScheme, hasPath, hasAuthority bool
+	for _, hf := range f.PseudoFields() {
+		switch hf.Name {
+		case ":protocol":
+			hasProtocol = true
+		case ":scheme":
+			hasScheme = true
+		case ":path":
+			hasPath = true
+		case ":authority":
+			hasAuthority = true
+		}
+	}
 
 	// extended connect is disabled, so we should not see :protocol
-	if disableExtendedConnectProtocol && rp.Protocol != "" {
+	if disableExtendedConnectProtocol && hasProtocol {
 		return nil, nil, sc.countError("bad_connect", streamError(f.StreamID, ErrCodeProtocol))
 	}
 
 	isConnect := rp.Method == "CONNECT"
-	if isConnect {
-		if rp.Protocol == "" && (rp.Path != "" || rp.Scheme != "" || rp.Authority == "") {
+	if hasProtocol {
+		// RFC 8441 section 4 extends CONNECT only, and requires the target
+		// URI's scheme and path. CONNECT-IP additionally requires an explicit
+		// :authority (RFC 9484 section 4.4), before any Host fallback below.
+		if !isConnect || rp.Protocol == "" || rp.Scheme == "" || rp.Path == "" ||
+			(rp.Protocol == "connect-ip" && rp.Authority == "") {
+			return nil, nil, sc.countError("bad_connect", streamError(f.StreamID, ErrCodeProtocol))
+		}
+	} else if isConnect {
+		if hasPath || hasScheme || rp.Authority == "" {
 			return nil, nil, sc.countError("bad_connect", streamError(f.StreamID, ErrCodeProtocol))
 		}
 	} else if rp.Method == "" || rp.Path == "" || (rp.Scheme != "https" && rp.Scheme != "http") {
@@ -2166,7 +2186,12 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 	for _, hf := range f.RegularFields() {
 		header.Add(sc.canonicalHeader(hf.Name), hf.Value)
 	}
-	if rp.Authority == "" {
+	if hasAuthority && rp.Authority == "" && header.Get("Host") != "" {
+		// RFC 9113 section 8.3.1 forbids using Host in place of a present
+		// :authority, even when the pseudo-header value is empty.
+		return nil, nil, sc.countError("authority_host_mismatch", streamError(f.StreamID, ErrCodeProtocol))
+	}
+	if !hasAuthority {
 		rp.Authority = header.Get("Host")
 	}
 	if rp.Protocol != "" {
@@ -3179,7 +3204,7 @@ var connHeaders = []string{
 }
 
 // checkValidHTTP2RequestHeaders checks whether h is a valid HTTP/2 request,
-// per RFC 7540 Section 8.1.2.2.
+// per RFC 9113 Section 8.2.2.
 // The returned error is reported to users.
 func checkValidHTTP2RequestHeaders(h http.Header) error {
 	for _, k := range connHeaders {
@@ -3187,17 +3212,18 @@ func checkValidHTTP2RequestHeaders(h http.Header) error {
 			return fmt.Errorf("request header %q is not valid in HTTP/2", k)
 		}
 	}
-	te := h["Te"]
-	if len(te) > 0 && (len(te) > 1 || (te[0] != "trailers" && te[0] != "")) {
-		return errors.New(`request header "TE" may only be "trailers" in HTTP/2`)
+	for _, value := range h["Te"] {
+		valid := true
+		foreachHeaderElement(value, func(element string) {
+			if !asciiEqualFold(element, "trailers") {
+				valid = false
+			}
+		})
+		if !valid {
+			return errors.New(`request header "TE" may only be "trailers" in HTTP/2`)
+		}
 	}
 	return nil
-}
-
-func new400Handler(err error) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-	}
 }
 
 // h1ServerKeepAlivesDisabled reports whether hs has its keep-alives

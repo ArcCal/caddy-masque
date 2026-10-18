@@ -133,6 +133,13 @@ type listener struct {
 	createdLocally bool
 }
 
+// ConnectionConfig contains HTTP limits snapshotted when a connection opens.
+// It does not change the QUIC transport configuration or existing connections.
+type ConnectionConfig struct {
+	MaxHeaderBytes int
+	IdleTimeout    time.Duration
+}
+
 // Server is a HTTP/3 server.
 type Server struct {
 	// Addr optionally specifies the UDP address for the server to listen on,
@@ -185,6 +192,11 @@ type Server struct {
 	// like PING frames are not considered.
 	// If zero or negative, there is no timeout.
 	IdleTimeout time.Duration
+
+	// GetConnectionConfig optionally selects HTTP limits for each new
+	// connection. The returned values replace MaxHeaderBytes and IdleTimeout.
+	// This permits reloads without mutating a server used by live connections.
+	GetConnectionConfig func(*quic.Conn) ConnectionConfig
 
 	// ConnContext optionally specifies a function that modifies the context used for a new connection c.
 	// The provided ctx has a ServerContextKey value.
@@ -463,6 +475,13 @@ func (s *Server) NewRawServerConn(conn *quic.Conn) (*RawServerConn, error) {
 }
 
 func (s *Server) newRawServerConn(conn *quic.Conn) (*RawServerConn, *quic.SendStream, qlogwriter.Recorder, error) {
+	config := ConnectionConfig{MaxHeaderBytes: s.MaxHeaderBytes, IdleTimeout: s.IdleTimeout}
+	if s.GetConnectionConfig != nil {
+		config = s.GetConnectionConfig(conn)
+	}
+	if config.MaxHeaderBytes <= 0 {
+		config.MaxHeaderBytes = http.DefaultMaxHeaderBytes
+	}
 	var qlogger qlogwriter.Recorder
 	if qlogTrace := conn.QlogTrace(); qlogTrace != nil && qlogTrace.SupportsSchemas(qlog.EventSchema) {
 		qlogger = qlogTrace.AddProducer()
@@ -480,17 +499,19 @@ func (s *Server) newRawServerConn(conn *quic.Conn) (*RawServerConn, *quic.SendSt
 	hconn := newRawServerConn(
 		conn,
 		s.EnableDatagrams,
-		s.IdleTimeout,
+		config.IdleTimeout,
 		qlogger,
 		s.Logger,
 		connCtx,
 		s.Handler,
-		s.maxHeaderBytes(),
+		config.MaxHeaderBytes,
 	)
 
 	// open the control stream and send a SETTINGS frame, it's also used to send a GOAWAY frame later
 	// when the server is gracefully closed
-	ctrlStr, err := hconn.openControlStream(s.settings())
+	settings := s.settings()
+	settings.MaxFieldSectionSize = int64(config.MaxHeaderBytes)
+	ctrlStr, err := hconn.openControlStream(settings)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("opening the control stream failed: %w", err)
 	}

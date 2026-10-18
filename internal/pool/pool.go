@@ -9,7 +9,8 @@
 // after the session ends, and replies matching it would reach whoever holds
 // the address next, so the pool tells which addresses were used before:
 // the server deletes their connection tracking entries before handing them
-// out. It follows masque-vpn's pool module.
+// out. After the bounded history fills, all new allocations conservatively
+// require that cleanup. It follows masque-vpn's pool module.
 package pool
 
 import (
@@ -27,6 +28,10 @@ import (
 // pools, and a reused address is cleared first. masque-vpn uses the same
 // threshold.
 const randomIIDBits = 64
+
+// Bound lifetime allocation history independently of prefix size. Smaller
+// pools retain their exact never-used/oldest-returned allocation policy.
+const maxReturned = 65536
 
 type entry struct {
 	host uint64
@@ -51,6 +56,9 @@ type family struct {
 	order    []entry
 	nextSeq  uint64
 	ownAddr  netip.Addr
+	// Once exact history would exceed its bound, forget it and report all
+	// subsequent allocations as possibly used, so conntrack is cleared.
+	historyFull bool
 }
 
 func newFamily(p netip.Prefix) *family {
@@ -141,13 +149,15 @@ func (f *family) allocate() (netip.Addr, bool, bool) {
 		}
 		return netip.Addr{}, false, false
 	}
-	if f.last == 0 {
+	if f.last == 0 || uint64(len(f.inUse)) >= f.capacity() {
 		return netip.Addr{}, false, false
 	}
 	var host uint64
 	used := false
-	if f.capacity() > uint64(len(f.inUse)+len(f.returned)) {
-		// Some address has never been used: pick one at random.
+	if f.historyFull || f.capacity() > uint64(len(f.inUse)+len(f.returned)) {
+		// Pick a never-used address, or a free one when exact history is
+		// no longer retained. Never assume freshness in the latter case.
+		used = f.historyFull
 		start := randomUint64(f.last)
 		found := false
 		for i := uint64(0); i < f.last; i++ {
@@ -202,13 +212,19 @@ func (f *family) release(a netip.Addr) {
 		return
 	}
 	delete(f.inUse, a)
-	if !f.tracked {
+	if !f.tracked || f.historyFull {
 		return
 	}
 	h := f.host(a)
 	f.nextSeq++
 	f.returned[h] = f.nextSeq
 	f.order = append(f.order, entry{h, f.nextSeq})
+	if len(f.returned) > maxReturned {
+		f.historyFull = true
+		f.returned = nil
+		f.order = nil
+		return
+	}
 	// Addresses claimed again leave stale entries behind; keep them from
 	// piling up when the pool is never short of fresh addresses.
 	if len(f.order) > 2*len(f.returned)+64 {
@@ -248,7 +264,8 @@ func (p *Pool) family(v6 bool) *family {
 }
 
 // Allocate picks a free address of a family (see the package
-// documentation for which) and tells whether a session used it before.
+// documentation for which) and tells whether prior use is possible and
+// requires clearing connection tracking state before assigning it.
 func (p *Pool) Allocate(v6 bool) (addr netip.Addr, usedBefore bool, ok bool) {
 	f := p.family(v6)
 	if f == nil {
