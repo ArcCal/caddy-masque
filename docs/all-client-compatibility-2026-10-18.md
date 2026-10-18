@@ -13,6 +13,11 @@ client-side conformance findings. Earlier HTTP/2, QUIC, reload, build and
 Cloudflare changes remain in the baseline; they are not attributed to this
 follow-up.
 
+The later [standalone client IETF audit](client-ietf-conformance-2026-10-18.md)
+provides detailed evidence and refined attribution, including the actual WARP
+egress path, the interpretive duplicate-status subcase, and precise ABI-versus-wire
+limits. Its client-specific scope distinctions supplement this overview.
+
 ## Acceptance and complete client inventory
 
 Mandatory IETF behavior takes precedence. The goal is interoperability with
@@ -46,8 +51,10 @@ difference is not, by itself, evidence of violating an IETF requirement.
 Source review does identify concrete departures in the production WARP
 profile (`rfc: false`): private H2 bare-IP Capsules omit the standard Context
 ID, absent H2 TLS ALPN is accepted, and H3 sends `:protocol` without requiring
-peer Extended CONNECT permission. These differ from RFC 9297 §3.5,
-RFC 9113 §3.3 and RFC 8441/RFC 9220 respectively. They are a documented private
+peer Extended CONNECT permission. These differ from standard CONNECT-IP payloads (RFC 9484 §§5–6, carried by
+RFC 9297 §3.5), RFC 9113 §3.3 and RFC 8441/RFC 9220 respectively.
+RFC 9297 §3.5 alone leaves payload semantics to the extension; a private bare-IP
+payload is a protocol-format difference, not by itself a generic Capsule violation. They are a documented private
 dialect, not proof of standard Caddy interoperability. No live Cloudflare
 session was run and no endpoint emulation or enrollment was added.
 
@@ -179,7 +186,7 @@ their passing status means successful characterization, not conformance.
 | Finding | Required behavior | Confirmed observation and scope |
 | --- | --- | --- |
 | C1: QPACK critical streams are not monitored | RFC 9204 §§4.2–4.4: critical-stream closure uses 0x104; invalid zero-capacity encoder/decoder instructions use 0x201/0x202. | NF adapter plus shared h3 ignores encoder/decoder FIN, encoder capacity 1 at advertised maximum zero, and a decoder acknowledgment with no dynamic section. Source stores the streams without an instruction/lifetime reader. CLI/IETF/Mac/Killswitch share this h3 source. The independent CF fork has the same relevant reader code; that extension is source-confirmed rather than separately malicious-wire tested. |
-| C2: malformed response fields can be accepted | RFC 9114 §§4.1.2, 4.2, 4.3: invalid/duplicate pseudo-fields and connection-specific fields make a response malformed. | The NF/shared parser accepts duplicate `:status`, request-only `:path` in a response and `connection: close`. CF's separate parser already fixes the first two; its response connection-field filtering gap remains source-confirmed. Do not transfer the duplicate-field finding to CF. |
+| C2: malformed response fields can be accepted | RFC 9114 §§4.1.2, 4.2, 4.3 explicitly reject invalid/request-only pseudo-fields and connection-specific fields. Duplicate-status acceptance is separately interpreted against §4.3.2 single-status semantics; no explicit duplicate-response MUST sentence is asserted. | The NF/shared parser accepts duplicate `:status`, request-only `:path` in a response and `connection: close`. CF's separate parser already fixes the first two; its response connection-field filtering gap remains source-confirmed. Do not transfer the duplicate-field finding to CF. |
 | C3: detected malformed responses use the wrong termination code | RFC 9114 §4.1.2 requires H3_MESSAGE_ERROR (0x10e); RFC 9297 §3.2 requires forbidden Capsule content fields to be treated as malformed. | Missing `:status` returns a Rust H3_MESSAGE_ERROR but requests ABI STOP_SENDING/CLOSE 0x10c. The full NF Client detects a forbidden Content-Type response but drops resources with code-zero CLOSE rather than the required message-error reset. The missing-status library branch is shared by the other h3 clients; the full-Client Content-Type observation is specifically proven through NF. |
 | C4: HEADERS after successful CONNECT is accepted as trailer EOF | RFC 9114 §4.4 and RFC 9297 §3.2 require CONNECT framing; prohibited HEADERS requires connection error 0x105. | NF/shared h3 returns ordinary EOF with no 0x105. The CF fork has an opt-in trailer guard, but its generic client does not enable it; the corresponding CF conclusion is based on source review. |
 | C5: malformed HTTP Datagram prefixes are dropped silently | RFC 9297 §2.1 requires connection error H3_DATAGRAM_ERROR (0x33) for an unparseable Quarter Stream ID or one above 2^60−1. | Full production NF Client consumes an empty Datagram and an encoded Quarter Stream ID of 2^60 without the required close. Its native Datagram loop treats decode/range failure like a valid unrelated-stream Datagram. This finding is specific to NF; it is not transferred to CF's separate h3-datagram decoder. |
