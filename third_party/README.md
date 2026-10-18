@@ -119,6 +119,13 @@ server and the fork's client.
 
 ## HTTP/3 and QUIC conformance repairs
 
+The [independent reassessment](../docs/ietf-reassessment-2026-10-18.md) checks
+the interpretation against original RFCs, verified errata and pinned peers.
+The same patch records also include the subsequent method/scheme validation,
+post-success HTTP/2 CONNECT framing, client GOAWAY ordering and QUIC packet-type
+corrections. Exact-code regression checks select this implementation's behavior;
+they do not deny permitted generic protocol errors or connection escalation.
+
 After the two HTTP/3 patches above, verification applies
 `quic-conformance.patch` and `http3-conformance.patch`. It still reconstructs
 the entire dependency and compares every shipped byte; these records do not
