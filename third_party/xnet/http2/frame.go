@@ -1719,7 +1719,11 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 		if VerboseLogs && fr.logReads {
 			fr.debugReadLoggerf("http2: decoded hpack field %+v", hf)
 		}
-		if !httpguts.ValidHeaderFieldValue(hf.Value) {
+		// RFC 9113 section 8.2.1 forbids leading/trailing SP or HTAB in
+		// all field values, including pseudo-headers and trailers.
+		v := hf.Value
+		if !httpguts.ValidHeaderFieldValue(v) || len(v) > 0 &&
+			(v[0] == ' ' || v[0] == '\t' || v[len(v)-1] == ' ' || v[len(v)-1] == '\t') {
 			// Don't include the value in the error, because it may be sensitive.
 			invalid = headerFieldValueError(hf.Name)
 		}

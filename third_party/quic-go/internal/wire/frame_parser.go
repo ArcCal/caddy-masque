@@ -52,6 +52,13 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
 			continue
 		}
 		ft := FrameType(typ)
+		if ft.IsDatagramFrameType() && !p.supportsDatagrams {
+			return 0, parsed, &qerr.TransportError{
+				ErrorCode:    qerr.ProtocolViolation,
+				FrameType:    typ,
+				ErrorMessage: "DATAGRAM support not advertised",
+			}
+		}
 		valid := ft.isValidRFC9000() ||
 			(p.supportsDatagrams && ft.IsDatagramFrameType()) ||
 			(p.supportsResetStreamAt && ft == FrameTypeResetStreamAt) ||

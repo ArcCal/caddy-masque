@@ -469,14 +469,15 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
 	require.Zero(t, sph.GetLossDetectionTimeout())
 
 	// Receive 1000 bytes from the client.
-	// As long as we haven't sent out 3x the amount of bytes received, we can send out new packets,
-	// even if we go above the 3x limit by sending the last packet.
+	// The packer must limit the last datagram to the exact remaining allowance.
 	sph.ReceivedBytes(1000, monotime.Now())
-	for i := range 4 {
+	for i := range 3 {
 		require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+		size := min(protocol.ByteCount(999), sph.AmplificationBudget())
+		require.Equal(t, protocol.ByteCount(3000-i*999), sph.AmplificationBudget())
 		pn := sph.PopPacketNumber(protocol.EncryptionInitial)
-		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, 999, false, false)
-		if i != 3 {
+		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, size, false, false)
+		if i != 2 {
 			require.NotZero(t, sph.GetLossDetectionTimeout())
 		}
 	}
@@ -487,10 +488,14 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
 	// receiving more data allows us to send out more packets
 	sph.ReceivedBytes(1000, monotime.Now())
 	require.NotZero(t, sph.GetLossDetectionTimeout())
-	for range 3 {
+	for i := range 3 {
 		require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
 		pn := sph.PopPacketNumber(protocol.EncryptionInitial)
-		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, 1000, false, false)
+		size := protocol.ByteCount(1000)
+		if i == 2 {
+			size = sph.AmplificationBudget()
+		}
+		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, size, false, false)
 	}
 	require.Equal(t, SendNone, sph.SendMode(monotime.Now()))
 	require.Zero(t, sph.GetLossDetectionTimeout())
@@ -1769,4 +1774,53 @@ func benchmarkSendAndAcknowledge(b *testing.B, ackEvery, inFlight int) {
 			ranges = ranges[:0]
 		}
 	}
+}
+
+func TestSentPacketHandlerExactAmplificationBudget(t *testing.T) {
+	h := NewSentPacketHandler(0, 1397, utils.NewRTTStats(), &utils.ConnectionStats{}, false, false, nil, protocol.PerspectiveServer, nil, utils.DefaultLogger).(*sentPacketHandler)
+	now := monotime.Now()
+	h.ReceivedBytes(1200, now)
+	for _, size := range []protocol.ByteCount{1397, 1397, 806} {
+		require.Equal(t, SendAny, h.SendMode(now))
+		require.GreaterOrEqual(t, h.AmplificationBudget(), size)
+		pn := h.PopPacketNumber(protocol.EncryptionHandshake)
+		h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionHandshake, protocol.ECNNon, size, false, false)
+		now = now.Add(time.Millisecond)
+	}
+	require.Equal(t, protocol.ByteCount(3600), h.bytesSent)
+	require.Zero(t, h.AmplificationBudget())
+	require.Equal(t, SendNone, h.SendMode(now))
+	h.ReceivedPacket(protocol.EncryptionHandshake, now)
+	require.Equal(t, protocol.MaxByteCount, h.AmplificationBudget())
+}
+
+func TestSentPacketHandlerInitialPTOAmplificationBudget(t *testing.T) {
+	h := NewSentPacketHandler(0, 1400, utils.NewRTTStats(), &utils.ConnectionStats{}, false, false, nil, protocol.PerspectiveServer, nil, utils.DefaultLogger).(*sentPacketHandler)
+	now := monotime.Now()
+	h.ReceivedBytes(1200, now)
+	h.bytesSent = 2800
+	h.numProbesToSend = 1
+	h.ptoMode = SendPTOInitial
+	// Initial PTOs cannot use a partial allowance to send an undersized Initial.
+	require.Equal(t, SendNone, h.SendMode(now))
+	h.ptoMode = SendPTOHandshake
+	require.Equal(t, SendPTOHandshake, h.SendMode(now))
+}
+
+func TestSentPacketHandlerStrictCongestionWindowBudget(t *testing.T) {
+	h := NewSentPacketHandler(0, 1400, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveServer, nil, utils.DefaultLogger).(*sentPacketHandler)
+	now := monotime.Now()
+	window := h.congestion.GetCongestionWindow()
+	for h.bytesInFlight < window-1 {
+		size := min(protocol.ByteCount(1400), window-1-h.bytesInFlight)
+		pn := h.PopPacketNumber(protocol.Encryption1RTT)
+		h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, size, false, false)
+		now = now.Add(time.Second)
+	}
+	require.Equal(t, SendAck, h.SendMode(now))
+	require.False(t, h.HasCongestionBudget(1400))
+	// PTO remains an explicit RFC 9002 exception to the congestion window.
+	h.numProbesToSend = 1
+	h.ptoMode = SendPTOAppData
+	require.Equal(t, SendPTOAppData, h.SendMode(now))
 }

@@ -688,7 +688,6 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/hyperium/h3?rev=43745ad87e95b0c035ac9c547aad467303213425#43745ad87e95b0c035ac9c547aad467303213425"
 dependencies = [
  "bytes",
  "fastrand",
@@ -710,14 +709,12 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/hyperium/h3?rev=43745ad87e95b0c035ac9c547aad467303213425#43745ad87e95b0c035ac9c547aad467303213425"
 dependencies = [
  "bytes",
  "futures-util",
  "h3",
  "h3-datagram",
  "quinn",
- "tokio-util",
 ]
 
 [[package]]
@@ -997,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "masque-vpn-killswitch"
-version = "1.0.0"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1017,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "masque-vpn-mac"
-version = "1.0.1"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "bytes",

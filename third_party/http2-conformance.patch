@@ -1,0 +1,390 @@
+diff --git a/http2/conformance_test.go b/http2/conformance_test.go
+new file mode 100644
+index 0000000..05c043d
+--- /dev/null
++++ b/http2/conformance_test.go
+@@ -0,0 +1,198 @@
++package http2_test
++
++import (
++	"io"
++	"net/http"
++	"testing"
++
++	. "golang.org/x/net/http2"
++)
++
++// Send raw HPACK fields so the transport cannot supply missing pseudo-headers
++// or normalize invalid values. Every rejection must leave another request usable.
++func TestServerRequestConformance(t *testing.T) {
++	connect := []string{":method", "CONNECT", ":protocol", "connect-ip", ":scheme", "https", ":authority", "example.com", ":path", "/vpn"}
++	get := []string{":method", "GET", ":scheme", "https", ":authority", "example.com", ":path", "/"}
++	replace := func(fields []string, name, value string, omit bool) []string {
++		var result []string
++		for i := 0; i < len(fields); i += 2 {
++			if fields[i] == name {
++				if !omit {
++					result = append(result, name, value)
++				}
++			} else {
++				result = append(result, fields[i:i+2]...)
++			}
++		}
++		return result
++	}
++	type requestCase struct {
++		name   string
++		fields []string
++		valid  bool
++	}
++	tests := []requestCase{
++		{"connect-ip", connect, true},
++		{"connect-ip-http-scheme", replace(connect, ":scheme", "http", false), true},
++		{"connect-ip-other-uri-scheme", replace(connect, ":scheme", "custom", false), true},
++		{"missing-scheme", replace(connect, ":scheme", "", true), false},
++		{"empty-scheme", replace(connect, ":scheme", "", false), false},
++		{"scheme-whitespace", replace(connect, ":scheme", "https\t", false), false},
++		{"missing-path", replace(connect, ":path", "", true), false},
++		{"empty-path", replace(connect, ":path", "", false), false},
++		{"path-whitespace", replace(connect, ":path", "/vpn ", false), false},
++		{"connect-ip-asterisk-path", replace(connect, ":path", "*", false), false},
++		{"missing-authority", replace(connect, ":authority", "", true), false},
++		{"missing-authority-with-host", append(replace(connect, ":authority", "", true), "host", "example.com"), false},
++		{"empty-authority-with-host", append(replace(connect, ":authority", "", false), "host", "example.com"), false},
++		{"authority-whitespace", replace(connect, ":authority", " example.com", false), false},
++		{"wrong-method", replace(connect, ":method", "GET", false), false},
++		{"empty-protocol", replace(connect, ":protocol", "", false), false},
++		{"empty-protocol-wrong-method", replace(replace(connect, ":method", "GET", false), ":protocol", "", false), false},
++		{"classic-connect", []string{":method", "CONNECT", ":authority", "example.com:443"}, true},
++		{"classic-connect-empty-path", []string{":method", "CONNECT", ":authority", "example.com:443", ":path", ""}, false},
++		{"classic-connect-empty-scheme", []string{":method", "CONNECT", ":authority", "example.com:443", ":scheme", ""}, false},
++		// RFC 8441 uses ordinary request authority rules. Only CONNECT-IP
++		// requires :authority explicitly, so retain Host fallback elsewhere.
++		{"websocket-host-fallback", []string{":method", "CONNECT", ":protocol", "websocket", ":scheme", "https", ":path", "/ws", "host", "example.com"}, true},
++		{"ordinary-host-fallback", []string{":method", "GET", ":scheme", "https", ":path", "/", "host", "example.com"}, true},
++		{"ordinary-empty-authority-with-host", append(replace(get, ":authority", "", false), "host", "example.com"), false},
++		{"get-asterisk-path", replace(get, ":path", "*", false), false},
++		{"options-asterisk-path", replace(replace(get, ":method", "OPTIONS", false), ":path", "*", false), true},
++		{"websocket-empty-authority-with-host", []string{":method", "CONNECT", ":protocol", "websocket", ":scheme", "https", ":authority", "", ":path", "/ws", "host", "example.com"}, false},
++	}
++	for _, name := range []string{"connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"} {
++		tests = append(tests, requestCase{name, append(append([]string(nil), get...), name, "value"), false})
++	}
++	for _, value := range []string{"gzip", "gzip, trailers"} {
++		tests = append(tests, requestCase{"te-" + value, append(append([]string(nil), get...), "te", value), false})
++	}
++	for _, value := range []string{" leading", "\tleading", "trailing ", "trailing\t", " ", "\t", "inner \t space", ""} {
++		tests = append(tests, requestCase{"field-value-" + value, append(append([]string(nil), get...), "x-test", value), value == "" || value == "inner \t space"})
++	}
++	tests = append(tests, requestCase{"te-trailers", append(append([]string(nil), get...), "te", "trailers"), true})
++	tests = append(tests, requestCase{"te-trailers-list", append(append([]string(nil), get...), "te", "Trailers, trailers", "te", "TRAILERS"), true})
++	tests = append(tests, requestCase{"te-empty-list", append(append([]string(nil), get...), "te", ""), true})
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			SetDisableExtendedConnectProtocol(t, false)
++			synctestTest(t, func(t testing.TB) {
++				st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++					if r.URL.Path != "/control" && !tt.valid {
++						t.Error("malformed request reached handler")
++					}
++					w.WriteHeader(http.StatusNoContent)
++				})
++				defer st.Close()
++				st.greet()
++				st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeaderRaw(tt.fields...), EndHeaders: true, EndStream: true})
++				if tt.valid {
++					st.wantHeaders(wantHeader{streamID: 1, endStream: true, header: http.Header{":status": {"204"}}})
++				} else {
++					st.wantRSTStream(1, ErrCodeProtocol)
++				}
++				st.writeHeaders(HeadersFrameParam{StreamID: 3, BlockFragment: st.encodeHeader(":path", "/control"), EndHeaders: true, EndStream: true})
++				st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
++			})
++		})
++	}
++}
++
++func TestServerTrailerConformance(t *testing.T) {
++	for _, declared := range []bool{false, true} {
++		for _, tt := range []struct {
++			name, value string
++			valid       bool
++		}{
++			{"x-test", " leading", false},
++			{"x-test", "\tleading", false},
++			{"x-test", "trailing ", false},
++			{"x-test", "trailing\t", false},
++			{"connection", "keep-alive", false},
++			{"keep-alive", "timeout=1", false},
++			{"proxy-connection", "keep-alive", false},
++			{"transfer-encoding", "chunked", false},
++			{"upgrade", "websocket", false},
++			{"te", "gzip", false},
++			{"x-test", "inner \t space", true},
++			{"x-test", "", true},
++		} {
++			name := "undeclared/"
++			if declared {
++				name = "declared/"
++			}
++			t.Run(name+tt.name+"/"+tt.value, func(t *testing.T) {
++				synctestTest(t, func(t testing.TB) {
++					st := newServerTester(t, nil)
++					defer st.Close()
++					st.greet()
++					var headers []string
++					if declared {
++						headers = []string{"trailer", "X-Test"}
++					}
++					st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeader(headers...), EndHeaders: true})
++					call := st.nextHandlerCall()
++					st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeaderRaw(tt.name, tt.value), EndHeaders: true, EndStream: true})
++					if !tt.valid {
++						st.wantRSTStream(1, ErrCodeProtocol)
++					}
++					call.do(func(w http.ResponseWriter, r *http.Request) {
++						_, err := io.ReadAll(r.Body)
++						if (err == nil) != tt.valid {
++							t.Errorf("body error = %v, valid trailer = %v", err, tt.valid)
++						}
++						w.WriteHeader(http.StatusNoContent)
++					})
++					call.exit()
++					if tt.valid {
++						st.wantHeaders(wantHeader{streamID: 1, endStream: true, header: http.Header{":status": {"204"}}})
++					}
++					st.writeHeaders(HeadersFrameParam{StreamID: 3, BlockFragment: st.encodeHeader(":path", "/control"), EndHeaders: true, EndStream: true})
++					control := st.nextHandlerCall()
++					control.do(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
++					control.exit()
++					st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
++				})
++			})
++		}
++	}
++}
++
++func TestServerNormalizesFieldWhitespace(t *testing.T) {
++	synctestTest(t, func(t testing.TB) {
++		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++			w.Header().Set("X-Test", " \tinner \t space\t ")
++			w.Header().Set("Trailer", "X-End")
++			w.WriteHeader(http.StatusOK)
++			w.(http.Flusher).Flush()
++			w.Header().Set("X-End", " \ttrailer \t value\t ")
++		})
++		defer st.Close()
++		st.greet()
++		getSlash(st)
++		st.wantHeaders(wantHeader{streamID: 1, header: http.Header{":status": {"200"}, "x-test": {"inner \t space"}}})
++		st.wantHeaders(wantHeader{streamID: 1, endStream: true, header: http.Header{"x-end": {"trailer \t value"}}})
++	})
++}
++
++func TestTransportNormalizesFieldWhitespace(t *testing.T) {
++	synctestTest(t, func(t testing.TB) {
++		tc := newTestClientConn(t)
++		tc.greet()
++		req, _ := http.NewRequest("GET", "https://example.com/", nil)
++		req.Header.Set("X-Test", " \tinner \t space\t ")
++		rt := tc.roundTrip(req)
++		tc.wantHeaders(wantHeader{streamID: rt.streamID(), endStream: true, header: http.Header{":method": {"GET"}, "x-test": {"inner \t space"}}})
++		tc.writeHeaders(HeadersFrameParam{StreamID: rt.streamID(), EndHeaders: true, EndStream: true, BlockFragment: tc.makeHeaderBlockFragment(":status", "204")})
++		rt.wantStatus(http.StatusNoContent)
++		body := tc.newRequestBody()
++		req, _ = http.NewRequest("POST", "https://example.com/", body)
++		req.Trailer = http.Header{"X-End": {" \ttrailer \t value\t "}}
++		rt = tc.roundTrip(req)
++		tc.wantHeaders(wantHeader{streamID: rt.streamID(), header: http.Header{":method": {"POST"}, "trailer": {"X-End"}}})
++		body.closeWithError(io.EOF)
++		tc.wantHeaders(wantHeader{streamID: rt.streamID(), endStream: true, header: http.Header{"x-end": {"trailer \t value"}}})
++		tc.writeHeaders(HeadersFrameParam{StreamID: rt.streamID(), EndHeaders: true, EndStream: true, BlockFragment: tc.makeHeaderBlockFragment(":status", "204")})
++		rt.wantStatus(http.StatusNoContent)
++	})
++}
+diff --git a/http2/frame.go b/http2/frame.go
+index a6bffd1..c75411b 100644
+--- a/http2/frame.go
++++ b/http2/frame.go
+@@ -1722 +1722,5 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
+-		if !httpguts.ValidHeaderFieldValue(hf.Value) {
++		// RFC 9113 section 8.2.1 forbids leading/trailing SP or HTAB in
++		// all field values, including pseudo-headers and trailers.
++		v := hf.Value
++		if !httpguts.ValidHeaderFieldValue(v) || len(v) > 0 &&
++			(v[0] == ' ' || v[0] == '\t' || v[len(v)-1] == ' ' || v[len(v)-1] == '\t') {
+diff --git a/http2/server.go b/http2/server.go
+index 74ba441..8044677 100644
+--- a/http2/server.go
++++ b/http2/server.go
+@@ -1982 +1982 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
+-		handler = new400Handler(err)
++		return sc.countError("bad_headers", StreamError{StreamID: id, Code: ErrCodeProtocol, Cause: err})
+@@ -2038,9 +2038,8 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
+-	if st.trailer != nil {
+-		for _, hf := range f.RegularFields() {
+-			key := sc.canonicalHeader(hf.Name)
+-			if !httpguts.ValidTrailerHeader(key) {
+-				// TODO: send more details to the peer somehow. But http2 has
+-				// no way to send debug data at a stream level. Discuss with
+-				// HTTP folk.
+-				return sc.countError("trailers_bogus", streamError(st.id, ErrCodeProtocol))
+-			}
++	for _, hf := range f.RegularFields() {
++		key := sc.canonicalHeader(hf.Name)
++		if !httpguts.ValidTrailerHeader(key) || key == "Upgrade" {
++			// Validate even undeclared trailers, which are not exposed to
++			// the handler. RFC 9113 section 8.2 applies to the entire message.
++			return sc.countError("trailers_bogus", streamError(st.id, ErrCodeProtocol))
++		}
++		if st.trailer != nil {
+@@ -2138,0 +2138,13 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
++	var hasProtocol, hasScheme, hasPath, hasAuthority bool
++	for _, hf := range f.PseudoFields() {
++		switch hf.Name {
++		case ":protocol":
++			hasProtocol = true
++		case ":scheme":
++			hasScheme = true
++		case ":path":
++			hasPath = true
++		case ":authority":
++			hasAuthority = true
++		}
++	}
+@@ -2141 +2153 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+-	if disableExtendedConnectProtocol && rp.Protocol != "" {
++	if disableExtendedConnectProtocol && hasProtocol {
+@@ -2146,2 +2158,10 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+-	if isConnect {
+-		if rp.Protocol == "" && (rp.Path != "" || rp.Scheme != "" || rp.Authority == "") {
++	if hasProtocol {
++		// RFC 8441 section 4 extends CONNECT only, and requires the target
++		// URI's scheme and path. CONNECT-IP additionally requires an explicit
++		// :authority (RFC 9484 section 4.4), before any Host fallback below.
++		if !isConnect || rp.Protocol == "" || rp.Scheme == "" || rp.Path == "" ||
++			(rp.Protocol == "connect-ip" && rp.Authority == "") {
++			return nil, nil, sc.countError("bad_connect", streamError(f.StreamID, ErrCodeProtocol))
++		}
++	} else if isConnect {
++		if hasPath || hasScheme || rp.Authority == "" {
+@@ -2169 +2189,6 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+-	if rp.Authority == "" {
++	if hasAuthority && rp.Authority == "" && header.Get("Host") != "" {
++		// RFC 9113 section 8.3.1 forbids using Host in place of a present
++		// :authority, even when the pseudo-header value is empty.
++		return nil, nil, sc.countError("authority_host_mismatch", streamError(f.StreamID, ErrCodeProtocol))
++	}
++	if !hasAuthority {
+@@ -3182 +3207 @@ var connHeaders = []string{
+-// per RFC 7540 Section 8.1.2.2.
++// per RFC 9113 Section 8.2.2.
+@@ -3190,3 +3215,10 @@ func checkValidHTTP2RequestHeaders(h http.Header) error {
+-	te := h["Te"]
+-	if len(te) > 0 && (len(te) > 1 || (te[0] != "trailers" && te[0] != "")) {
+-		return errors.New(`request header "TE" may only be "trailers" in HTTP/2`)
++	for _, value := range h["Te"] {
++		valid := true
++		foreachHeaderElement(value, func(element string) {
++			if !asciiEqualFold(element, "trailers") {
++				valid = false
++			}
++		})
++		if !valid {
++			return errors.New(`request header "TE" may only be "trailers" in HTTP/2`)
++		}
+@@ -3197,6 +3228,0 @@ func checkValidHTTP2RequestHeaders(h http.Header) error {
+-func new400Handler(err error) http.HandlerFunc {
+-	return func(w http.ResponseWriter, r *http.Request) {
+-		http.Error(w, err.Error(), http.StatusBadRequest)
+-	}
+-}
+-
+diff --git a/http2/server_internal_test.go b/http2/server_internal_test.go
+index feab790..a22e9f5 100644
+--- a/http2/server_internal_test.go
++++ b/http2/server_internal_test.go
+@@ -19,0 +20,12 @@ func TestCheckValidHTTP2Request(t *testing.T) {
++		{
++			h:    http.Header{"Te": {"Trailers, trailers", "TRAILERS"}},
++			want: nil,
++		},
++		{
++			h:    http.Header{"Te": {""}},
++			want: nil,
++		},
++		{
++			h:    http.Header{"Te": {"trailers, gzip"}},
++			want: errors.New(`request header "TE" may only be "trailers" in HTTP/2`),
++		},
+diff --git a/http2/server_test.go b/http2/server_test.go
+index b7e4d62..6d92c64 100644
+--- a/http2/server_test.go
++++ b/http2/server_test.go
+@@ -452,2 +452,4 @@ func testServer_Request_Get_Host(t testing.TB) {
+-			StreamID:      1, // clients send odd numbers
+-			BlockFragment: st.encodeHeader(":authority", "", "host", host),
++			StreamID: 1, // clients send odd numbers
++			// Host fallback is permitted only when :authority is absent,
++			// not when an explicitly empty value was sent (RFC 9113 8.3.1).
++			BlockFragment: st.encodeHeaderRaw(":method", "GET", ":scheme", "https", ":path", "/", "host", host),
+@@ -3053,10 +3055,2 @@ func testServer_Rejects_ConnHeaders(t testing.TB) {
+-	st.wantHeaders(wantHeader{
+-		streamID:  1,
+-		endStream: false,
+-		header: http.Header{
+-			":status":                []string{"400"},
+-			"content-type":           []string{"text/plain; charset=utf-8"},
+-			"x-content-type-options": []string{"nosniff"},
+-			"content-length":         []string{"51"},
+-		},
+-	})
++	// RFC 9113 sections 8.1.1 and 8.2.2 require a stream error.
++	st.wantRSTStream(1, ErrCodeProtocol)
+diff --git a/http2/transport.go b/http2/transport.go
+index 2a70255..f21713c 100644
+--- a/http2/transport.go
++++ b/http2/transport.go
+@@ -25,0 +26 @@ import (
++	"strings"
+@@ -1724,0 +1726,3 @@ func (cc *ClientConn) writeHeader(name, value string) {
++	if !strings.HasPrefix(name, ":") {
++		value = strings.Trim(value, " \t")
++	}
+diff --git a/http2/transport_test.go b/http2/transport_test.go
+index 247949d..1976f73 100644
+--- a/http2/transport_test.go
++++ b/http2/transport_test.go
+@@ -2200 +2200 @@ func TestTransportResponseContentLength(t *testing.T) {
+-			wantLen:  -1,
++			wantLen:  -2, // Invalid generic field syntax: RFC 9113 section 8.2.1.
+@@ -2205 +2205 @@ func TestTransportResponseContentLength(t *testing.T) {
+-			wantLen:  -1,
++			wantLen:  -2,
+@@ -2244,0 +2245,8 @@ func TestTransportResponseContentLength(t *testing.T) {
++			if tt.wantLen == -2 {
++				tc.wantRSTStream(rt.streamID(), ErrCodeProtocol)
++				var streamErr StreamError
++				if err := rt.err(); !errors.As(err, &streamErr) || streamErr.StreamID != rt.streamID() || streamErr.Code != ErrCodeProtocol {
++					t.Fatalf("got error %v; want stream PROTOCOL_ERROR", err)
++				}
++				return
++			}
+diff --git a/http2/write.go b/http2/write.go
+index 33bae60..848992e 100644
+--- a/http2/write.go
++++ b/http2/write.go
+@@ -8,0 +9 @@ import (
++	"strings"
+@@ -198,0 +200,3 @@ func encKV(enc *hpack.Encoder, k, v string) {
++	// Match net/http's field-value normalization when serializing headers
++	// and trailers. RFC 9113 section 8.2.1 prohibits this whitespace on wire.
++	v = strings.Trim(v, " \t")
+diff --git a/internal/httpcommon/request.go b/internal/httpcommon/request.go
+index e64d55c..ec2633d 100644
+--- a/internal/httpcommon/request.go
++++ b/internal/httpcommon/request.go
+@@ -476 +476,2 @@ func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
+-		if rp.Path == "" || (rp.Path[0] != '/' && rp.Path != "*") {
++		// Asterisk-form is defined only for OPTIONS (RFC 9113 section 8.3.1).
++		if rp.Path == "" || (rp.Path[0] != '/' && (rp.Path != "*" || rp.Method != "OPTIONS")) {

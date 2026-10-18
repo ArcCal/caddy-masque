@@ -138,3 +138,23 @@ func testResponseBodyLengthLimiting(t *testing.T, alongFrameBoundary bool) {
 	require.Zero(t, n)
 	require.ErrorIs(t, err, errTooMuchData)
 }
+
+func TestBodyCONNECTTransitionDuringRead(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	str := NewMockDatagramStream(ctrl)
+	str.EXPECT().StreamID().Return(quic.StreamID(0)).AnyTimes()
+	stream := newStream(str, nil, nil, nil, nil)
+	data := bytes.NewReader(getDataFrame([]byte("tunnel bytes")))
+	str.EXPECT().Read(gomock.Any()).DoAndReturn(func(p []byte) (int, error) {
+		// The successful response is written while body.Read is already
+		// blocked with a buffer limited by the former Content-Length.
+		stream.tunnel.Store(true)
+		return data.Read(p)
+	}).AnyTimes()
+	body := newBody(stream, 0)
+	_, err := body.Read(make([]byte, 64))
+	require.NoError(t, err)
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.Equal(t, "tunnel bytes", string(got))
+}

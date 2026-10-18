@@ -1031,11 +1031,21 @@ func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
 	h.congestion.SetMaxDatagramSize(s)
 }
 
-func (h *sentPacketHandler) isAmplificationLimited() bool {
+func (h *sentPacketHandler) AmplificationBudget() protocol.ByteCount {
 	if h.peerAddressValidated {
-		return false
+		return protocol.MaxByteCount
 	}
-	return h.bytesSent >= amplificationFactor*h.bytesReceived
+	return max(0, amplificationFactor*h.bytesReceived-h.bytesSent)
+}
+
+func (h *sentPacketHandler) HasCongestionBudget(size protocol.ByteCount) bool {
+	return size <= max(0, h.congestion.GetCongestionWindow()-h.bytesInFlight)
+}
+
+func (h *sentPacketHandler) isAmplificationLimited() bool {
+	// Avoid trying to construct packets too small for the packer's headers.
+	budget := h.AmplificationBudget()
+	return budget < protocol.MinCoalescedPacketSize || (h.numProbesToSend > 0 && h.ptoMode == SendPTOInitial && budget < protocol.MinInitialPacketSize)
 }
 
 func (h *sentPacketHandler) QueueProbePacket(encLevel protocol.EncryptionLevel) bool {

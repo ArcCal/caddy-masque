@@ -23,6 +23,7 @@ import (
 	"net/textproto"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1722,6 +1723,9 @@ func (cc *ClientConn) encodeTrailers(trailer http.Header) ([]byte, error) {
 }
 
 func (cc *ClientConn) writeHeader(name, value string) {
+	if !strings.HasPrefix(name, ":") {
+		value = strings.Trim(value, " \t")
+	}
 	if VerboseLogs {
 		log.Printf("http2: Transport encoding header %q = %q", name, value)
 	}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -47,6 +48,11 @@ type Stream struct {
 
 	qlogger qlogwriter.Recorder
 
+	isConnect bool
+	// A successful CONNECT changes both directions from HTTP content to a tunnel.
+	// The handler can write the response concurrently with reading the request.
+	tunnel atomic.Bool
+
 	parseTrailer  func(io.Reader, *headersFrame) error
 	parsedTrailer bool
 }
@@ -58,7 +64,7 @@ func newStream(
 	parseTrailer func(io.Reader, *headersFrame) error,
 	qlogger qlogwriter.Recorder,
 ) *Stream {
-	return &Stream{
+	s := &Stream{
 		datagramStream: str,
 		conn:           conn,
 		buf:            make([]byte, 16),
@@ -71,6 +77,8 @@ func newStream(
 			closeConn: conn.CloseWithError,
 		},
 	}
+	s.frameParser.tunnel = &s.tunnel
+	return s
 }
 
 func (s *Stream) Read(b []byte) (int, error) {
@@ -87,17 +95,43 @@ func (s *Stream) Read(b []byte) (int, error) {
 			switch f := frame.(type) {
 			case *dataFrame:
 				if s.parsedTrailer {
+					s.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "DATA frame received after trailers")
 					return 0, errors.New("DATA frame received after trailers")
+				}
+				// Empty DATA frames do not end the HTTP content.
+				if f.Length == 0 {
+					continue
 				}
 				s.bytesRemainingInFrame = f.Length
 				break parseLoop
 			case *headersFrame:
+				if s.tunnel.Load() {
+					s.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "HEADERS frame on a CONNECT tunnel")
+					return 0, errors.New("HEADERS frame on a CONNECT tunnel")
+				}
 				if s.parsedTrailer {
+					s.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "additional HEADERS frame received after trailers")
 					maybeQlogInvalidHeadersFrame(s.qlogger, s.StreamID(), f.Length)
 					return 0, errors.New("additional HEADERS frame received after trailers")
 				}
 				s.parsedTrailer = true
-				return 0, maybeReplaceError(s.parseTrailer(s.datagramStream, f))
+				if err := s.parseTrailer(s.datagramStream, f); err != nil {
+					if err == io.EOF || err == io.ErrUnexpectedEOF {
+						err = truncatedFrame(s.conn.CloseWithError, err)
+					} else if _, ok := errors.AsType[*qpackError](err); ok {
+						s.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeQPACKDecompressionFailed), err.Error())
+					} else if _, malformed := errors.AsType[*trailerError](err); malformed {
+						code := ErrCodeMessageError
+						if errors.Is(err, errHeaderTooLarge) {
+							code = ErrCodeExcessiveLoad
+						}
+						s.CancelRead(quic.StreamErrorCode(code))
+						s.CancelWrite(quic.StreamErrorCode(code))
+					}
+					return 0, maybeReplaceError(err)
+				}
+				// Keep reading so EOF and invalid frames after trailers are enforced.
+				continue
 			default:
 				s.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "")
 				// parseNextFrame skips over unknown frame types
@@ -115,6 +149,9 @@ func (s *Stream) Read(b []byte) (int, error) {
 		n, err = s.datagramStream.Read(b)
 	}
 	s.bytesRemainingInFrame -= uint64(n)
+	if s.bytesRemainingInFrame > 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
+		err = truncatedFrame(s.conn.CloseWithError, err)
+	}
 	return n, maybeReplaceError(err)
 }
 
@@ -206,6 +243,7 @@ type RequestStream struct {
 	sentRequest   bool
 	requestedGzip bool
 	isConnect     bool
+	isHead        bool
 }
 
 func newRequestStream(
@@ -339,6 +377,7 @@ func (s *RequestStream) sendRequestHeader(req *http.Request) error {
 		s.requestedGzip = true
 	}
 	s.isConnect = req.Method == http.MethodConnect
+	s.isHead = req.Method == http.MethodHead
 	s.sentRequest = true
 	return maybeReplaceError(s.requestWriter.WriteRequestHeader(s.str.datagramStream, req, s.requestedGzip, s.str.StreamID(), s.str.qlogger))
 }
@@ -382,6 +421,7 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
 	headerBlock := make([]byte, hf.Length)
 	if _, err := io.ReadFull(s.str.datagramStream, headerBlock); err != nil {
 		maybeQlogInvalidHeadersFrame(s.str.qlogger, s.str.StreamID(), hf.Length)
+		err = truncatedFrame(s.str.conn.CloseWithError, err)
 		s.str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
 		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
 		return nil, fmt.Errorf("http3: failed to read response headers: %w", maybeReplaceError(err))
@@ -392,28 +432,36 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
 		hfs = make([]qpack.HeaderField, 0, 16)
 	}
 	res := s.response
-	err = updateResponseFromHeaders(res, decodeFn, s.maxHeaderBytes, &hfs)
+	err = updateResponseFromHeaders(res, decodeFn, s.maxHeaderBytes, &hfs, s.isConnect)
 	if s.str.qlogger != nil {
 		qlogParsedHeadersFrame(s.str.qlogger, s.str.StreamID(), hf, hfs)
 	}
 	if err != nil {
-		errCode := ErrCodeMessageError
 		if _, ok := errors.AsType[*qpackError](err); ok {
-			errCode = ErrCodeQPACKDecompressionFailed
+			s.str.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeQPACKDecompressionFailed), err.Error())
+		} else {
+			s.str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
+			s.str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
 		}
-		s.str.CancelRead(quic.StreamErrorCode(errCode))
-		s.str.CancelWrite(quic.StreamErrorCode(errCode))
 		return nil, fmt.Errorf("http3: invalid response: %w", err)
 	}
 
 	// Check that the server doesn't send more data in DATA frames than indicated by the Content-Length header (if set).
 	// See section 4.1.2 of RFC 9114.
-	respBody := newResponseBody(s.str, res.ContentLength, s.reqDone)
-
 	// Rules for when to set Content-Length are defined in https://tools.ietf.org/html/rfc7230#section-3.3.2.
 	isInformational := res.StatusCode >= 100 && res.StatusCode < 200
 	isNoContent := res.StatusCode == http.StatusNoContent
 	isSuccessfulConnect := s.isConnect && res.StatusCode >= 200 && res.StatusCode < 300
+	contentLength := res.ContentLength
+	if isSuccessfulConnect {
+		// RFC 9110 section 9.3.6 requires ignoring Content-Length on a tunnel.
+		s.str.tunnel.Store(true)
+		contentLength = -1
+	} else if s.isHead || isInformational || isNoContent || res.StatusCode == http.StatusNotModified {
+		// Content-Length on HEAD and 304 describes a selected representation.
+		contentLength = 0
+	}
+	respBody := newResponseBody(s.str, contentLength, s.reqDone)
 	if (isInformational || isNoContent || isSuccessfulConnect) && res.ContentLength == -1 {
 		res.ContentLength = 0
 	}

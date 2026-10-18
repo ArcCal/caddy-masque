@@ -256,3 +256,21 @@ func TestResponseWriterTrailers(t *testing.T) {
 	// invalid trailers are ignored
 	require.NotContains(t, trailers, "content-length")
 }
+
+func TestResponseWriterImplicitSuccessfulCONNECT(t *testing.T) {
+	rw := newTestResponseWriter(t)
+	rw.str.isConnect = true
+	rw.Header().Set("Capsule-Protocol", "?1")
+	rw.Header().Set("Content-Length", "0")
+	rw.Header().Set("Trailer", "X-Trailer")
+	_, err := rw.Write([]byte("tunnel bytes"))
+	require.NoError(t, err)
+	rw.Header().Set("X-Trailer", "must not be sent")
+	hdr := rw.DecodeHeaders(t, 0)
+	require.Equal(t, []string{"200"}, hdr[":status"])
+	require.Equal(t, []string{"?1"}, hdr["capsule-protocol"])
+	require.NotContains(t, hdr, "content-length")
+	require.NotContains(t, hdr, "content-type")
+	require.Equal(t, []byte("tunnel bytes"), rw.DecodeBody(t))
+	require.Empty(t, rw.buf.Bytes(), "a successful CONNECT must not send trailers")
+}

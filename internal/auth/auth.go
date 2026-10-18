@@ -206,8 +206,8 @@ type Authenticator struct {
 	// credentials cannot queue without end ahead of real users.
 	waiting    atomic.Int64
 	maxWaiting int64
-	// Verified instead of a real hash for unknown names, so the time taken
-	// does not reveal which names exist.
+	// Unknown names also incur a password verification. Its cost matches
+	// generated hashes; custom PHC parameters can have different costs.
 	dummyHash string
 	// Called (at most once a minute) when the queue is full.
 	OnBusy   func()

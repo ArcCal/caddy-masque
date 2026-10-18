@@ -27,6 +27,13 @@ func (e *qpackError) Unwrap() error { return e.err }
 
 var errHeaderTooLarge = errors.New("http3: headers too large")
 
+// trailerError distinguishes malformed field sections from read deadlines and
+// other transport errors while receiving the trailer frame payload.
+type trailerError struct{ err error }
+
+func (e *trailerError) Error() string { return e.err.Error() }
+func (e *trailerError) Unwrap() error { return e.err }
+
 type header struct {
 	// Pseudo header fields defined in RFC 9114
 	Path      string
@@ -52,7 +59,7 @@ var invalidHeaderFields = [...]string{
 	"upgrade",
 }
 
-func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, headerFields *[]qpack.HeaderField) (header, error) {
+func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, headerFields *[]qpack.HeaderField, isConnect bool) (header, error) {
 	hdr := header{Headers: make(http.Header)}
 	var readFirstRegularHeader, readContentLength, hasMethod, hasStatus bool
 	var contentLengthStr string
@@ -130,6 +137,12 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
 			readFirstRegularHeader = true
 			switch h.Name {
 			case "content-length":
+				// Pseudo headers precede regular fields, so :status is known.
+				// RFC 9110 section 9.3.6 requires ignoring any Content-Length
+				// on a successful CONNECT response, including invalid values.
+				if !isRequest && isConnect && len(hdr.Status) == 3 && hdr.Status[0] == '2' {
+					continue
+				}
 				// Ignore duplicate Content-Length headers.
 				// Fail if the duplicates differ.
 				if !readContentLength {
@@ -144,7 +157,7 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
 		}
 	}
 	hdr.ContentLength = -1
-	if len(contentLengthStr) > 0 {
+	if readContentLength {
 		// use ParseUint instead of ParseInt, so that parsing fails on negative values
 		cl, err := strconv.ParseUint(contentLengthStr, 10, 63)
 		if err != nil {
@@ -225,7 +238,7 @@ func parseTrailers(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpa
 }
 
 func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField) (*http.Request, error) {
-	hdr, err := parseHeaders(decodeFn, true, sizeLimit, headerFields)
+	hdr, err := parseHeaders(decodeFn, true, sizeLimit, headerFields, false)
 	if err != nil {
 		return nil, err
 	}
@@ -296,6 +309,10 @@ func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *
 		return nil, fmt.Errorf("invalid :path: %q", hdr.Path)
 	}
 
+	if !isConnect && hdr.Scheme == "" {
+		return nil, errors.New(":scheme must not be empty")
+	}
+
 	var u *url.URL
 	var requestURI string
 
@@ -347,8 +364,8 @@ func validExtendedConnectProtocol(protocol string) bool {
 // using the decoded qpack header filed.
 // It is only called for the HTTP header (and not the HTTP trailer).
 // It takes an http.Response as an argument to allow the caller to set the trailer later on.
-func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField) error {
-	hdr, err := parseHeaders(decodeFn, false, sizeLimit, headerFields)
+func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField, isConnect bool) error {
+	hdr, err := parseHeaders(decodeFn, false, sizeLimit, headerFields, isConnect)
 	if err != nil {
 		return err
 	}
@@ -447,7 +464,7 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
 func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *qpack.Decoder, qlogger qlogwriter.Recorder, streamID quic.StreamID) (http.Header, error) {
 	if hf.Length > uint64(maxHeaderBytes) {
 		maybeQlogInvalidHeadersFrame(qlogger, streamID, hf.Length)
-		return nil, fmt.Errorf("http3: HEADERS frame too large: %d bytes (max: %d)", hf.Length, maxHeaderBytes)
+		return nil, &trailerError{fmt.Errorf("%w: HEADERS frame too large: %d bytes (max: %d)", errHeaderTooLarge, hf.Length, maxHeaderBytes)}
 	}
 
 	b := make([]byte, hf.Length)
@@ -464,7 +481,7 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
 	trailers, err := parseTrailers(decodeFn, maxHeaderBytes, headerFields)
 	if err != nil {
 		maybeQlogInvalidHeadersFrame(qlogger, streamID, hf.Length)
-		return nil, err
+		return nil, &trailerError{err}
 	}
 	if qlogger != nil {
 		qlogParsedHeadersFrame(qlogger, streamID, hf, fields)

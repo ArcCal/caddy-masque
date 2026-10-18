@@ -124,6 +124,7 @@ fi
 cleanup_swap
 install -m 755 "$BUILD_DIR/caddy" /usr/local/bin/caddy
 caddy version
+caddy list-modules | grep -x 'dns.providers.cloudflare' >/dev/null || die "the build is missing the required Cloudflare DNS module"
 
 say "Ports"
 # masque-vpn's own server, or another web server, would hold 443.

@@ -473,7 +473,8 @@ func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
 	} else {
 		// "[The :path] pseudo-header field MUST NOT be empty [...]"
 		// https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1-2.4.2
-		if rp.Path == "" || (rp.Path[0] != '/' && rp.Path != "*") {
+		// Asterisk-form is defined only for OPTIONS (RFC 9113 section 8.3.1).
+		if rp.Path == "" || (rp.Path[0] != '/' && (rp.Path != "*" || rp.Method != "OPTIONS")) {
 			return ServerRequestResult{
 				InvalidReason: "bad_path",
 			}

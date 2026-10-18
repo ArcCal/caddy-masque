@@ -137,6 +137,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 	headerBlock := make([]byte, hf.Length)
 	if _, err := io.ReadFull(str, headerBlock); err != nil {
 		maybeQlogInvalidHeadersFrame(qlogger, str.StreamID(), hf.Length)
+		truncatedFrame(conn.CloseWithError, err)
 		str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
 		str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
 		return
@@ -159,12 +160,12 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 			return
 		}
 
-		errCode := ErrCodeMessageError
 		if _, ok := errors.AsType[*qpackError](err); ok {
-			errCode = ErrCodeQPACKDecompressionFailed
+			conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeQPACKDecompressionFailed), err.Error())
+		} else {
+			str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
+			str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
 		}
-		str.CancelRead(quic.StreamErrorCode(errCode))
-		str.CancelWrite(quic.StreamErrorCode(errCode))
 		return
 	}
 
@@ -186,6 +187,8 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 		req.Trailer = trailers
 		return nil
 	}, qlogger)
+
+	hstr.isConnect = req.Method == http.MethodConnect
 
 	// We only use the client's priority for local scheduling.
 	// A Priority response header is only transmitted so that potential intermediaries can use it,
@@ -254,7 +257,7 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 
 	// response not written to the client yet, set Content-Length
 	if !r.headerWritten {
-		if _, haveCL := r.header["Content-Length"]; !haveCL {
+		if _, haveCL := r.header["Content-Length"]; !haveCL && !hstr.tunnel.Load() {
 			r.header.Set("Content-Length", strconv.FormatInt(r.numWritten, 10))
 		}
 	}

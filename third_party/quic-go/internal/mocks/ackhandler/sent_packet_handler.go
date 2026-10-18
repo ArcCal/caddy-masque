@@ -43,6 +43,44 @@ func (m *MockSentPacketHandler) EXPECT() *MockSentPacketHandlerMockRecorder {
 	return m.recorder
 }
 
+// AmplificationBudget mocks base method.
+func (m *MockSentPacketHandler) AmplificationBudget() protocol.ByteCount {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AmplificationBudget")
+	ret0, _ := ret[0].(protocol.ByteCount)
+	return ret0
+}
+
+// AmplificationBudget indicates an expected call of AmplificationBudget.
+func (mr *MockSentPacketHandlerMockRecorder) AmplificationBudget() *MockSentPacketHandlerAmplificationBudgetCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AmplificationBudget", reflect.TypeOf((*MockSentPacketHandler)(nil).AmplificationBudget))
+	return &MockSentPacketHandlerAmplificationBudgetCall{Call: call}
+}
+
+// MockSentPacketHandlerAmplificationBudgetCall wrap *gomock.Call
+type MockSentPacketHandlerAmplificationBudgetCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerAmplificationBudgetCall) Return(arg0 protocol.ByteCount) *MockSentPacketHandlerAmplificationBudgetCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerAmplificationBudgetCall) Do(f func() protocol.ByteCount) *MockSentPacketHandlerAmplificationBudgetCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerAmplificationBudgetCall) DoAndReturn(f func() protocol.ByteCount) *MockSentPacketHandlerAmplificationBudgetCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // DropPackets mocks base method.
 func (m *MockSentPacketHandler) DropPackets(arg0 protocol.EncryptionLevel, rcvTime monotime.Time) {
 	m.ctrl.T.Helper()
@@ -151,6 +189,44 @@ func (c *MockSentPacketHandlerGetLossDetectionTimeoutCall) Do(f func() monotime.
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockSentPacketHandlerGetLossDetectionTimeoutCall) DoAndReturn(f func() monotime.Time) *MockSentPacketHandlerGetLossDetectionTimeoutCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// HasCongestionBudget mocks base method.
+func (m *MockSentPacketHandler) HasCongestionBudget(arg0 protocol.ByteCount) bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "HasCongestionBudget", arg0)
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// HasCongestionBudget indicates an expected call of HasCongestionBudget.
+func (mr *MockSentPacketHandlerMockRecorder) HasCongestionBudget(arg0 any) *MockSentPacketHandlerHasCongestionBudgetCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HasCongestionBudget", reflect.TypeOf((*MockSentPacketHandler)(nil).HasCongestionBudget), arg0)
+	return &MockSentPacketHandlerHasCongestionBudgetCall{Call: call}
+}
+
+// MockSentPacketHandlerHasCongestionBudgetCall wrap *gomock.Call
+type MockSentPacketHandlerHasCongestionBudgetCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerHasCongestionBudgetCall) Return(arg0 bool) *MockSentPacketHandlerHasCongestionBudgetCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerHasCongestionBudgetCall) Do(f func(protocol.ByteCount) bool) *MockSentPacketHandlerHasCongestionBudgetCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerHasCongestionBudgetCall) DoAndReturn(f func(protocol.ByteCount) bool) *MockSentPacketHandlerHasCongestionBudgetCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }
