@@ -248,6 +248,34 @@ func TestTransportParameterSetsDefaultValuesWhenNotSent(t *testing.T) {
 	require.EqualValues(t, protocol.DefaultActiveConnectionIDLimit, p.ActiveConnectionIDLimit)
 }
 
+func TestTransportParameterIdleTimeoutMilliseconds(t *testing.T) {
+	const maxMilliseconds = uint64(math.MaxInt64 / int64(time.Millisecond))
+	for _, tc := range []struct {
+		name         string
+		milliseconds uint64
+		want         time.Duration
+	}{
+		{name: "explicit zero disables peer timeout", milliseconds: 0, want: 0},
+		{name: "existing positive timeout floor", milliseconds: 1, want: protocol.MinRemoteIdleTimeout},
+		{name: "ordinary timeout", milliseconds: 30000, want: 30 * time.Second},
+		{name: "largest exact duration", milliseconds: maxMilliseconds, want: time.Duration(maxMilliseconds) * time.Millisecond},
+		{name: "first overflowing duration saturates", milliseconds: maxMilliseconds + 1, want: math.MaxInt64},
+		{name: "positive wraparound saturates", milliseconds: 1 << 55, want: math.MaxInt64},
+		{name: "maximum varint saturates", milliseconds: quicvarint.Max, want: math.MaxInt64},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := quicvarint.Append(nil, uint64(initialSourceConnectionIDParameterID))
+			b = quicvarint.Append(b, 0)
+			b = quicvarint.Append(b, uint64(maxIdleTimeoutParameterID))
+			b = quicvarint.Append(b, uint64(quicvarint.Len(tc.milliseconds)))
+			b = quicvarint.Append(b, tc.milliseconds)
+			var p TransportParameters
+			require.NoError(t, p.Unmarshal(b, protocol.PerspectiveClient))
+			require.Equal(t, tc.want, p.MaxIdleTimeout)
+		})
+	}
+}
+
 func TestTransportParameterErrors(t *testing.T) {
 	tests := []struct {
 		name           string

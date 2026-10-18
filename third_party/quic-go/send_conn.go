@@ -23,6 +23,7 @@ type sendConn interface {
 type remoteAddrInfo struct {
 	addr net.Addr
 	oob  []byte
+	info packetInfo
 }
 
 type sconn struct {
@@ -65,12 +66,16 @@ func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logge
 	sc.remoteAddrInfo.Store(&remoteAddrInfo{
 		addr: remote,
 		oob:  oob,
+		info: info,
 	})
 	return sc
 }
 
 func (c *sconn) Write(p []byte, gsoSize uint16, ecn protocol.ECN) error {
-	ai := c.remoteAddrInfo.Load()
+	return c.writeWithInfo(p, gsoSize, ecn, c.remoteAddrInfo.Load())
+}
+
+func (c *sconn) writeWithInfo(p []byte, gsoSize uint16, ecn protocol.ECN, ai *remoteAddrInfo) error {
 	err := c.writePacket(p, ai.addr, ai.oob, gsoSize, ecn)
 	if err != nil && isGSOError(err) {
 		// disable GSO for future calls
@@ -117,8 +122,11 @@ func (c *sconn) ChangeRemoteAddr(addr net.Addr, info packetInfo) {
 	c.remoteAddrInfo.Store(&remoteAddrInfo{
 		addr: addr,
 		oob:  info.OOB(),
+		info: info,
 	})
 }
+
+func (c *sconn) currentPacketInfo() packetInfo { return c.remoteAddrInfo.Load().info }
 
 func (c *sconn) RemoteAddr() net.Addr { return c.remoteAddrInfo.Load().addr }
 func (c *sconn) LocalAddr() net.Addr  { return c.localAddr }

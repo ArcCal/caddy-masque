@@ -430,14 +430,14 @@ type serverConn struct {
 	// Everything following is owned by the serve loop; use serveG.check():
 	serveG                      goroutineLock // used to verify funcs are on serve()
 	pushEnabled                 bool
-	sawClientPreface            bool // preface has already been read, used in h2c upgrade
-	sawFirstSettings            bool // got the initial SETTINGS frame after the preface
-	needToSendSettingsAck       bool
+	sawClientPreface            bool   // preface has already been read, used in h2c upgrade
+	sawFirstSettings            bool   // got the initial SETTINGS frame after the preface
+	pendingSettingsAcks         int    // one ACK per received SETTINGS frame
 	unackedSettings             int    // how many SETTINGS have we sent without ACKs?
 	pendingEncoderTableSize     bool   // peer changed SETTINGS_HEADER_TABLE_SIZE; apply to hpackEncoder before the next frame write
 	encoderTableSizeMin         uint32 // smallest SETTINGS_HEADER_TABLE_SIZE since the last apply
 	encoderTableSize            uint32 // latest SETTINGS_HEADER_TABLE_SIZE
-	queuedControlFrames         int    // control frames in the writeSched queue
+	queuedControlFrames         int    // queued control frames, including pending SETTINGS ACKs
 	clientMaxStreams            uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
 	advMaxStreams               uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
 	curClientStreams            uint32 // number of open streams initiated by the client
@@ -1299,8 +1299,9 @@ func (sc *serverConn) scheduleFrameWrite() {
 			})
 			continue
 		}
-		if sc.needToSendSettingsAck {
-			sc.needToSendSettingsAck = false
+		if sc.pendingSettingsAcks > 0 {
+			sc.pendingSettingsAcks--
+			sc.queuedControlFrames--
 			sc.startFrameWrite(FrameWriteRequest{write: writeSettingsAck{}})
 			continue
 		}
@@ -1645,9 +1646,10 @@ func (sc *serverConn) processSettings(f *SettingsFrame) error {
 	if err := f.ForeachSetting(sc.processSetting); err != nil {
 		return err
 	}
-	// TODO: judging by RFC 7540, Section 6.5.3 each SETTINGS frame should be
-	// acknowledged individually, even if multiple are received before the ACK.
-	sc.needToSendSettingsAck = true
+	// RFC 9113 section 6.5.3 requires one acknowledgment per SETTINGS frame.
+	// Preserve ACK priority while charging the existing control-frame budget.
+	sc.pendingSettingsAcks++
+	sc.queuedControlFrames++
 	sc.scheduleFrameWrite()
 	return nil
 }
@@ -1744,7 +1746,7 @@ func (sc *serverConn) processData(f *DataFrame) error {
 		// and return any flow control bytes since we're not going
 		// to consume them.
 		if !sc.inflow.take(f.Length) {
-			return sc.countError("data_flow", streamError(id, ErrCodeFlowControl))
+			return sc.countError("data_flow", ConnectionError(ErrCodeFlowControl))
 		}
 		sc.sendWindowUpdate(nil, int(f.Length)) // conn-level
 
@@ -1761,7 +1763,7 @@ func (sc *serverConn) processData(f *DataFrame) error {
 	// Sender sending more than they'd declared?
 	if st.declBodyBytes != -1 && st.bodyBytes+int64(len(data)) > st.declBodyBytes {
 		if !sc.inflow.take(f.Length) {
-			return sc.countError("data_flow", streamError(id, ErrCodeFlowControl))
+			return sc.countError("data_flow", ConnectionError(ErrCodeFlowControl))
 		}
 		sc.sendWindowUpdate(nil, int(f.Length)) // conn-level
 
@@ -1772,8 +1774,14 @@ func (sc *serverConn) processData(f *DataFrame) error {
 		return sc.countError("send_too_much", streamError(id, ErrCodeProtocol))
 	}
 	if f.Length > 0 {
-		// Check whether the client has flow control quota.
-		if !takeInflows(&sc.inflow, &st.inflow, f.Length) {
+		// Account for all DATA against the connection window, even when
+		// rejecting it for a stream error (RFC 9113 section 6.9).
+		if !sc.inflow.take(f.Length) {
+			return sc.countError("data_flow", ConnectionError(ErrCodeFlowControl))
+		}
+		if !st.inflow.take(f.Length) {
+			// Discard the offending DATA and return connection credit only.
+			sc.sendWindowUpdate(nil, int(f.Length))
 			return sc.countError("flow_on_data_length", streamError(id, ErrCodeFlowControl))
 		}
 
@@ -1802,7 +1810,7 @@ func (sc *serverConn) processData(f *DataFrame) error {
 		sc.sendWindowUpdate32(st, pad)
 	}
 	if f.StreamEnded() {
-		st.endStream()
+		return st.endStream()
 	}
 	return nil
 }
@@ -1828,18 +1836,22 @@ func (st *stream) isPushed() bool {
 
 // endStream closes a Request.Body's pipe. It is called when a DATA
 // frame says a request body is over (or after trailers).
-func (st *stream) endStream() {
+func (st *stream) endStream() error {
 	sc := st.sc
 	sc.serveG.check()
 
 	if st.declBodyBytes != -1 && st.declBodyBytes != st.bodyBytes {
 		st.body.CloseWithError(fmt.Errorf("request declared a Content-Length of %d but only wrote %d bytes",
 			st.declBodyBytes, st.bodyBytes))
+		if !st.isConnect {
+			return sc.countError("request_body_length", streamError(st.id, ErrCodeProtocol))
+		}
 	} else {
 		st.body.closeWithErrorAndCode(io.EOF, st.copyTrailersToHandlerRequest)
 		st.body.CloseWithError(io.EOF)
 	}
 	st.state = stateHalfClosedRemote
+	return nil
 }
 
 // copyTrailersToHandlerRequest is run in the Handler's goroutine in
@@ -2058,8 +2070,7 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
 			st.trailer[key] = append(st.trailer[key], hf.Value)
 		}
 	}
-	st.endStream()
-	return nil
+	return st.endStream()
 }
 
 func (sc *serverConn) checkPriority(streamID uint32, p PriorityParam) error {
@@ -2094,9 +2105,20 @@ func (sc *serverConn) processPriorityUpdate(f *PriorityUpdateFrame) error {
 	if _, ok := sc.writeSched.(*priorityWriteSchedulerRFC9218); !ok {
 		return nil
 	}
+	state, _ := sc.state(f.PrioritizedStreamID)
+	if state == stateIdle {
+		// RFC 9218 section 7.1 forbids prioritizing idle push streams.
+		// The scheduler buffers only the most recent idle update, so at
+		// most one idle stream adds to the concurrent request-stream count.
+		if f.PrioritizedStreamID%2 == 0 || sc.curClientStreams >= sc.advMaxStreams {
+			return sc.countError("priority_update_idle", ConnectionError(ErrCodeProtocol))
+		}
+	}
 	p, ok := parseRFC9218Priority(f.Priority, sc.priorityAware)
 	if !ok {
-		return sc.countError("unparsable_priority_update", streamError(f.PrioritizedStreamID, ErrCodeProtocol))
+		// Section 7 permits a connection error. A reset would itself be
+		// invalid when the prioritized request stream is still idle.
+		return sc.countError("unparsable_priority_update", ConnectionError(ErrCodeProtocol))
 	}
 	sc.writeSched.AdjustStream(f.PrioritizedStreamID, p)
 	return nil
@@ -2223,16 +2245,24 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		return nil, nil, err
 	}
 	bodyOpen := !f.StreamEnded()
-	if bodyOpen {
-		if vv, ok := rp.Header["Content-Length"]; ok {
-			if cl, err := strconv.ParseUint(vv[0], 10, 63); err == nil {
-				req.ContentLength = int64(cl)
-			} else {
-				req.ContentLength = 0
-			}
-		} else {
-			req.ContentLength = -1
+	if vv, ok := rp.Header["Content-Length"]; ok {
+		if len(vv) != 1 {
+			return nil, nil, sc.countError("bad_content_length", streamError(st.id, ErrCodeProtocol))
 		}
+		cl, err := strconv.ParseUint(vv[0], 10, 63)
+		if err != nil {
+			return nil, nil, sc.countError("bad_content_length", streamError(st.id, ErrCodeProtocol))
+		}
+		if bodyOpen {
+			req.ContentLength = int64(cl)
+		}
+		if !bodyOpen && !isConnect && cl != 0 {
+			return nil, nil, sc.countError("request_body_length", streamError(st.id, ErrCodeProtocol))
+		}
+	} else if bodyOpen {
+		req.ContentLength = -1
+	}
+	if bodyOpen {
 		st.reqBody.pipe = &pipe{
 			b: &dataBuffer{expected: req.ContentLength},
 		}
@@ -2911,7 +2941,7 @@ func checkWriteHeaderCode(code int) {
 	// no equivalent bogus thing we can realistically send in HTTP/2,
 	// so we'll consistently panic instead and help people find their bugs
 	// early. (We can't return an error from WriteHeader even if we wanted to.)
-	if code < 100 || code > 999 {
+	if code < 100 || code > 999 || code == http.StatusSwitchingProtocols {
 		panic(fmt.Sprintf("invalid WriteHeader code %v", code))
 	}
 }

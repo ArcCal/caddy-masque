@@ -19,6 +19,7 @@ type queueEntry struct {
 	buf     *packetBuffer
 	gsoSize uint16
 	ecn     protocol.ECN
+	remote  *remoteAddrInfo
 }
 
 type sendQueue struct {
@@ -27,6 +28,7 @@ type sendQueue struct {
 	runStopped  chan struct{} // runStopped when the run loop returns
 	available   chan struct{}
 	conn        sendConn
+	sconn       *sconn
 }
 
 var _ sender = &sendQueue{}
@@ -34,8 +36,10 @@ var _ sender = &sendQueue{}
 const sendQueueCapacity = 8
 
 func newSendQueue(conn sendConn) sender {
+	sc, _ := conn.(*sconn)
 	return &sendQueue{
 		conn:        conn,
+		sconn:       sc,
 		runStopped:  make(chan struct{}),
 		closeCalled: make(chan struct{}),
 		available:   make(chan struct{}, 1),
@@ -47,8 +51,13 @@ func newSendQueue(conn sendConn) sender {
 // Callers need to make sure that there's actually space in the send queue by calling WouldBlock.
 // Otherwise Send will panic.
 func (h *sendQueue) Send(p *packetBuffer, gsoSize uint16, ecn protocol.ECN) {
+	entry := queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn}
+	if h.sconn != nil {
+		// A migration can occur before the send worker drains this entry.
+		entry.remote = h.sconn.remoteAddrInfo.Load()
+	}
 	select {
-	case h.queue <- queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn}:
+	case h.queue <- entry:
 		// clear available channel if we've reached capacity
 		if len(h.queue) == sendQueueCapacity {
 			select {
@@ -87,7 +96,13 @@ func (h *sendQueue) Run() error {
 			// make sure that all queued packets are actually sent out
 			shouldClose = true
 		case e := <-h.queue:
-			if err := h.conn.Write(e.buf.Data, e.gsoSize, e.ecn); err != nil {
+			var err error
+			if e.remote != nil {
+				err = h.sconn.writeWithInfo(e.buf.Data, e.gsoSize, e.ecn, e.remote)
+			} else {
+				err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
+			}
+			if err != nil {
 				// This additional check enables:
 				// 1. Checking for "datagram too large" message from the kernel, as such,
 				// 2. Path MTU discovery,and

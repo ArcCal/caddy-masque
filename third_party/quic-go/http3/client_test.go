@@ -411,6 +411,15 @@ func testClient1xxHandling(t *testing.T, numEarlyHints int, terminalStatus int, 
 	for range numEarlyHints {
 		rw.WriteHeader(http.StatusEarlyHints)
 	}
+	if terminalStatus == http.StatusSwitchingProtocols {
+		// A conforming server writer cannot generate 101; inject it to test the receiver.
+		rspBuf.Write(conformanceHeaders(t, ":status", "101"))
+		require.ErrorContains(t,
+			testClientResponseValidation(t, &Transport{}, rspBuf.Bytes(), quic.StreamErrorCode(ErrCodeMessageError)),
+			`invalid status code: "101"`,
+		)
+		return
+	}
 	rw.WriteHeader(terminalStatus)
 	rw.Flush()
 	rspBytes := rspBuf.Bytes()

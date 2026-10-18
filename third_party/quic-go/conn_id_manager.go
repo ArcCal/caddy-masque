@@ -20,9 +20,12 @@ type newConnID struct {
 type connIDManager struct {
 	queue []newConnID
 
-	highestProbingID uint64
-	pathMx           sync.Mutex
-	pathProbing      map[pathID]newConnID // initialized lazily
+	highestProbingID  uint64
+	pathMx            sync.Mutex
+	pathProbing       map[pathID]newConnID // initialized lazily
+	pathControlRefs   map[protocol.ConnectionID]*pathControlCIDReference
+	peerRetirePriorTo uint64
+	activeRetired     bool
 
 	handshakeComplete         bool
 	activeSequenceNumber      uint64
@@ -70,7 +73,7 @@ func (h *connIDManager) Add(f *wire.NewConnectionIDFrame) error {
 	if err := h.add(f); err != nil {
 		return err
 	}
-	if len(h.queue) >= protocol.MaxActiveConnectionIDs {
+	if h.activeConnectionIDCount() > protocol.MaxActiveConnectionIDs {
 		return &qerr.TransportError{ErrorCode: qerr.ConnectionIDLimitError}
 	}
 	return nil
@@ -83,29 +86,20 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
 			ErrorMessage: "received NEW_CONNECTION_ID frame but zero-length connection IDs are in use",
 		}
 	}
-	// If the NEW_CONNECTION_ID frame is reordered, such that its sequence number is smaller than the currently active
-	// connection ID or if it was already retired, send the RETIRE_CONNECTION_ID frame immediately.
-	if f.SequenceNumber < max(h.activeSequenceNumber, h.highestProbingID) || f.SequenceNumber < h.highestRetired {
-		h.queueControlFrame(&wire.RetireConnectionIDFrame{
-			SequenceNumber: f.SequenceNumber,
-		})
-		return nil
-	}
+	h.peerRetirePriorTo = max(h.peerRetirePriorTo, f.RetirePriorTo)
+	h.invalidatePathControlCIDs()
 
 	if f.RetirePriorTo != 0 && h.pathProbing != nil {
 		for id, entry := range h.pathProbing {
 			if entry.SequenceNumber < f.RetirePriorTo {
-				h.queueControlFrame(&wire.RetireConnectionIDFrame{
-					SequenceNumber: entry.SequenceNumber,
-				})
-				h.removeStatelessResetToken(entry.StatelessResetToken)
+				h.retireConnectionID(entry, true)
 				delete(h.pathProbing, id)
 			}
 		}
 	}
 	// Retire elements in the queue.
 	// Doesn't retire the active connection ID.
-	if f.RetirePriorTo > h.highestRetired {
+	if f.RetirePriorTo > 0 {
 		var newQueue []newConnID
 		for _, entry := range h.queue {
 			if entry.SequenceNumber >= f.RetirePriorTo {
@@ -115,20 +109,39 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
 			}
 		}
 		h.queue = newQueue
-		h.highestRetired = f.RetirePriorTo
+		h.highestRetired = max(h.highestRetired, f.RetirePriorTo)
 	}
 
-	if f.SequenceNumber == h.activeSequenceNumber {
-		return nil
+	known := !h.activeRetired && f.SequenceNumber == h.activeSequenceNumber
+	for _, entry := range h.pathProbing {
+		if entry.SequenceNumber == f.SequenceNumber {
+			if err := checkKnownConnectionID(entry, f); err != nil {
+				return err
+			}
+			known = true
+		}
+	}
+	for _, reference := range h.pathControlRefs {
+		if reference.valid && reference.entry.SequenceNumber == f.SequenceNumber {
+			if err := checkKnownConnectionID(reference.entry, f); err != nil {
+				return err
+			}
+			known = true
+		}
+	}
+	if !known {
+		if f.SequenceNumber < max(h.activeSequenceNumber, h.highestProbingID) || f.SequenceNumber < h.highestRetired {
+			h.queueControlFrame(&wire.RetireConnectionIDFrame{SequenceNumber: f.SequenceNumber})
+		} else if err := h.addConnectionID(f.SequenceNumber, f.ConnectionID, f.StatelessResetToken); err != nil {
+			return err
+		}
 	}
 
-	if err := h.addConnectionID(f.SequenceNumber, f.ConnectionID, f.StatelessResetToken); err != nil {
-		return err
+	if !h.activeRetired && h.activeSequenceNumber < h.peerRetirePriorTo {
+		h.retireActiveConnectionID()
+		h.activeRetired = true
 	}
-
-	// Retire the active connection ID, if necessary.
-	if h.activeSequenceNumber < f.RetirePriorTo {
-		// The queue is guaranteed to have at least one element at this point.
+	if h.activeRetired && len(h.queue) > 0 {
 		h.updateConnectionID()
 	}
 	return nil
@@ -172,12 +185,8 @@ func (h *connIDManager) addConnectionID(seq uint64, connID protocol.ConnectionID
 
 func (h *connIDManager) updateConnectionID() {
 	h.assertNotClosed()
-	h.queueControlFrame(&wire.RetireConnectionIDFrame{
-		SequenceNumber: h.activeSequenceNumber,
-	})
-	h.highestRetired = max(h.highestRetired, h.activeSequenceNumber)
-	if h.activeStatelessResetToken != nil {
-		h.removeStatelessResetToken(*h.activeStatelessResetToken)
+	if !h.activeRetired {
+		h.retireActiveConnectionID()
 	}
 
 	front := h.queue[0]
@@ -185,6 +194,7 @@ func (h *connIDManager) updateConnectionID() {
 	h.activeSequenceNumber = front.SequenceNumber
 	h.activeConnectionID = front.ConnectionID
 	h.activeStatelessResetToken = &front.StatelessResetToken
+	h.activeRetired = false
 	h.packetsSinceLastChange = 0
 	h.packetsPerConnectionID = protocol.PacketsPerConnectionID/2 + uint32(h.rand.Int31n(protocol.PacketsPerConnectionID))
 	h.addStatelessResetToken(*h.activeStatelessResetToken)
@@ -195,13 +205,19 @@ func (h *connIDManager) Close() {
 	defer h.pathMx.Unlock()
 
 	h.closed = true
-	if h.activeStatelessResetToken != nil {
+	if !h.activeRetired && h.activeStatelessResetToken != nil {
 		h.removeStatelessResetToken(*h.activeStatelessResetToken)
 	}
 	for _, entry := range h.pathProbing {
 		h.removeStatelessResetToken(entry.StatelessResetToken)
 	}
+	for _, reference := range h.pathControlRefs {
+		if reference.valid && reference.retirePending && reference.hasResetToken {
+			h.removeStatelessResetToken(reference.entry.StatelessResetToken)
+		}
+	}
 	clear(h.pathProbing)
+	clear(h.pathControlRefs)
 }
 
 // is called when the server performs a Retry
@@ -228,6 +244,9 @@ func (h *connIDManager) SentPacket() {
 }
 
 func (h *connIDManager) shouldUpdateConnID() bool {
+	if h.activeRetired {
+		return len(h.queue) > 0
+	}
 	if !h.handshakeComplete {
 		return false
 	}
@@ -294,10 +313,7 @@ func (h *connIDManager) RetireConnIDForPath(pathID pathID) {
 	if !ok {
 		return
 	}
-	h.queueControlFrame(&wire.RetireConnectionIDFrame{
-		SequenceNumber: entry.SequenceNumber,
-	})
-	h.removeStatelessResetToken(entry.StatelessResetToken)
+	h.retireConnectionID(entry, true)
 	delete(h.pathProbing, pathID)
 }
 
@@ -305,7 +321,7 @@ func (h *connIDManager) IsActiveStatelessResetToken(token protocol.StatelessRese
 	h.pathMx.Lock()
 	defer h.pathMx.Unlock()
 
-	if h.activeStatelessResetToken != nil {
+	if !h.activeRetired && h.activeStatelessResetToken != nil {
 		if *h.activeStatelessResetToken == token {
 			return true
 		}
@@ -315,6 +331,11 @@ func (h *connIDManager) IsActiveStatelessResetToken(token protocol.StatelessRese
 			if entry.StatelessResetToken == token {
 				return true
 			}
+		}
+	}
+	for _, reference := range h.pathControlRefs {
+		if reference.valid && reference.hasResetToken && reference.entry.StatelessResetToken == token {
+			return true
 		}
 	}
 	return false

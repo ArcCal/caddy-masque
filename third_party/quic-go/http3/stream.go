@@ -426,7 +426,7 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
 		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
 		return nil, fmt.Errorf("http3: failed to read response headers: %w", maybeReplaceError(err))
 	}
-	decodeFn := s.decoder.Decode(headerBlock)
+	decodeFn := decodeFieldSection(s.decoder, headerBlock)
 	var hfs []qpack.HeaderField
 	if s.str.qlogger != nil {
 		hfs = make([]qpack.HeaderField, 0, 16)
