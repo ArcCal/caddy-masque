@@ -82,6 +82,13 @@ func TestConformanceRequestErrors(t *testing.T) {
 	}{
 		{"missing scheme", conformanceHeaders(t, ":method", "GET", ":authority", "localhost", ":path", "/"), ErrCodeMessageError, false},
 		{"empty scheme", conformanceHeaders(t, ":method", "GET", ":scheme", "", ":authority", "localhost", ":path", "/"), ErrCodeMessageError, false},
+		{"scheme starts with digit", conformanceHeaders(t, ":method", "GET", ":scheme", "1https", ":authority", "localhost", ":path", "/"), ErrCodeMessageError, false},
+		{"scheme contains space", conformanceHeaders(t, ":method", "GET", ":scheme", "ht tps", ":authority", "localhost", ":path", "/"), ErrCodeMessageError, false},
+		{"scheme contains slash", conformanceHeaders(t, ":method", "GET", ":scheme", "https/path", ":authority", "localhost", ":path", "/"), ErrCodeMessageError, false},
+		{"scheme includes colon", conformanceHeaders(t, ":method", "GET", ":scheme", "https:", ":authority", "localhost", ":path", "/"), ErrCodeMessageError, false},
+		{"scheme contains underscore", conformanceHeaders(t, ":method", "GET", ":scheme", "h_ttps", ":authority", "localhost", ":path", "/"), ErrCodeMessageError, false},
+		{"scheme contains non-ASCII", conformanceHeaders(t, ":method", "GET", ":scheme", "h\xc3\xa9ttps", ":authority", "localhost", ":path", "/"), ErrCodeMessageError, false},
+		{"scheme Unicode case folding", conformanceHeaders(t, ":method", "GET", ":scheme", "\xe2\x84\xaattp", ":authority", "localhost", ":path", "/"), ErrCodeMessageError, false},
 		{"empty content length", conformanceHeaders(t, ":method", "POST", ":scheme", "https", ":authority", "localhost", ":path", "/", "content-length", ""), ErrCodeMessageError, false},
 		{"short content", append(conformanceHeaders(t, ":method", "POST", ":scheme", "https", ":authority", "localhost", ":path", "/", "content-length", "5"), getDataFrame([]byte("abc"))...), ErrCodeMessageError, false},
 		{"short content with trailers", append(append(conformanceHeaders(t, ":method", "POST", ":scheme", "https", ":authority", "localhost", ":path", "/", "content-length", "5"), getDataFrame([]byte("abc"))...), trailers...), ErrCodeMessageError, false},
@@ -116,6 +123,45 @@ func TestConformanceRequestErrors(t *testing.T) {
 			require.Equal(t, []string{"200"}, decodeHeader(t, good)[":status"])
 			_, err = io.ReadAll(good)
 			require.NoError(t, err)
+		})
+	}
+}
+
+func TestConformanceClientGoAwayOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ids  []quic.StreamID
+		code ErrCode
+	}{
+		{"decreasing", []quic.StreamID{5, 4, 0}, ErrCodeClosedCriticalStream},
+		{"equal", []quic.StreamID{5, 5}, ErrCodeClosedCriticalStream},
+		{"maximum initial ID", []quic.StreamID{1<<62 - 1}, ErrCodeClosedCriticalStream},
+		{"increasing", []quic.StreamID{5, 6}, ErrCodeIDError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := conformanceServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+			ctrl, err := conn.OpenUniStream()
+			require.NoError(t, err)
+			data := []byte{0, 4, 0} // control stream with empty SETTINGS
+			for _, id := range tc.ids {
+				data = (&goAwayFrame{StreamID: id}).Append(data)
+			}
+			_, err = ctrl.Write(data)
+			require.NoError(t, err)
+			if tc.code == ErrCodeClosedCriticalStream {
+				// Client GOAWAY limits pushes, not incoming requests. The
+				// unsupported-push server must still serve ordinary requests.
+				str := conformanceRequest(t, conn, conformanceHeaders(t, ":method", "GET", ":scheme", "https", ":authority", "localhost", ":path", "/"), true)
+				require.Equal(t, []string{"200"}, decodeHeader(t, str)[":status"])
+				_, err = io.ReadAll(str)
+				require.NoError(t, err)
+				// A clean control-stream FIN verifies that all the preceding
+				// GOAWAY frames were processed without an earlier ID error.
+				require.NoError(t, ctrl.Close())
+			}
+			conformanceConnectionError(t, conn, tc.code)
 		})
 	}
 }

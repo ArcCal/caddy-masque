@@ -348,7 +348,7 @@ index d4dc26e..38234b2 100644
 +}
 +
 diff --git a/internal/wire/frame_parser.go b/internal/wire/frame_parser.go
-index afc3bed..d7a8a88 100644
+index afc3bed..80fd68c 100644
 --- a/internal/wire/frame_parser.go
 +++ b/internal/wire/frame_parser.go
 @@ -54,0 +55,7 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
@@ -359,11 +359,42 @@ index afc3bed..d7a8a88 100644
 +				ErrorMessage: "DATAGRAM support not advertised",
 +			}
 +		}
+@@ -68 +75 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
+-				ErrorCode:    qerr.FrameEncodingError,
++				ErrorCode:    qerr.ProtocolViolation,
 diff --git a/internal/wire/frame_parser_test.go b/internal/wire/frame_parser_test.go
-index c7aec86..4532ea8 100644
+index c7aec86..4d86c03 100644
 --- a/internal/wire/frame_parser_test.go
 +++ b/internal/wire/frame_parser_test.go
-@@ -526,7 +526,8 @@ func TestFrameParserDatagramUnsupported(t *testing.T) {
+@@ -398 +398 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
+-			allowedZeroRTT:   false,
++			allowedZeroRTT:   true,
+@@ -454,0 +455,18 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
++		{
++			name:             "DATAGRAM_WITHOUT_LENGTH",
++			frameType:        FrameTypeDatagramNoLength,
++			frame:            &DatagramFrame{Data: []byte("datagram")},
++			allowedInitial:   false,
++			allowedHandshake: false,
++			allowedZeroRTT:   true,
++			allowedOneRTT:    true,
++		},
++		{
++			name:             "DATAGRAM_WITH_LENGTH",
++			frameType:        FrameTypeDatagramWithLength,
++			frame:            &DatagramFrame{DataLenPresent: true, Data: []byte("datagram")},
++			allowedInitial:   false,
++			allowedHandshake: false,
++			allowedZeroRTT:   true,
++			allowedOneRTT:    true,
++		},
+@@ -494 +512,4 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
+-					require.Equal(t, qerr.FrameEncodingError, transportErr.ErrorCode)
++					// RFC 9000, section 12.4 distinguishes forbidden packet
++					// types from malformed or unknown frame encodings.
++					require.Equal(t, qerr.ProtocolViolation, transportErr.ErrorCode)
++					require.Equal(t, uint64(tc.frameType), transportErr.FrameType)
+@@ -526,7 +547,8 @@ func TestFrameParserDatagramUnsupported(t *testing.T) {
 -	parser := NewFrameParser(false, true, true)
 -	f := &DatagramFrame{Data: []byte("foobar")}
 -	b, err := f.Append(nil, protocol.Version1)
@@ -379,6 +410,13 @@ index c7aec86..4532ea8 100644
 +		_, _, err = parser.ParseType(b, protocol.Encryption1RTT)
 +		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation, FrameType: uint64(b[0])})
 +	}
+diff --git a/internal/wire/frame_type.go b/internal/wire/frame_type.go
+index 597523f..ddb5150 100644
+--- a/internal/wire/frame_type.go
++++ b/internal/wire/frame_type.go
+@@ -71 +71 @@ func (t FrameType) isAllowedAtEncLevel(encLevel protocol.EncryptionLevel) bool {
+-		case FrameTypeCrypto, FrameTypeAck, FrameTypeAckECN, FrameTypeConnectionClose, FrameTypeNewToken, FrameTypePathResponse, FrameTypeRetireConnectionID:
++		case FrameTypeCrypto, FrameTypeAck, FrameTypeAckECN, FrameTypeNewToken, FrameTypePathResponse, FrameTypeRetireConnectionID:
 diff --git a/mtu_discoverer.go b/mtu_discoverer.go
 index 76b28e7..a3a07e1 100644
 --- a/mtu_discoverer.go

@@ -395,7 +395,7 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
 			frame:            &ConnectionCloseFrame{IsApplicationError: false, ReasonPhrase: "err"},
 			allowedInitial:   true,
 			allowedHandshake: true,
-			allowedZeroRTT:   false,
+			allowedZeroRTT:   true,
 			allowedOneRTT:    true,
 		},
 		{
@@ -453,6 +453,24 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
 			allowedOneRTT:    true,
 		},
 		{
+			name:             "DATAGRAM_WITHOUT_LENGTH",
+			frameType:        FrameTypeDatagramNoLength,
+			frame:            &DatagramFrame{Data: []byte("datagram")},
+			allowedInitial:   false,
+			allowedHandshake: false,
+			allowedZeroRTT:   true,
+			allowedOneRTT:    true,
+		},
+		{
+			name:             "DATAGRAM_WITH_LENGTH",
+			frameType:        FrameTypeDatagramWithLength,
+			frame:            &DatagramFrame{DataLenPresent: true, Data: []byte("datagram")},
+			allowedInitial:   false,
+			allowedHandshake: false,
+			allowedZeroRTT:   true,
+			allowedOneRTT:    true,
+		},
+		{
 			name:             "RESET_STREAM_AT",
 			frameType:        FrameTypeResetStreamAt,
 			frame:            &ResetStreamFrame{StreamID: 1, FinalSize: 1, ReliableSize: 1},
@@ -491,7 +509,10 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
 				} else {
 					var transportErr *qerr.TransportError
 					require.ErrorAs(t, err, &transportErr)
-					require.Equal(t, qerr.FrameEncodingError, transportErr.ErrorCode)
+					// RFC 9000, section 12.4 distinguishes forbidden packet
+					// types from malformed or unknown frame encodings.
+					require.Equal(t, qerr.ProtocolViolation, transportErr.ErrorCode)
+					require.Equal(t, uint64(tc.frameType), transportErr.FrameType)
 				}
 			})
 		}

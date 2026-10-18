@@ -518,6 +518,7 @@ type stream struct {
 	id        uint32
 	body      *pipe // non-nil if expecting DATA frames
 	reqBody   *requestBody
+	isConnect bool        // request method is CONNECT
 	cw        closeWaiter // closed wait stream transitions to closed state
 	ctx       context.Context
 	cancelCtx func()
@@ -531,6 +532,7 @@ type stream struct {
 	resetQueued      bool        // RST_STREAM queued for write; set by sc.resetStream
 	gotTrailerHeader bool        // HEADER frame for trailers was seen
 	wroteHeaders     bool        // whether we wrote headers (not status 100)
+	connectAccepted  bool        // a successful CONNECT response has started
 	readDeadline     *time.Timer // nil if unused
 	writeDeadline    *time.Timer // nil if unused
 	closeErr         error       // set before cw is closed
@@ -1154,6 +1156,11 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 			}
 		case stateClosed:
 			panic(fmt.Sprintf("internal error: attempt to send frame on a closed stream: %v", wr))
+		}
+		if h, ok := wr.write.(*writeResHeaders); ok && st.isConnect && h.httpResCode >= 200 && h.httpResCode < 300 {
+			// Set this on the serve goroutine before response bytes can reach
+			// the peer, including when the write runs asynchronously.
+			st.connectAccepted = true
 		}
 	}
 	if wpp, ok := wr.write.(*writePushPromise); ok {
@@ -2024,6 +2031,11 @@ func (sc *serverConn) upgradeRequest(req *http.Request) {
 func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
 	sc := st.sc
 	sc.serveG.check()
+	if st.connectAccepted {
+		// RFC 9113 section 8.5 allows only DATA and stream-management
+		// frames on an established CONNECT stream, not HTTP trailers.
+		return sc.countError("connect_trailers", streamError(st.id, ErrCodeProtocol))
+	}
 	if st.gotTrailerHeader {
 		return sc.countError("dup_trailers", ConnectionError(ErrCodeProtocol))
 	}
@@ -2155,6 +2167,14 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 	}
 
 	isConnect := rp.Method == "CONNECT"
+	if !httpguts.ValidHeaderFieldName(rp.Method) {
+		// Methods use the token grammar (RFC 9110 section 9.1).
+		return nil, nil, sc.countError("bad_method", streamError(f.StreamID, ErrCodeProtocol))
+	}
+	if (hasScheme || !isConnect) && !validURIScheme(rp.Scheme) {
+		return nil, nil, sc.countError("bad_scheme", streamError(f.StreamID, ErrCodeProtocol))
+	}
+	rp.Scheme, _ = asciiToLower(rp.Scheme)
 	if hasProtocol {
 		// RFC 8441 section 4 extends CONNECT only, and requires the target
 		// URI's scheme and path. CONNECT-IP additionally requires an explicit
@@ -2167,7 +2187,7 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		if hasPath || hasScheme || rp.Authority == "" {
 			return nil, nil, sc.countError("bad_connect", streamError(f.StreamID, ErrCodeProtocol))
 		}
-	} else if rp.Method == "" || rp.Path == "" || (rp.Scheme != "https" && rp.Scheme != "http") {
+	} else if rp.Path == "" {
 		// See 8.1.2.6 Malformed Requests and Responses:
 		//
 		// Malformed requests or responses that are detected
@@ -2220,6 +2240,21 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 	return rw, req, nil
 }
 
+// validURIScheme applies RFC 3986 section 3.1. RFC 9113 section 8.3.1
+// permits schemes other than http and https.
+func validURIScheme(s string) bool {
+	if len(s) == 0 || !('A' <= s[0] && s[0] <= 'Z' || 'a' <= s[0] && s[0] <= 'z') {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if !('A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '+' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
 func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.ServerRequestParam) (*responseWriter, *http.Request, error) {
 	sc.serveG.check()
 
@@ -2257,6 +2292,7 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.Server
 }
 
 func (sc *serverConn) newResponseWriter(st *stream, req *http.Request) *responseWriter {
+	st.isConnect = req.Method == "CONNECT"
 	rws := responseWriterStatePool.Get().(*responseWriterState)
 	bwSave := rws.bw
 	*rws = responseWriterState{} // zero all the fields

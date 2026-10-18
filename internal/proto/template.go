@@ -174,8 +174,8 @@ func (t *Template) HasVariable(name string) bool {
 }
 
 // Expand expands the template into a path and query with vars (name,
-// value pairs); undefined variables are left out (RFC 6570). "*" is
-// written literally, as in the RFC 9484 examples.
+// value pairs); undefined variables are left out (RFC 6570). Wildcard
+// "*" is percent-encoded (RFC 9484 §4.6, verified erratum 8444).
 func (t *Template) Expand(vars map[string]string) string {
 	var out strings.Builder
 	for _, p := range t.parts {
@@ -519,9 +519,6 @@ func normalize(s string) string {
 }
 
 func encode(value string) string {
-	if value == "*" {
-		return "*"
-	}
 	var out strings.Builder
 	for i := 0; i < len(value); i++ {
 		c := value[i]

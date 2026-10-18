@@ -13,6 +13,18 @@ the published IETF text requires, and the limits of each conclusion. The client
 repository was read and imported without modification. No client repair was
 applied or proposed as a hidden dependency of the server fixes.
 
+**Reassessment:** the [independent RFC/source review](ietf-reassessment-2026-10-18.md)
+checks the conclusions against verified errata and other implementations.
+The specific HTTP/3 codes below identify the tested implementation contract,
+not the only permitted error choice: RFC 9114 §8.1 expressly allows an endpoint
+to decline a more specific code and select `H3_GENERAL_PROTOCOL_ERROR` (0x101).
+Section 8 also permits stream errors to be escalated to connection errors.
+Neither flexibility excuses accepting malformed messages, silently continuing
+after a required connection error, or substituting arbitrary cancellation for
+a detected protocol error. None of the reported cancellation/no-error paths
+requested the generic protocol error. Native ABI observations remain distinct
+from packet captures.
+
 ## 1. Findings and practical significance
 
 Seven HTTP/3 finding groups are substantiated below. C6 and C7 reject legal
@@ -99,7 +111,7 @@ Sources: [root declarations](https://github.com/ArcCal/masque-vpn/blob/e10a6ec9f
 
 The NF-host proofs send a resolved QPACK stream type first, and deliver FIN as a separate native ABI event. They observe an active driver and no corresponding parent CLOSE after a bounded wait for each of:
 
-| Input | Required connection error | Proof function |
+| Input | Specific connection error used by these proofs | Proof function |
 | --- | --- | --- |
 | Encoder stream `02`, then FIN | H3_CLOSED_CRITICAL_STREAM, 0x104 | `qpack_encoder_fin_is_not_enforced` |
 | Decoder stream `03`, then FIN | H3_CLOSED_CRITICAL_STREAM, 0x104 | `qpack_decoder_fin_is_not_enforced` |
@@ -181,6 +193,7 @@ Normative basis for C3:
 - [RFC 9297 §3.2](https://www.rfc-editor.org/rfc/rfc9297.html#section-3.2): “The Capsule Protocol MUST NOT be used with messages that contain Content-Length, Content-Type, or Transfer-Encoding header fields”; a receiver observing a violation “MUST treat the HTTP message as malformed.”
 - [RFC 9114 §4.1.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.2): “Malformed requests or responses that are detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.”
 - [RFC 9114 §8](https://www.rfc-editor.org/rfc/rfc9114.html#section-8): “An endpoint MAY choose to treat a stream error as a connection error under certain circumstances”. **Do not report whole-connection termination by itself as forbidden.** The issue is the selected/missing message-error signaling, not the choice to tear down the entire connection.
+- [RFC 9114 §8.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1) also permits deliberate `H3_GENERAL_PROTOCOL_ERROR` when the endpoint declines a more specific code. A general protocol error is not a demonstrated defect merely because a proof expects `H3_MESSAGE_ERROR`; the observed paths request cancellation or ordinary cleanup instead.
 
 #### Required evidence wording limits
 
@@ -549,11 +562,11 @@ future fixes reviewable without weakening Caddy's mandatory IETF behavior:
 
 | Finding | Required repair and useful acceptance checks |
 | --- | --- |
-| C1 | Poll each opened QPACK critical receive stream for lifetime and instructions; preserve valid type-only/open streams and capacity-zero operation. Require exact connection-error requests for FIN, excess capacity and invalid acknowledgment, with duplicate-stream and valid-instruction controls. Static-only compression remains permitted. |
+| C1 | Poll each opened QPACK critical receive stream for lifetime and instructions; preserve valid type-only/open streams and capacity-zero operation. Require connection-error signaling for FIN, excess capacity and invalid acknowledgment, with duplicate-stream and permitted-instruction controls. Our tests may enforce chosen specific codes; general conformance assessment must also allow deliberate `H3_GENERAL_PROTOCOL_ERROR`. Static-only compression remains permitted. |
 | C2 | Validate pseudo-fields in response context and reject connection-specific fields. Preserve duplicate multiplicity until explicit singleton policy is enforced; test same/different repeated statuses and retain the stated normative interpretation. Exercise the complete client after valid assignment/routes, plus permitted ordinary headers. |
-| C3 | Propagate the detected malformed-message classification to transport termination. Test both the returned application error and the requested stream/connection error; capture native wire behavior separately. Escalating to a connection error is permitted, but normal cleanup alone does not select `H3_MESSAGE_ERROR`. |
-| C4 | Activate CONNECT framing rules after the final success response in each actual caller. Require connection `0x105` for prohibited HEADERS while continuing to allow ordinary non-CONNECT trailers and applicable negotiated extension frames. |
-| C5 | Parse and range-check the Quarter Stream ID before routing by request ID. Require connection `0x33` for malformed prefixes; retain permitted drops/buffering for valid not-yet-created streams and mandatory dropping for closed receive sides. Cover NF and WARP's separate manual decoders independently. |
+| C3 | Propagate the detected malformed-message classification to transport termination. Test both the returned application error and the requested stream/connection error; capture native wire behavior separately. Escalating to a connection error and deliberately selecting the general protocol error are permitted. Normal cleanup or request cancellation alone does not provide that protocol-error signal. |
+| C4 | Activate CONNECT framing rules after the final success response in each actual caller. Require a connection error for prohibited HEADERS, using specific `0x105` or an intentional general protocol error, while continuing to allow ordinary non-CONNECT trailers and applicable negotiated extension frames. |
+| C5 | Parse and range-check the Quarter Stream ID before routing by request ID. Require a connection error for malformed prefixes (`0x33` is the specific code; intentional general protocol errors remain allowed); retain permitted drops/buffering for valid not-yet-created streams and mandatory dropping for closed receive sides. Cover NF and WARP's separate manual decoders independently. |
 | C6 | Consume permitted informational responses until a final response arrives, keeping existing setup bounds. Test `200`, `100→200`, `103→200`, multiple permitted interim messages, final refusal, and rejection of unsupported HTTP/3 status 101 (RFC 9114 §4.5). No success may be inferred from 1xx alone. |
 | C7 | Keep reading past empty DATA until bytes, a permitted ordinary trailer section or actual stream closure arrives. Test empty frames before and between Capsule bytes, multiple empty frames, FIN, resets and cancellation. Do not use a positive DATA length as a requirement. |
 | WARP profile and SOCKS limits | Distinguish standard mode from documented private service behavior; validate each actual caller rather than only a reusable frontend component. Retain an explicit limited-SOCKS conformance statement unless GSSAPI is implemented. |
@@ -573,6 +586,7 @@ recorded native H3 incident has this particular cause.
 
 The following distinctions are part of the conclusion:
 
+- Verified [RFC 9484 erratum 8444](https://www.rfc-editor.org/errata/eid8444) corrects the original wildcard examples to `%2A`. The audited client's URI-template implementation already follows it; this is not a client defect. The server's stale internal expansion helper is corrected by the reassessment, while its tolerant matcher continues to accept existing request forms.
 - Legal stream 4 behind an unwritten lower stream, and selecting H3 Capsules
   because native usable Datagram capacity is small, are compatibility cases
   rather than client RFC violations by themselves.
