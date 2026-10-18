@@ -1,6 +1,7 @@
 package http2_test
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -67,6 +68,22 @@ func TestServerRequestConformance(t *testing.T) {
 	for _, value := range []string{"gzip", "gzip, trailers"} {
 		tests = append(tests, requestCase{"te-" + value, append(append([]string(nil), get...), "te", value), false})
 	}
+	for _, value := range []string{"HTTP", "HTTPS", "custom", "custom+1.2-foo"} {
+		tests = append(tests,
+			requestCase{"ordinary-valid-scheme-" + value, replace(get, ":scheme", value, false), true},
+			requestCase{"connect-valid-scheme-" + value, replace(connect, ":scheme", value, false), true})
+	}
+	for _, value := range []string{"1https", "+https", "https:", "http s", "http/s", "h\tttp", "h\xc3\xa9", "\xe2\x84\xaa"} {
+		tests = append(tests,
+			requestCase{"ordinary-invalid-scheme-" + value, replace(get, ":scheme", value, false), false},
+			requestCase{"connect-invalid-scheme-" + value, replace(connect, ":scheme", value, false), false})
+	}
+	for _, value := range []string{"get", "CUSTOM", "!#$%&'*+-.^_`|~9"} {
+		tests = append(tests, requestCase{"valid-method-" + value, replace(get, ":method", value, false), true})
+	}
+	for _, value := range []string{"", "BAD METHOD", "BAD\tMETHOD", "BAD/METHOD", "BAD:METHOD", "M\xc3\x89THOD"} {
+		tests = append(tests, requestCase{"invalid-method-" + value, replace(get, ":method", value, false), false})
+	}
 	for _, value := range []string{" leading", "\tleading", "trailing ", "trailing\t", " ", "\t", "inner \t space", ""} {
 		tests = append(tests, requestCase{"field-value-" + value, append(append([]string(nil), get...), "x-test", value), value == "" || value == "inner \t space"})
 	}
@@ -95,6 +112,84 @@ func TestServerRequestConformance(t *testing.T) {
 				st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
 			})
 		})
+	}
+}
+
+func TestServerConnectFrameConformance(t *testing.T) {
+	requests := []struct {
+		name   string
+		fields []string
+	}{
+		{"ordinary", []string{":method", "GET", ":scheme", "https", ":authority", "example.com", ":path", "/"}},
+		{"classic-connect", []string{":method", "CONNECT", ":authority", "example.com:443"}},
+		{"connect-ip", []string{":method", "CONNECT", ":protocol", "connect-ip", ":scheme", "https", ":authority", "example.com", ":path", "/vpn"}},
+	}
+	for _, request := range requests {
+		for _, response := range []struct {
+			name   string
+			status int
+		}{
+			{"accepted", 200},
+			{"accepted-other-2xx", 299},
+			{"refused", 403},
+			{"before-final-response", 0},
+			{"after-informational", 103},
+		} {
+			for _, ending := range []string{"trailers", "empty-trailers", "data-fin"} {
+				t.Run(request.name+"/"+response.name+"/"+ending, func(t *testing.T) {
+					SetDisableExtendedConnectProtocol(t, false)
+					synctestTest(t, func(t testing.TB) {
+						st := newServerTester(t, nil)
+						defer st.Close()
+						st.greet()
+						fields := append(append([]string(nil), request.fields...), "trailer", "X-End")
+						st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeaderRaw(fields...), EndHeaders: true})
+						call := st.nextHandlerCall()
+						if response.status != 0 {
+							call.do(func(w http.ResponseWriter, r *http.Request) {
+								w.WriteHeader(response.status)
+								if response.status >= 200 {
+									w.(http.Flusher).Flush()
+								}
+							})
+							st.wantHeaders(wantHeader{streamID: 1, header: http.Header{":status": {fmt.Sprint(response.status)}}})
+						}
+						if ending == "data-fin" {
+							st.writeData(1, true, nil)
+						} else {
+							var trailers []string
+							if ending == "trailers" {
+								trailers = []string{"x-end", "ok"}
+							}
+							st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeaderRaw(trailers...), EndHeaders: true, EndStream: true})
+						}
+						rejected := request.name != "ordinary" && response.status >= 200 && response.status < 300 && ending != "data-fin"
+						if rejected {
+							st.wantRSTStream(1, ErrCodeProtocol)
+						}
+						call.do(func(w http.ResponseWriter, r *http.Request) {
+							_, err := io.ReadAll(r.Body)
+							if (err != nil) != rejected {
+								t.Errorf("body error = %v, rejected = %v", err, rejected)
+							}
+						})
+						call.exit()
+						if !rejected {
+							if response.status < 200 {
+								st.wantHeaders(wantHeader{streamID: 1, endStream: true, header: http.Header{":status": {"200"}}})
+							} else {
+								st.wantData(wantData{streamID: 1, endStream: true})
+							}
+						}
+						st.writeHeaders(HeadersFrameParam{StreamID: 3, BlockFragment: st.encodeHeader(":path", "/control"), EndHeaders: true, EndStream: true})
+						control := st.nextHandlerCall()
+						control.do(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
+						control.exit()
+						st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
+					})
+				})
+			}
+		}
 	}
 }
 

@@ -30,6 +30,7 @@ The [all-client compatibility follow-up](docs/all-client-compatibility-2026-10-1
 contract, the independent gateway client fixture, and confirmed client-side RFC limitations. Protocol-core tests do not
 establish native Network.framework or GUI acceptance.
 The separate [client IETF conformance audit](docs/client-ietf-conformance-2026-10-18.md) details each client finding, affected implementations, pinned source and RFC evidence, reproduction boundaries, and private WARP/SOCKS limitations.
+The [independent IETF reassessment](docs/ietf-reassessment-2026-10-18.md) checks those interpretations against original RFCs, verified errata and other implementations, and records corrections and narrowly scoped follow-up repairs.
 
 ## One-step install
 
@@ -324,8 +325,9 @@ Caddy obtains by itself need nothing.
   log has a warning.
 - **Encrypted connections only**: RFC 9484 §4 requires CONNECT-IP to run over TLS or QUIC. CONNECT-IP requests on
   connections without TLS (`http://` sites, h2c) always go to the website; no tunnel is set up.
-- **Malformed requests**: an authenticated request whose `target` or `ipproto` is missing or invalid, or that has content
-  headers, is malformed (RFC 9484 §4.1, RFC 9297 §3.2): the answer is 400; over HTTP/3 the request stream is also ended
+- **Malformed requests**: omitted optional `target` and `ipproto` variables mean wildcard scope. Present invalid values
+  are malformed after authentication; recognized CONNECT-IP requests with invalid upgrade syntax or forbidden content
+  headers are malformed before authentication (RFC 9484 §4.1, RFC 9297 §3.2). The answer is 400; over HTTP/3 the request stream is also ended
   with H3_MESSAGE_ERROR as RFC 9114 §4.1.2 says (STOP_SENDING; the 400 still gets through). A destination that is not
   allowed (403), a DNS failure (502) and the like are refusals, not malformed requests. A tunnel the server aborts for
   another reason (an unanswered IPv6 MTU probe, a path too narrow for 1280-byte packets) is cancelled with

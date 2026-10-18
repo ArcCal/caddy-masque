@@ -4,6 +4,15 @@ Date: 18 October 2026. Baseline: `94eae65ba1cf23a9122d1abd9d38594f9bcf4f4e`.
 The repaired source is the commit containing this report. Local measurements
 below refer to that source before commit, with its dirty-tree build metadata.
 
+For the subsequent skeptical check against original RFCs, verified errata and
+independent implementations, see [the IETF reassessment](ietf-reassessment-2026-10-18.md).
+Specific error codes and continued availability of other streams in this
+report are deliberately tested implementation choices. HTTP/3 permits an
+intentional general protocol error (RFC 9114 §8.1), HTTP/2 permits generic
+error substitution (RFC 9113 §5.4), and both permit stream-to-connection
+escalation. Do not interpret these regression expectations as the only lawful
+error code or scope in every implementation.
+
 ## Acceptance policy and scope
 
 Mandatory IETF behavior takes precedence over camouflage and other design

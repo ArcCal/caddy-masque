@@ -4,6 +4,9 @@ Each version is tagged with its number; CI attaches Caddy builds to its release 
 
 ## Unreleased
 
+- Recheck earlier conformance judgments against original RFCs, verified errata and pinned independent implementations. Clarify permitted generic HTTP/QUIC errors and distinguish implementation policy from mandatory behavior.
+- Validate HTTP/2 method tokens and HTTP/2–HTTP/3 URI schemes, retaining valid custom schemes and extension methods. Reject HEADERS after successful HTTP/2 CONNECT and increasing client HTTP/3 GOAWAY identifiers.
+- Correct QUIC forbidden-packet error attribution and allow transport CONNECTION_CLOSE in 0-RTT. Correct internal wildcard expansion to `%2A` per verified RFC 9484 erratum 8444 while preserving tolerant request matching.
 - Wait for delayed HTTP/3 SETTINGS rather than permanently disabling negotiated QUIC Datagrams after three seconds. Pending admissions remain cancellable and release their lease on user revocation or shutdown; failures before a response use a non-2xx status.
 - Preserve ignored CONNECT response Content-Length fields for Capsule Protocol validation without using them to delimit tunnel DATA.
 - Reject malformed HTTP/3 field-edge whitespace and response/trailer TE fields, accept valid request TE lists, and normalize outgoing header whitespace without changing the caller's header map.

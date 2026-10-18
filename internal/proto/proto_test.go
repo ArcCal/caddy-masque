@@ -385,9 +385,9 @@ func TestExpand(t *testing.T) {
 		vars map[string]string
 		want string
 	}{
-		{map[string]string{"target": "*", "ipproto": "*"}, "/.well-known/masque/ip/*/*/"},
+		{map[string]string{"target": "*", "ipproto": "*"}, "/.well-known/masque/ip/%2A/%2A/"},
 		{map[string]string{"target": "2001:db8::42", "ipproto": "17"}, "/.well-known/masque/ip/2001%3Adb8%3A%3A42/17/"},
-		{map[string]string{"target": "192.0.2.0/24", "ipproto": "*"}, "/.well-known/masque/ip/192.0.2.0%2F24/*/"},
+		{map[string]string{"target": "192.0.2.0/24", "ipproto": "*"}, "/.well-known/masque/ip/192.0.2.0%2F24/%2A/"},
 	}
 	for _, c := range cases {
 		if got := d.Expand(c.vars); got != c.want {
@@ -395,15 +395,43 @@ func TestExpand(t *testing.T) {
 		}
 	}
 	q := tpl(t, "https://proxy.example.org:4443/masque/ip{?target,ipproto}")
-	if got := q.Expand(map[string]string{"target": "*", "ipproto": "6"}); got != "/masque/ip?target=*&ipproto=6" {
+	if got := q.Expand(map[string]string{"target": "*", "ipproto": "6"}); got != "/masque/ip?target=%2A&ipproto=6" {
 		t.Error(got)
 	}
 	if got := q.Expand(nil); got != "/masque/ip" {
 		t.Error(got)
 	}
 	lit := tpl(t, "https://proxy.example.org:4443/masque/ip?t={target}&i={ipproto}")
-	if got := lit.Expand(map[string]string{"target": "*", "ipproto": "*"}); got != "/masque/ip?t=*&i=*" {
+	if got := lit.Expand(map[string]string{"target": "*", "ipproto": "*"}); got != "/masque/ip?t=%2A&i=%2A" {
 		t.Error(got)
+	}
+}
+
+// Verified RFC 9484 erratum 8444 requires a client to encode wildcard
+// variables as %2A. Keep accepting raw * from existing clients as well;
+// a twice-escaped value is decoded once and is not a wildcard.
+func TestMatchWildcardEncodings(t *testing.T) {
+	for _, pathTemplate := range []string{
+		"/.well-known/masque/ip/{target}/{ipproto}/",
+		"/ip{?target,ipproto}",
+		"/ip?t={target}&i={ipproto}",
+	} {
+		x := tpl(t, "https://proxy.example"+pathTemplate)
+		canonical := x.Expand(map[string]string{"target": "*", "ipproto": "*"})
+		if !strings.Contains(canonical, "%2A") || strings.Contains(canonical, "*") {
+			t.Fatalf("%s: noncanonical wildcard expansion %s", pathTemplate, canonical)
+		}
+		for _, encoding := range []string{"%2A", "%2a", "*"} {
+			path := strings.ReplaceAll(canonical, "%2A", encoding)
+			m, ok := x.Match(path)
+			if !ok || m["target"] != "*" || m["ipproto"] != "*" {
+				t.Errorf("%s: wildcard match %v, %v", path, m, ok)
+			}
+		}
+		path := strings.ReplaceAll(canonical, "%2A", "%252A")
+		if m, ok := x.Match(path); !ok || m["target"] != "%2A" || m["ipproto"] != "%2A" {
+			t.Errorf("%s: percent-encoding decoded more than once: %v, %v", path, m, ok)
+		}
 	}
 }
 
@@ -566,6 +594,9 @@ func TestMatchIndependentExpansions(t *testing.T) {
 				t.Fatal(err)
 			}
 			path := strings.TrimPrefix(expanded, "https://proxy.example")
+			if got := x.Expand(map[string]string{"target": c[0], "ipproto": c[1]}); got != path {
+				t.Errorf("%s: expansion %s, independent RFC 6570 expansion %s", s, got, path)
+			}
 			m, ok := x.Match(path)
 			if !ok || len(m) != 2 || m["target"] != c[0] || m["ipproto"] != c[1] {
 				t.Errorf("%s %s: %v %v", s, path, m, ok)

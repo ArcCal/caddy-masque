@@ -18,6 +18,14 @@ provides detailed evidence and refined attribution, including the actual WARP
 egress path, the interpretive duplicate-status subcase, and precise ABI-versus-wire
 limits. Its client-specific scope distinctions supplement this overview.
 
+The later [IETF reassessment](ietf-reassessment-2026-10-18.md) also checks
+original RFCs, verified errata and independent implementations. Exact-code
+assertions in this ledger describe this implementation's chosen regression
+contract; they do not exclude deliberate HTTP/3 general protocol errors
+(RFC 9114 §8.1), HTTP/2 generic error substitution (RFC 9113 §5.4), or permitted
+stream-to-connection escalation. The observed client cancellation/no-error
+paths did not select those allowed protocol-error alternatives.
+
 ## Acceptance and complete client inventory
 
 Mandatory IETF behavior takes precedence. The goal is interoperability with
