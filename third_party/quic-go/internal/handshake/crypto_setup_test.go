@@ -334,6 +334,38 @@ func TestTransportParameters(t *testing.T) {
 	require.Equal(t, 42*time.Second, serverReceivedTransportParameters.MaxIdleTimeout)
 }
 
+func TestHandshakeZeroIdleTimeoutTransportParameter(t *testing.T) {
+	clientConf, serverConf := getTLSConfigs()
+	_, clientEvents, clientErr, _, serverEvents, serverErr := handshakeWithTLSConf(
+		t, clientConf, serverConf,
+		utils.NewRTTStats(), utils.NewRTTStats(),
+		&wire.TransportParameters{ActiveConnectionIDLimit: 2},
+		&wire.TransportParameters{ActiveConnectionIDLimit: 2, MaxIdleTimeout: 30 * time.Second},
+		false,
+	)
+	require.NoError(t, clientErr)
+	require.NoError(t, serverErr)
+	for _, tc := range []struct {
+		name   string
+		events []Event
+		want   time.Duration
+	}{
+		{name: "server receives explicit zero", events: serverEvents, want: 0},
+		{name: "client receives positive timeout", events: clientEvents, want: 30 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got *wire.TransportParameters
+			for _, ev := range tc.events {
+				if ev.Kind == EventReceivedTransportParameters {
+					got = ev.TransportParameters
+				}
+			}
+			require.NotNil(t, got)
+			require.Equal(t, tc.want, got.MaxIdleTimeout)
+		})
+	}
+}
+
 func TestNewSessionTicketAtWrongEncryptionLevel(t *testing.T) {
 	clientConf, serverConf := getTLSConfigs()
 	client, _, clientErr, _, _, serverErr := handshakeWithTLSConf(

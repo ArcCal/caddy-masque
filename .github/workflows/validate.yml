@@ -72,10 +72,15 @@ jobs:
       - name: Patched QUIC transport regressions
         working-directory: third_party/quic-go
         run: |
-          go test . ./internal/ackhandler ./internal/congestion ./internal/wire
+          go test . ./internal/... ./quicvarint ./qlog
           # The baseline allocation-count assertion is instrument-sensitive;
           # it runs above without race instrumentation. Keep all functional cases.
-          go test -race -skip '^TestFrameParserAllocs$' . ./internal/ackhandler ./internal/congestion ./internal/wire
+          go test -race -skip '^TestFrameParserAllocs$' . ./internal/... ./quicvarint ./qlog
+          # Exercise actual UDP migration, path budgets and MTU validation
+          # against both QUIC versions, including the unchanged transfer controls.
+          for version in 1 2; do
+            go test -race -count=1 -run '^(TestNATRebinding.*|TestPathValidation.*|TestConnectionMigration|TestPathMTUDiscovery|TestDatagram.*|TestKeyUpdates|TestStatelessResets)$' ./integrationtests/self -args -version="$version"
+          done
 
   e2e:
     name: end-to-end with masque-client (Go ${{ matrix.go }}, ${{ matrix.runner }})

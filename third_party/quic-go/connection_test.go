@@ -25,6 +25,7 @@ import (
 	"github.com/quic-go/quic-go/internal/wire"
 	"github.com/quic-go/quic-go/qlog"
 	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/quic-go/quic-go/testutils/events"
 
 	"github.com/stretchr/testify/assert"
@@ -1426,6 +1427,10 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 	data, err = (&wire.HandshakeDoneFrame{}).Append(nil, protocol.Version1)
 	require.NoError(t, err)
 	done := make(chan struct{})
+	var nextConnID protocol.ConnectionID
+	if usePreferredAddress {
+		tc.connRunner.EXPECT().AddResetToken(preferredAddressResetToken, gomock.Any())
+	}
 	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).Return(nil, nil).AnyTimes()
 	gomock.InOrder(
 		unpacker.EXPECT().UnpackLongHeader(gomock.Any(), gomock.Any()).Return(
@@ -1435,6 +1440,8 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 		cs.EXPECT().SetHandshakeConfirmed(),
 		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
 			func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version) (shortHeaderPacket, error) {
+				// CID selection mutates the manager and belongs to the connection run loop.
+				nextConnID = tc.conn.connIDManager.Get()
 				close(done)
 				return shortHeaderPacket{}, errNothingToPack
 			},
@@ -1450,10 +1457,6 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 		t.Fatal("timeout")
 	}
 
-	if usePreferredAddress {
-		tc.connRunner.EXPECT().AddResetToken(preferredAddressResetToken, gomock.Any())
-	}
-	nextConnID := tc.conn.connIDManager.Get()
 	if usePreferredAddress {
 		require.Equal(t, preferredAddressConnID, nextConnID)
 	}
@@ -2034,6 +2037,76 @@ func TestConnectionIdleTimeout(t *testing.T) {
 			t.Fatal("should have timed out")
 		}
 	})
+}
+
+func TestConnectionDecodedPeerIdleTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		encoded []byte
+		want    time.Duration
+	}{
+		{name: "omitted", want: 30 * time.Second},
+		{name: "explicit zero", encoded: []byte{0}, want: 30 * time.Second},
+		{name: "smaller positive", encoded: quicvarint.Append(nil, 10000), want: 10 * time.Second},
+		{name: "larger positive", encoded: quicvarint.Append(nil, 60000), want: 30 * time.Second},
+		{name: "large valid varint", encoded: quicvarint.Append(nil, quicvarint.Max), want: 30 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newServerTestConnection(t, nil, &Config{MaxIdleTimeout: 30 * time.Second}, false,
+				connectionOptHandshakeConfirmed(), connectionOptRTT(time.Millisecond)).conn
+			b := []byte{0x0f, 0} // required initial_source_connection_id, with a zero-length ID
+			if tc.encoded != nil {
+				b = append(b, 0x01, byte(len(tc.encoded))) // max_idle_timeout
+				b = append(b, tc.encoded...)
+			}
+			var params wire.TransportParameters
+			require.NoError(t, params.Unmarshal(b, protocol.PerspectiveClient))
+			require.NoError(t, c.handleTransportParameters(&params))
+			require.Equal(t, tc.want, c.idleTimeout)
+			require.Equal(t, tc.want, c.nextIdleTimeoutTime().Sub(c.idleTimeoutStartTime()))
+		})
+	}
+}
+
+func TestConnectionPathResponseBatchFitsAllowance(t *testing.T) {
+	tc := newServerTestConnection(t, nil, nil, false, connectionOptHandshakeConfirmed())
+	connID := protocol.ParseConnectionID([]byte{1, 2, 3, 4})
+	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1234}
+	pm := newPathManager(func(pathID) (protocol.ConnectionID, bool) { return connID, true }, func(pathID) {}, utils.DefaultLogger)
+	tc.conn.pathManager = pm
+	challenges := make([]*wire.PathChallengeFrame, 130)
+	for i := range challenges {
+		challenges[i] = &wire.PathChallengeFrame{Data: [8]byte{byte(i)}}
+	}
+	_, frames, _ := pm.HandlePacket(addr, monotime.Now(), challenges, false, 1195, packetInfo{})
+	var sentFrames []wire.Frame
+	var sentBytes protocol.ByteCount
+	var pn protocol.PacketNumber
+	tc.packer.EXPECT().PackPathProbePacket(connID, gomock.Any(), protocol.ByteCount(1200), protocol.Version1).DoAndReturn(
+		func(_ protocol.ConnectionID, frames []ackhandler.Frame, maxSize protocol.ByteCount, _ protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+			var frameBytes protocol.ByteCount
+			for _, frame := range frames {
+				frameBytes += frame.Frame.Length(protocol.Version1)
+				sentFrames = append(sentFrames, frame.Frame)
+			}
+			require.LessOrEqual(t, frameBytes+25, maxSize)
+			buf := getPacketBuffer()
+			buf.Data = append(buf.Data, make([]byte, int(maxSize))...)
+			p := shortHeaderPacket{PacketNumber: pn, Frames: frames, Length: maxSize, IsPathProbePacket: true}
+			pn++
+			return p, buf, nil
+		}).Times(2)
+	tc.sendConn.EXPECT().WriteTo(gomock.Any(), addr, packetInfo{}).DoAndReturn(func(b []byte, _ net.Addr, _ packetInfo) error {
+		sentBytes += protocol.ByteCount(len(b))
+		return nil
+	}).Times(2)
+	require.NoError(t, tc.conn.sendPathProbeFrames(connID, frames, addr, packetInfo{}, monotime.Now(), 0))
+	require.Len(t, sentFrames, 131)
+	for _, challenge := range challenges {
+		require.Contains(t, sentFrames, &wire.PathResponseFrame{Data: challenge.Data})
+	}
+	require.LessOrEqual(t, sentBytes, protocol.ByteCount(3*1195))
+	require.Equal(t, protocol.ByteCount(1185), pm.ProbeSize(addr))
 }
 
 func TestConnectionKeepAlive(t *testing.T) {
@@ -3265,26 +3338,38 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 		if isNATRebinding {
 			payload = []byte{1} // PING frame
 		}
+		var packedFrames []ackhandler.Frame
+		var nextPackedPN protocol.PacketNumber
+		tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.ByteCount, _ protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+				packedFrames = frames
+				buf := getPacketBuffer()
+				buf.Data = append(buf.Data, make([]byte, protocol.MinInitialPacketSize)...)
+				packet := shortHeaderPacket{PacketNumber: nextPackedPN, Frames: frames, Length: protocol.MinInitialPacketSize, IsPathProbePacket: true}
+				nextPackedPN++
+				return packet, buf, nil
+			},
+		).AnyTimes()
+		// Revalidation of the previously active path is covered separately.
+		tc.sendConn.EXPECT().WriteTo(gomock.Any(), tc.remoteAddr, packetInfo{}).AnyTimes()
 		gomock.InOrder(
 			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
 				protocol.PacketNumber(10), protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
 			),
-			tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
-					pathChallenge = frames[0].Frame.(*wire.PathChallengeFrame)
-					return shortHeaderPacket{IsPathProbePacket: true}, getPacketBuffer(), nil
-				},
-			),
 			tc.sendConn.EXPECT().WriteTo(gomock.Any(), newRemoteAddr, packetInfo{}).DoAndReturn(
-				func([]byte, net.Addr, packetInfo) error { close(probeSent); return nil },
+				func([]byte, net.Addr, packetInfo) error {
+					pathChallenge = packedFrames[0].Frame.(*wire.PathChallengeFrame)
+					close(probeSent)
+					return nil
+				},
 			),
 			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
 				shortHeaderPacket{}, errNothingToPack,
-			),
+			).AnyTimes(),
 		)
 
 		tc.conn.handlePacket(receivedPacket{
-			data:       make([]byte, 10),
+			data:       make([]byte, protocol.MinInitialPacketSize),
 			buffer:     getPacketBuffer(),
 			remoteAddr: newRemoteAddr,
 			rcvTime:    monotime.Now(),
@@ -3432,8 +3517,8 @@ func testConnectionMigration(t *testing.T, enabled bool) {
 		shortHeaderPacket{}, errNothingToPack,
 	).AnyTimes()
 	packedProbe := make(chan struct{})
-	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-		func(protocol.ConnectionID, []ackhandler.Frame, protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(protocol.ConnectionID, []ackhandler.Frame, protocol.ByteCount, protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
 			defer close(packedProbe)
 			return shortHeaderPacket{IsPathProbePacket: true}, getPacketBuffer(), nil
 		},

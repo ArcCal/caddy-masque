@@ -1,19 +1,368 @@
 diff --git a/http2/conformance_test.go b/http2/conformance_test.go
 new file mode 100644
-index 0000000..7482679
+index 0000000..6f1e6a8
 --- /dev/null
 +++ b/http2/conformance_test.go
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,642 @@
 +package http2_test
 +
 +import (
 +	"fmt"
 +	"io"
++	"math"
 +	"net/http"
 +	"testing"
++	"testing/synctest"
 +
 +	. "golang.org/x/net/http2"
 +)
++
++// Each received SETTINGS frame needs its own ACK even while the peer blocks writes.
++func TestServerSettingsAcknowledgmentsDuringWrite(t *testing.T) {
++	synctestTest(t, func(t testing.TB) {
++		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
++		defer st.Close()
++		st.greet()
++		st.cc.(*synctestNetConn).SetReadBufferSize(0)
++		st.bodylessReq1()
++		synctest.Wait()
++		for i := 0; i < 3; i++ {
++			st.writeSettings()
++		}
++		synctest.Wait()
++		st.cc.(*synctestNetConn).SetReadBufferSize(math.MaxInt)
++		st.wantHeaders(wantHeader{streamID: 1, endStream: true, header: http.Header{":status": {"204"}}})
++		for i := 0; i < 3; i++ {
++			st.wantSettingsAck()
++		}
++		st.writeHeaders(HeadersFrameParam{StreamID: 3, BlockFragment: st.encodeHeader(), EndHeaders: true, EndStream: true})
++		st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
++	})
++}
++
++func TestServerSettingsAckQueueBound(t *testing.T) {
++	DisableGoroutineTracking(t)
++	synctestTest(t, func(t testing.TB) {
++		st := newServerTester(t, nil)
++		defer st.Close()
++		st.greet()
++		st.cc.(*synctestNetConn).SetReadBufferSize(0)
++		st.cc.(*synctestNetConn).autoWait = false
++		for i := 0; i < MaxQueuedControlFrames+3; i++ {
++			st.fr.WriteSettings()
++		}
++		synctest.Wait()
++		st.cc.(*synctestNetConn).SetReadBufferSize(math.MaxInt)
++		st.advance(GoAwayTimeout)
++		for st.readFrame() != nil {
++		}
++		st.wantClosed()
++	})
++}
++
++func TestServerRequestContentLengthEndingConformance(t *testing.T) {
++	for _, ending := range []string{"headers-fin", "data-fin", "trailers-fin"} {
++		for _, length := range []string{"0", "1"} {
++			for _, body := range []string{"", "x"} {
++				if ending == "headers-fin" && body != "" {
++					continue
++				}
++				t.Run(fmt.Sprintf("%s/length-%s/body-%d", ending, length, len(body)), func(t *testing.T) {
++					synctestTest(t, func(t testing.TB) {
++						st := newServerTester(t, nil)
++						defer st.Close()
++						st.greet()
++						st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeader(":method", "POST", "content-length", length), EndHeaders: true, EndStream: ending == "headers-fin"})
++						var call *serverHandlerCall
++						if ending != "headers-fin" {
++							call = st.nextHandlerCall()
++						}
++						if ending == "data-fin" {
++							st.writeData(1, true, []byte(body))
++						}
++						if ending == "trailers-fin" {
++							if body != "" {
++								st.writeData(1, false, []byte(body))
++							}
++							if length != "0" || body == "" {
++								st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeaderRaw(), EndHeaders: true, EndStream: true})
++							}
++						}
++						valid := length == fmt.Sprint(len(body))
++						if !valid {
++							st.wantRSTStream(1, ErrCodeProtocol)
++						}
++						if call == nil && valid {
++							call = st.nextHandlerCall()
++						}
++						if call != nil {
++							call.do(func(w http.ResponseWriter, r *http.Request) {
++								got, err := io.ReadAll(r.Body)
++								if (err == nil) != valid {
++									t.Errorf("body error = %v, valid = %v", err, valid)
++								}
++								if valid && string(got) != body {
++									t.Errorf("body = %q, want %q", got, body)
++								}
++								w.WriteHeader(http.StatusNoContent)
++							})
++							call.exit()
++						}
++						if valid {
++							st.wantHeaders(wantHeader{streamID: 1, endStream: true, header: http.Header{":status": {"204"}}})
++						}
++						st.writeHeaders(HeadersFrameParam{StreamID: 3, BlockFragment: st.encodeHeader(":path", "/control"), EndHeaders: true, EndStream: true})
++						control := st.nextHandlerCall()
++						control.do(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
++						control.exit()
++						st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
++					})
++				})
++			}
++		}
++	}
++}
++
++func TestServerInvalidRequestContentLength(t *testing.T) {
++	for _, values := range [][]string{{""}, {"+1"}, {"-1"}, {"abc"}, {"1, 2"}, {"1", "2"}, {"9223372036854775808"}} {
++		for _, end := range []bool{false, true} {
++			t.Run(fmt.Sprintf("%q/end-%v", values, end), func(t *testing.T) {
++				synctestTest(t, func(t testing.TB) {
++					st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++						if r.URL.Path != "/control" {
++							t.Error("invalid content length reached handler")
++						}
++						w.WriteHeader(http.StatusNoContent)
++					})
++					defer st.Close()
++					st.greet()
++					fields := []string{":method", "POST", ":scheme", "https", ":authority", "example.com", ":path", "/"}
++					for _, value := range values {
++						fields = append(fields, "content-length", value)
++					}
++					st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeaderRaw(fields...), EndHeaders: true, EndStream: end})
++					st.wantRSTStream(1, ErrCodeProtocol)
++					st.writeHeaders(HeadersFrameParam{StreamID: 3, BlockFragment: st.encodeHeader(":path", "/control"), EndHeaders: true, EndStream: true})
++					st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
++				})
++			})
++		}
++	}
++}
++
++func TestServerConnectContentLengthEnding(t *testing.T) {
++	t.Run("initial-headers-fin", func(t *testing.T) {
++		synctestTest(t, func(t testing.TB) {
++			st := newServerTester(t, nil)
++			defer st.Close()
++			st.greet()
++			st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeaderRaw(":method", "CONNECT", ":authority", "example.com:443", "content-length", "1"), EndHeaders: true, EndStream: true})
++			call := st.nextHandlerCall()
++			call.do(func(w http.ResponseWriter, r *http.Request) {
++				if r.ContentLength != 0 {
++					t.Errorf("ended CONNECT content length = %d, want original 0", r.ContentLength)
++				}
++				if body, err := io.ReadAll(r.Body); err != nil || len(body) != 0 {
++					t.Errorf("ended CONNECT body = %q, %v", body, err)
++				}
++				w.WriteHeader(http.StatusOK)
++				w.(http.Flusher).Flush()
++			})
++			st.wantHeaders(wantHeader{streamID: 1, header: http.Header{":status": {"200"}}})
++			call.exit()
++			st.wantData(wantData{streamID: 1, endStream: true})
++			st.writeHeaders(HeadersFrameParam{StreamID: 3, BlockFragment: st.encodeHeader(), EndHeaders: true, EndStream: true})
++			control := st.nextHandlerCall()
++			control.do(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
++			control.exit()
++			st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
++		})
++	})
++	for _, status := range []int{200, 403} {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			synctestTest(t, func(t testing.TB) {
++				st := newServerTester(t, nil)
++				defer st.Close()
++				st.greet()
++				st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeaderRaw(":method", "CONNECT", ":authority", "example.com:443", "content-length", "1"), EndHeaders: true})
++				call := st.nextHandlerCall()
++				call.do(func(w http.ResponseWriter, r *http.Request) {
++					w.WriteHeader(status)
++					w.(http.Flusher).Flush()
++				})
++				st.wantHeaders(wantHeader{streamID: 1, header: http.Header{":status": {fmt.Sprint(status)}}})
++				st.writeData(1, true, nil)
++				// CONNECT has no HTTP message content. Preserve the existing
++				// Body.Read error without adding an HTTP content-length reset
++				// for tunnel DATA (RFC 9110 section 9.3.6, RFC 9113 section 8.1.1).
++				call.do(func(w http.ResponseWriter, r *http.Request) {
++					if _, err := io.ReadAll(r.Body); err == nil {
++						t.Error("expected existing body length error")
++					}
++				})
++				call.exit()
++				st.wantData(wantData{streamID: 1, endStream: true})
++				st.writeHeaders(HeadersFrameParam{StreamID: 3, BlockFragment: st.encodeHeader(), EndHeaders: true, EndStream: true})
++				control := st.nextHandlerCall()
++				control.do(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
++				control.exit()
++				st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
++			})
++		})
++	}
++}
++
++func TestServerPriorityUpdateConformance(t *testing.T) {
++	for _, tt := range []struct {
++		name, state, priority string
++		id                    uint32
++		valid                 bool
++	}{
++		{"idle-push", "idle", "u=1", 2, false},
++		{"idle-at-stream-limit", "active", "u=1", 3, false},
++		{"unparsable-idle", "idle", "Invalid dictionary: (((", 1, false},
++		{"legal-idle-request", "idle", "u=1", 1, true},
++		{"active-request", "active", "u=1", 1, true},
++		{"closed-request", "closed", "u=1", 1, true},
++		{"unknown-and-out-of-range", "idle", "u=8, i=42, unknown=?1", 1, true},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			synctestTest(t, func(t testing.TB) {
++				st := newServerTester(t, nil, func(s *Server) {
++					s.MaxConcurrentStreams = 1
++					s.NewWriteScheduler = NewPriorityWriteSchedulerRFC9218
++				})
++				defer st.Close()
++				st.greet()
++				var call *serverHandlerCall
++				var lastStream uint32
++				if tt.state != "idle" {
++					st.bodylessReq1()
++					call = st.nextHandlerCall()
++					lastStream = 1
++					if tt.state == "closed" {
++						call.do(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
++						call.exit()
++						st.wantHeaders(wantHeader{streamID: 1, endStream: true, header: http.Header{":status": {"204"}}})
++					}
++				}
++				st.writePriorityUpdate(tt.id, tt.priority)
++				if !tt.valid {
++					st.wantGoAway(lastStream, ErrCodeProtocol)
++					return
++				}
++				st.writePing(false, [8]byte{1})
++				if ping := readFrame[*PingFrame](t, st); !ping.IsAck() || ping.Data != [8]byte{1} {
++					t.Errorf("unexpected PING response: %v", ping)
++				}
++				if tt.state == "active" {
++					call.do(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
++					call.exit()
++					st.wantHeaders(wantHeader{streamID: 1, endStream: true, header: http.Header{":status": {"204"}}})
++				}
++				id := lastStream + 2
++				if lastStream == 0 {
++					id = 1
++				}
++				st.writeHeaders(HeadersFrameParam{StreamID: id, BlockFragment: st.encodeHeader(), EndHeaders: true, EndStream: true})
++				control := st.nextHandlerCall()
++				control.do(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
++				control.exit()
++				st.wantHeaders(wantHeader{streamID: id, endStream: true, header: http.Header{":status": {"204"}}})
++			})
++		})
++	}
++}
++
++func TestServerSwitchingProtocolsResponse(t *testing.T) {
++	for _, status := range []int{100, 101, 103} {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			synctestTest(t, func(t testing.TB) {
++				st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++					if r.URL.Path != "/control" {
++						w.WriteHeader(status)
++					}
++					w.WriteHeader(http.StatusNoContent)
++				})
++				defer st.Close()
++				st.greet()
++				st.bodylessReq1()
++				if status == 101 {
++					st.wantRSTStream(1, ErrCodeInternal)
++				} else {
++					st.wantHeaders(wantHeader{streamID: 1, header: http.Header{":status": {fmt.Sprint(status)}}})
++					st.wantHeaders(wantHeader{streamID: 1, endStream: true, header: http.Header{":status": {"204"}}})
++				}
++				st.writeHeaders(HeadersFrameParam{StreamID: 3, BlockFragment: st.encodeHeader(":path", "/control"), EndHeaders: true, EndStream: true})
++				st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
++			})
++		})
++	}
++}
++
++func TestServerReceiveFlowControlErrorConformance(t *testing.T) {
++	for _, state := range []string{"open", "ended", "reset", "content-length-overrun"} {
++		t.Run("connection-window/"+state, func(t *testing.T) {
++			synctestTest(t, func(t testing.TB) {
++				const window = 65535 * 2
++				st := newServerTester(t, nil, func(s *Server) {
++					s.MaxUploadBufferPerConnection = window
++					s.MaxUploadBufferPerStream = window
++				})
++				defer st.Close()
++				st.greet()
++				fields := []string{":method", "POST"}
++				if state == "content-length-overrun" {
++					fields = append(fields, "content-length", "0")
++				}
++				st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeader(fields...), EndHeaders: true, EndStream: state == "ended"})
++				_ = st.nextHandlerCall()
++				if state == "reset" {
++					if err := st.fr.WriteRSTStream(1, ErrCodeCancel); err != nil {
++						t.Fatal(err)
++					}
++				}
++				st.writeData(1, false, make([]byte, window+1))
++				st.wantGoAway(1, ErrCodeFlowControl)
++			})
++		})
++	}
++	t.Run("stream-window-refunds-full-padded-frame", func(t *testing.T) {
++		synctestTest(t, func(t testing.TB) {
++			st := newServerTester(t, nil, func(s *Server) {
++				s.MaxUploadBufferPerConnection = 65535 * 2
++				s.MaxUploadBufferPerStream = 4096
++			})
++			defer st.Close()
++			st.greet()
++			st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeader(":method", "POST"), EndHeaders: true})
++			call := st.nextHandlerCall()
++			st.writeDataPadded(1, false, make([]byte, 8190), make([]byte, 1))
++			st.wantUnorderedFrames(
++				func(f *RSTStreamFrame) bool { return f.StreamID == 1 && f.ErrCode == ErrCodeFlowControl },
++				func(f *WindowUpdateFrame) bool { return f.StreamID == 0 && f.Increment == 8192 },
++			)
++			call.do(func(w http.ResponseWriter, r *http.Request) {
++				if _, err := io.ReadAll(r.Body); err == nil {
++					t.Error("expected stream error")
++				}
++			})
++			call.exit()
++			st.writeHeaders(HeadersFrameParam{StreamID: 3, BlockFragment: st.encodeHeader(":method", "POST", "content-length", "4096"), EndHeaders: true})
++			control := st.nextHandlerCall()
++			st.writeData(3, true, make([]byte, 4096))
++			control.do(func(w http.ResponseWriter, r *http.Request) {
++				if body, err := io.ReadAll(r.Body); err != nil || len(body) != 4096 {
++					t.Errorf("control body = %d bytes, %v", len(body), err)
++				}
++				w.WriteHeader(http.StatusNoContent)
++			})
++			st.wantWindowUpdate(0, 4096)
++			control.exit()
++			st.wantHeaders(wantHeader{streamID: 3, endStream: true, header: http.Header{":status": {"204"}}})
++		})
++	})
++}
 +
 +// Send raw HPACK fields so the transport cannot supply missing pseudo-headers
 +// or normalize invalid values. Every rejection must leave another request usable.
@@ -309,9 +658,19 @@ index a6bffd1..c75411b 100644
 +		if !httpguts.ValidHeaderFieldValue(v) || len(v) > 0 &&
 +			(v[0] == ' ' || v[0] == '\t' || v[len(v)-1] == ' ' || v[len(v)-1] == '\t') {
 diff --git a/http2/server.go b/http2/server.go
-index 74ba441..400ca6c 100644
+index 74ba441..b29eeac 100644
 --- a/http2/server.go
 +++ b/http2/server.go
+@@ -433,3 +433,3 @@ type serverConn struct {
+-	sawClientPreface            bool // preface has already been read, used in h2c upgrade
+-	sawFirstSettings            bool // got the initial SETTINGS frame after the preface
+-	needToSendSettingsAck       bool
++	sawClientPreface            bool   // preface has already been read, used in h2c upgrade
++	sawFirstSettings            bool   // got the initial SETTINGS frame after the preface
++	pendingSettingsAcks         int    // one ACK per received SETTINGS frame
+@@ -440 +440 @@ type serverConn struct {
+-	queuedControlFrames         int    // control frames in the writeSched queue
++	queuedControlFrames         int    // queued control frames, including pending SETTINGS ACKs
 @@ -520,0 +521 @@ type stream struct {
 +	isConnect bool        // request method is CONNECT
 @@ -533,0 +535 @@ type stream struct {
@@ -322,16 +681,59 @@ index 74ba441..400ca6c 100644
 +			// the peer, including when the write runs asynchronously.
 +			st.connectAccepted = true
 +		}
-@@ -1982 +1989 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
+@@ -1295,2 +1302,3 @@ func (sc *serverConn) scheduleFrameWrite() {
+-		if sc.needToSendSettingsAck {
+-			sc.needToSendSettingsAck = false
++		if sc.pendingSettingsAcks > 0 {
++			sc.pendingSettingsAcks--
++			sc.queuedControlFrames--
+@@ -1641,3 +1649,4 @@ func (sc *serverConn) processSettings(f *SettingsFrame) error {
+-	// TODO: judging by RFC 7540, Section 6.5.3 each SETTINGS frame should be
+-	// acknowledged individually, even if multiple are received before the ACK.
+-	sc.needToSendSettingsAck = true
++	// RFC 9113 section 6.5.3 requires one acknowledgment per SETTINGS frame.
++	// Preserve ACK priority while charging the existing control-frame budget.
++	sc.pendingSettingsAcks++
++	sc.queuedControlFrames++
+@@ -1740 +1749 @@ func (sc *serverConn) processData(f *DataFrame) error {
+-			return sc.countError("data_flow", streamError(id, ErrCodeFlowControl))
++			return sc.countError("data_flow", ConnectionError(ErrCodeFlowControl))
+@@ -1757 +1766 @@ func (sc *serverConn) processData(f *DataFrame) error {
+-			return sc.countError("data_flow", streamError(id, ErrCodeFlowControl))
++			return sc.countError("data_flow", ConnectionError(ErrCodeFlowControl))
+@@ -1768,2 +1777,8 @@ func (sc *serverConn) processData(f *DataFrame) error {
+-		// Check whether the client has flow control quota.
+-		if !takeInflows(&sc.inflow, &st.inflow, f.Length) {
++		// Account for all DATA against the connection window, even when
++		// rejecting it for a stream error (RFC 9113 section 6.9).
++		if !sc.inflow.take(f.Length) {
++			return sc.countError("data_flow", ConnectionError(ErrCodeFlowControl))
++		}
++		if !st.inflow.take(f.Length) {
++			// Discard the offending DATA and return connection credit only.
++			sc.sendWindowUpdate(nil, int(f.Length))
+@@ -1798 +1813 @@ func (sc *serverConn) processData(f *DataFrame) error {
+-		st.endStream()
++		return st.endStream()
+@@ -1824 +1839 @@ func (st *stream) isPushed() bool {
+-func (st *stream) endStream() {
++func (st *stream) endStream() error {
+@@ -1830,0 +1846,3 @@ func (st *stream) endStream() {
++		if !st.isConnect {
++			return sc.countError("request_body_length", streamError(st.id, ErrCodeProtocol))
++		}
+@@ -1835,0 +1854 @@ func (st *stream) endStream() {
++	return nil
+@@ -1982 +2001 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
 -		handler = new400Handler(err)
 +		return sc.countError("bad_headers", StreamError{StreamID: id, Code: ErrCodeProtocol, Cause: err})
-@@ -2026,0 +2034,5 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
+@@ -2026,0 +2046,5 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
 +	if st.connectAccepted {
 +		// RFC 9113 section 8.5 allows only DATA and stream-management
 +		// frames on an established CONNECT stream, not HTTP trailers.
 +		return sc.countError("connect_trailers", streamError(st.id, ErrCodeProtocol))
 +	}
-@@ -2038,9 +2050,8 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
+@@ -2038,9 +2062,8 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
 -	if st.trailer != nil {
 -		for _, hf := range f.RegularFields() {
 -			key := sc.canonicalHeader(hf.Name)
@@ -349,7 +751,26 @@ index 74ba441..400ca6c 100644
 +			return sc.countError("trailers_bogus", streamError(st.id, ErrCodeProtocol))
 +		}
 +		if st.trailer != nil {
-@@ -2138,0 +2150,13 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+@@ -2050,2 +2073 @@ func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
+-	st.endStream()
+-	return nil
++	return st.endStream()
+@@ -2085,0 +2108,9 @@ func (sc *serverConn) processPriorityUpdate(f *PriorityUpdateFrame) error {
++	state, _ := sc.state(f.PrioritizedStreamID)
++	if state == stateIdle {
++		// RFC 9218 section 7.1 forbids prioritizing idle push streams.
++		// The scheduler buffers only the most recent idle update, so at
++		// most one idle stream adds to the concurrent request-stream count.
++		if f.PrioritizedStreamID%2 == 0 || sc.curClientStreams >= sc.advMaxStreams {
++			return sc.countError("priority_update_idle", ConnectionError(ErrCodeProtocol))
++		}
++	}
+@@ -2088 +2119,3 @@ func (sc *serverConn) processPriorityUpdate(f *PriorityUpdateFrame) error {
+-		return sc.countError("unparsable_priority_update", streamError(f.PrioritizedStreamID, ErrCodeProtocol))
++		// Section 7 permits a connection error. A reset would itself be
++		// invalid when the prioritized request stream is still idle.
++		return sc.countError("unparsable_priority_update", ConnectionError(ErrCodeProtocol))
+@@ -2138,0 +2172,13 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 +	var hasProtocol, hasScheme, hasPath, hasAuthority bool
 +	for _, hf := range f.PseudoFields() {
 +		switch hf.Name {
@@ -363,10 +784,10 @@ index 74ba441..400ca6c 100644
 +			hasAuthority = true
 +		}
 +	}
-@@ -2141 +2165 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+@@ -2141 +2187 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 -	if disableExtendedConnectProtocol && rp.Protocol != "" {
 +	if disableExtendedConnectProtocol && hasProtocol {
-@@ -2146,2 +2170,18 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+@@ -2146,2 +2192,18 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 -	if isConnect {
 -		if rp.Protocol == "" && (rp.Path != "" || rp.Scheme != "" || rp.Authority == "") {
 +	if !httpguts.ValidHeaderFieldName(rp.Method) {
@@ -387,10 +808,10 @@ index 74ba441..400ca6c 100644
 +		}
 +	} else if isConnect {
 +		if hasPath || hasScheme || rp.Authority == "" {
-@@ -2150 +2190 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+@@ -2150 +2212 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 -	} else if rp.Method == "" || rp.Path == "" || (rp.Scheme != "https" && rp.Scheme != "http") {
 +	} else if rp.Path == "" {
-@@ -2169 +2209,6 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+@@ -2169 +2231,6 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 -	if rp.Authority == "" {
 +	if hasAuthority && rp.Authority == "" && header.Get("Host") != "" {
 +		// RFC 9113 section 8.3.1 forbids using Host in place of a present
@@ -398,7 +819,35 @@ index 74ba441..400ca6c 100644
 +		return nil, nil, sc.countError("authority_host_mismatch", streamError(f.StreamID, ErrCodeProtocol))
 +	}
 +	if !hasAuthority {
-@@ -2197,0 +2243,15 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+@@ -2181,9 +2248,13 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
+-	if bodyOpen {
+-		if vv, ok := rp.Header["Content-Length"]; ok {
+-			if cl, err := strconv.ParseUint(vv[0], 10, 63); err == nil {
+-				req.ContentLength = int64(cl)
+-			} else {
+-				req.ContentLength = 0
+-			}
+-		} else {
+-			req.ContentLength = -1
++	if vv, ok := rp.Header["Content-Length"]; ok {
++		if len(vv) != 1 {
++			return nil, nil, sc.countError("bad_content_length", streamError(st.id, ErrCodeProtocol))
++		}
++		cl, err := strconv.ParseUint(vv[0], 10, 63)
++		if err != nil {
++			return nil, nil, sc.countError("bad_content_length", streamError(st.id, ErrCodeProtocol))
++		}
++		if bodyOpen {
++			req.ContentLength = int64(cl)
++		}
++		if !bodyOpen && !isConnect && cl != 0 {
++			return nil, nil, sc.countError("request_body_length", streamError(st.id, ErrCodeProtocol))
+@@ -2190,0 +2262,4 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
++	} else if bodyOpen {
++		req.ContentLength = -1
++	}
++	if bodyOpen {
+@@ -2197,0 +2273,15 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 +// validURIScheme applies RFC 3986 section 3.1. RFC 9113 section 8.3.1
 +// permits schemes other than http and https.
 +func validURIScheme(s string) bool {
@@ -414,12 +863,15 @@ index 74ba441..400ca6c 100644
 +	return true
 +}
 +
-@@ -2234,0 +2295 @@ func (sc *serverConn) newResponseWriter(st *stream, req *http.Request) *response
+@@ -2234,0 +2325 @@ func (sc *serverConn) newResponseWriter(st *stream, req *http.Request) *response
 +	st.isConnect = req.Method == "CONNECT"
-@@ -3182 +3243 @@ var connHeaders = []string{
+@@ -2853 +2944 @@ func checkWriteHeaderCode(code int) {
+-	if code < 100 || code > 999 {
++	if code < 100 || code > 999 || code == http.StatusSwitchingProtocols {
+@@ -3182 +3273 @@ var connHeaders = []string{
 -// per RFC 7540 Section 8.1.2.2.
 +// per RFC 9113 Section 8.2.2.
-@@ -3190,3 +3251,10 @@ func checkValidHTTP2RequestHeaders(h http.Header) error {
+@@ -3190,3 +3281,10 @@ func checkValidHTTP2RequestHeaders(h http.Header) error {
 -	te := h["Te"]
 -	if len(te) > 0 && (len(te) > 1 || (te[0] != "trailers" && te[0] != "")) {
 -		return errors.New(`request header "TE" may only be "trailers" in HTTP/2`)
@@ -433,7 +885,7 @@ index 74ba441..400ca6c 100644
 +		if !valid {
 +			return errors.New(`request header "TE" may only be "trailers" in HTTP/2`)
 +		}
-@@ -3197,6 +3264,0 @@ func checkValidHTTP2RequestHeaders(h http.Header) error {
+@@ -3197,6 +3294,0 @@ func checkValidHTTP2RequestHeaders(h http.Header) error {
 -func new400Handler(err error) http.HandlerFunc {
 -	return func(w http.ResponseWriter, r *http.Request) {
 -		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -458,7 +910,7 @@ index feab790..a22e9f5 100644
 +			want: errors.New(`request header "TE" may only be "trailers" in HTTP/2`),
 +		},
 diff --git a/http2/server_test.go b/http2/server_test.go
-index b7e4d62..41d1fab 100644
+index b7e4d62..9a3e731 100644
 --- a/http2/server_test.go
 +++ b/http2/server_test.go
 @@ -452,2 +452,4 @@ func testServer_Request_Get_Host(t testing.TB) {
@@ -471,7 +923,30 @@ index b7e4d62..41d1fab 100644
 @@ -627 +629 @@ func TestServer_Request_Reject_Pseudo_scheme_invalid(t *testing.T) {
 -	testRejectRequest(t, func(st *serverTester) { st.bodylessReq1(":scheme", "bogus") })
 +	testRejectRequest(t, func(st *serverTester) { st.bodylessReq1(":scheme", "1bogus") })
-@@ -3053,10 +3055,2 @@ func testServer_Rejects_ConnHeaders(t testing.TB) {
+@@ -1330 +1332 @@ func testServer_Rejects_PriorityUnparsable(t testing.TB) {
+-	st.wantRSTStream(1, ErrCodeProtocol)
++	st.wantGoAway(0, ErrCodeProtocol)
+@@ -1510 +1512 @@ func TestServerRejectsContentLengthWithSignNewRequests(t *testing.T) {
+-			name:   "ignore cl with plus sign",
++			name:   "reject cl with plus sign",
+@@ -1515 +1517 @@ func TestServerRejectsContentLengthWithSignNewRequests(t *testing.T) {
+-			name:   "ignore cl with minus sign",
++			name:   "reject cl with minus sign",
+@@ -1525 +1527 @@ func TestServerRejectsContentLengthWithSignNewRequests(t *testing.T) {
+-			name:   "overflows int64, so ignored",
++			name:   "reject unrepresentable cl",
+@@ -1533,0 +1536,8 @@ func TestServerRejectsContentLengthWithSignNewRequests(t *testing.T) {
++			if tt.wantCL == 0 {
++				st := newServerTester(t, nil)
++				defer st.Close()
++				st.greet()
++				st.writeHeaders(HeadersFrameParam{StreamID: 1, BlockFragment: st.encodeHeader("content-length", tt.cl), EndHeaders: true})
++				st.wantRSTStream(1, ErrCodeProtocol)
++				return
++			}
+@@ -2329,0 +2340 @@ func testServer_HeaderTableSizeDuringWrite(t testing.TB) {
++	st.wantSettingsAck()
+@@ -3053,10 +3064,2 @@ func testServer_Rejects_ConnHeaders(t testing.TB) {
 -	st.wantHeaders(wantHeader{
 -		streamID:  1,
 -		endStream: false,

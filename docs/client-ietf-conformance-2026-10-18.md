@@ -586,7 +586,7 @@ recorded native H3 incident has this particular cause.
 
 The following distinctions are part of the conclusion:
 
-- Verified [RFC 9484 erratum 8444](https://www.rfc-editor.org/errata/eid8444) corrects the original wildcard examples to `%2A`. The audited client's URI-template implementation already follows it; this is not a client defect. The server's stale internal expansion helper is corrected by the reassessment, while its tolerant matcher continues to accept existing request forms.
+- Verified [RFC 9484 erratum 8444](https://www.rfc-editor.org/errata/eid8444) corrects the original wildcard examples to `%2A`. The audited shared/root client's URI-template implementation already follows it. The separate CF-local copy at the audited revision still emitted raw `*`; the late-revision addendum below records that historical defect and its upstream repair. The server's stale internal expansion helper is corrected by the reassessment, while its tolerant matcher continues to accept existing request forms.
 - Legal stream 4 behind an unwritten lower stream, and selecting H3 Capsules
   because native usable Datagram capacity is small, are compatibility cases
   rather than client RFC violations by themselves.
@@ -603,6 +603,67 @@ The following distinctions are part of the conclusion:
 - IETF conformance takes precedence over a server workaround. The protected
   client repository remains unchanged; no permissive Caddy behavior is used
   to disguise these client limitations.
+
+## Late-revision addendum: CF wildcard encoding, fixed upstream
+
+A final remote check found client `main` at
+`906352c346f6ec2b0b6b5bd5713fca1e0f187b6e`, four commits after the diagnostic
+revision `e10a6ec9fcf0e005d36572830539802df36f6638`. The immutable
+[comparison](https://github.com/ArcCal/masque-vpn/compare/e10a6ec9fcf0e005d36572830539802df36f6638...906352c346f6ec2b0b6b5bd5713fca1e0f187b6e)
+changes only the CF gateway subtree. This addendum corrects the earlier broad
+wildcard statement without changing the seven HTTP/3 finding groups.
+
+**Historical C8: the CF-local URI helper emitted unencoded wildcard variables.**
+At e10, the separate
+[CF helper](https://github.com/ArcCal/masque-vpn/blob/e10a6ec9fcf0e005d36572830539802df36f6638/masque-vpn-cf-masque/vendor/masque-proto/src/uri_template.rs#L381-L391)
+returned literal `*` before ordinary percent encoding. Its
+[default-template test](https://github.com/ArcCal/masque-vpn/blob/e10a6ec9fcf0e005d36572830539802df36f6638/masque-vpn-cf-masque/vendor/masque-proto/src/uri_template.rs#L465-L470)
+expected `/.well-known/masque/ip/*/*/`. This affects requests expanded by the
+CF-local reusable generic client and the corresponding local template helper;
+it is not a defect of the canonical/root helper, Mac, Killswitch or NF, nor
+proof that the distinct WARP caller uses this expansion path. Caddy's tolerant
+matcher accepted the old form, so this is a source-confirmed encoding violation
+rather than a demonstrated ordinary Caddy connection failure.
+
+The normative basis is explicit. Verified
+[erratum 8444](https://www.rfc-editor.org/errata/eid8444) adds to RFC 9484 §4.6:
+“If the "target" or "ipproto" variable is set to the wildcard value "*", it
+MUST be percent-encoded. It will therefore be transmitted as "%2A".”
+[RFC 6570 §3.2.1](https://www.rfc-editor.org/rfc/rfc6570.html#section-3.2.1)
+already restricts passthrough in ordinary expansion to unreserved characters;
+`*` is outside the
+[RFC 3986 §2.3](https://www.rfc-editor.org/rfc/rfc3986.html#section-2.3)
+unreserved set. RFC 9484 §3 forbids reserved and fragment expansion, so those
+operators cannot justify the special case. Erratum 8444 also corrects the
+misleading original examples; raw examples alone are insufficient evidence
+that the implementation conforms.
+
+This issue was repaired **in the client project upstream**, by
+[commit 1e32d636](https://github.com/ArcCal/masque-vpn/commit/1e32d636fa37314563bd5161a62abf99a6d78bdb),
+before this addendum. The
+[906 helper](https://github.com/ArcCal/masque-vpn/blob/906352c346f6ec2b0b6b5bd5713fca1e0f187b6e/masque-vpn-cf-masque/vendor/masque-proto/src/uri_template.rs#L381-L390)
+removes the special case, and its
+[regression](https://github.com/ArcCal/masque-vpn/blob/906352c346f6ec2b0b6b5bd5713fca1e0f187b6e/masque-vpn-cf-masque/vendor/masque-proto/src/uri_template.rs#L556-L576)
+covers `%2A` in paths and queries, decoding once and preserving literal escape
+data as `%252A`. No client repair was made by this caddy-masque review.
+
+The latest delta also adds cooperative receive-loop yielding in the CF frontend,
+bounded executable logging and scoped-name DNS failover. Root H3, all NF code,
+canonical/Mac/Killswitch callers, CF H3/Datagram forks, CF tunnel code and the
+WARP caller are byte-identical to the diagnostic revision. The one CF frontend
+client production-line change wraps the existing Datagram read future; its
+response/error/CONNECT handling is unchanged. Consequently C1–C7 retain their
+existing source attribution and qualifications, including CF's C2 exceptions
+and C7 exclusion. The thirteen replayed diagnostic assertions remain actual e10
+executions of the unchanged relevant source; they are not relabeled as a fresh
+latest-HEAD malicious-peer or native Apple run. Supplemental 906 CF-to-Caddy
+acceptance subsequently passed all eight carrier/family cases with each of Go
+1.26.9 and 1.27.2 under race checking. Fourteen URI-template tests and seven
+buffered HTTP/3 scheduling regressions also passed. The complete 492 regular
+files plus one symlink remained unchanged. Commands, the initial offline cache
+miss and successful locked retry, hashes and coverage limits are recorded
+separately in the comprehensive review; these ordinary acceptance results do
+not constitute a fresh C1–C7 adversarial-peer test.
 
 ## Appendix: pinned source index for C4–C7 and the distinct Datagram decoders
 

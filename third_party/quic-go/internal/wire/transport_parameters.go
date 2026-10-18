@@ -319,7 +319,13 @@ func (p *TransportParameters) readNumericTransportParameter(b []byte, paramID tr
 			return fmt.Errorf("initial_max_streams_uni too large: %d (maximum %d)", p.MaxUniStreamNum, protocol.MaxStreamCount)
 		}
 	case maxIdleTimeoutParameterID:
-		p.MaxIdleTimeout = max(protocol.MinRemoteIdleTimeout, time.Duration(val)*time.Millisecond)
+		if val == 0 {
+			p.MaxIdleTimeout = 0
+		} else if val > uint64(math.MaxInt64/int64(time.Millisecond)) {
+			p.MaxIdleTimeout = math.MaxInt64
+		} else {
+			p.MaxIdleTimeout = max(protocol.MinRemoteIdleTimeout, time.Duration(val)*time.Millisecond)
+		}
 	case maxUDPPayloadSizeParameterID:
 		if val < 1200 {
 			return fmt.Errorf("invalid value for max_udp_payload_size: %d (minimum 1200)", val)

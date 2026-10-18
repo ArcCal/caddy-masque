@@ -447,6 +447,9 @@ func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, si
 	if err != nil {
 		return fmt.Errorf("invalid status code: %w", err)
 	}
+	if len(hdr.Status) != 3 || status < 100 || status == http.StatusSwitchingProtocols {
+		return fmt.Errorf("invalid status code: %q", hdr.Status)
+	}
 	rsp.StatusCode = status
 	rsp.Status = hdr.Status + " " + http.StatusText(status)
 	return nil
@@ -510,6 +513,9 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
 		}
 		for _, v := range vals {
 			v = strings.Trim(v, " \t")
+			if !httpguts.ValidHeaderFieldValue(v) {
+				continue
+			}
 			if err := enc.WriteField(qpack.HeaderField{Name: lowercaseKey, Value: v}); err != nil {
 				return false, err
 			}
@@ -517,6 +523,9 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
 				headerFields = append(headerFields, qlog.HeaderField{Name: lowercaseKey, Value: v})
 			}
 		}
+	}
+	if buf.Len() == 0 {
+		return false, nil
 	}
 
 	b := make([]byte, 0, frameHeaderLen+buf.Len())
@@ -539,7 +548,7 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
 	if _, err := io.ReadFull(r, b); err != nil {
 		return nil, err
 	}
-	decodeFn := decoder.Decode(b)
+	decodeFn := decodeFieldSection(decoder, b)
 	var fields []qpack.HeaderField
 	var headerFields *[]qpack.HeaderField
 	if qlogger != nil {

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/http/httpguts"
+
 	"github.com/quic-go/qpack"
 	"github.com/quic-go/quic-go/http3/qlog"
 )
@@ -82,8 +84,8 @@ func (w *responseWriter) WriteHeader(status int) {
 		return
 	}
 
-	// http status must be 3 digits
-	if status < 100 || status > 999 {
+	// HTTP status must be 3 digits; HTTP/3 does not support 101 (RFC 9114 section 4.5).
+	if status < 100 || status > 999 || status == http.StatusSwitchingProtocols {
 		panic(fmt.Sprintf("invalid WriteHeader code %v", status))
 	}
 	w.status = status
@@ -234,13 +236,16 @@ func (w *responseWriter) writeHeader(status int) error {
 
 	hopFields := connectionHeaderFields(w.header)
 	for k, v := range w.header {
+		if !httpguts.ValidHeaderFieldName(k) {
+			continue
+		}
 		name := strings.ToLower(k)
 		// HTTP/3 cannot carry Connection or other hop-by-hop response fields,
 		// including those explicitly nominated by a legacy Connection value.
 		if _, hop := hopFields[name]; isConnectionSpecificHeader(name) || hop {
 			continue
 		}
-		if w.str.tunnel.Load() && strings.EqualFold(k, "Content-Length") {
+		if strings.EqualFold(k, "Content-Length") && (w.str.tunnel.Load() || status < 200 || status == http.StatusNoContent) {
 			continue
 		}
 		if _, excluded := w.trailers[k]; excluded {
@@ -252,6 +257,9 @@ func (w *responseWriter) writeHeader(status int) error {
 		}
 		for index := range v {
 			value := strings.Trim(v[index], " \t")
+			if !httpguts.ValidHeaderFieldValue(value) {
+				continue
+			}
 			if err := enc.WriteField(qpack.HeaderField{Name: name, Value: value}); err != nil {
 				return err
 			}

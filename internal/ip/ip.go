@@ -286,8 +286,9 @@ func mayICMPv4Error(original []byte, h Header) bool {
 	return true
 }
 
-// RFC 4443 §2.4 (e): no errors about ICMPv6 errors, from unspecified or
-// multicast sources, or (except Packet Too Big) to multicast destinations.
+// RFC 4443 §2.4 (e): no errors about ICMPv6 errors or redirects, from
+// unspecified or multicast sources, or (except Packet Too Big) to multicast
+// destinations.
 func mayICMPv6Error(original []byte, h Header, icmpType byte) bool {
 	if h.Src.IsUnspecified() || h.Src.IsMulticast() {
 		return false
@@ -297,7 +298,7 @@ func mayICMPv6Error(original []byte, h Header, icmpType byte) bool {
 	}
 	if h.Protocol == ProtoICMPv6 {
 		t, ok := icmpTypeAt(original, h)
-		return ok && t >= 128 // below 128 are errors
+		return ok && t >= 128 && t != 137 // errors and Redirect cannot elicit errors
 	}
 	return true
 }

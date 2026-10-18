@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -1082,6 +1083,7 @@ func TestPackPathProbePacket(t *testing.T) {
 			{Frame: &wire.PathChallengeFrame{Data: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}}},
 			{Frame: &wire.PathResponseFrame{Data: [8]byte{8, 7, 6, 5, 4, 3, 2, 1}}},
 		},
+		protocol.MinInitialPacketSize,
 		protocol.Version1,
 	)
 	require.NoError(t, err)
@@ -1096,4 +1098,39 @@ func TestPackPathProbePacket(t *testing.T) {
 	require.Len(t, buf.Data, protocol.MinInitialPacketSize)
 	require.True(t, p.IsPathProbePacket)
 	require.False(t, p.IsPathMTUProbePacket)
+}
+
+func TestPackPathProbePacketAmplificationBudget(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	tp := newTestPacketPacker(t, mockCtrl, protocol.PerspectiveServer)
+	tp.sealingManager.EXPECT().Get1RTTSealer().Return(newMockShortHeaderSealer(mockCtrl), nil)
+	tp.pnManager.EXPECT().PeekPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x43), protocol.PacketNumberLen2)
+	tp.pnManager.EXPECT().PopPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x43))
+	p, buf, err := tp.packer.PackPathProbePacket(protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+		[]ackhandler.Frame{{Frame: &wire.PathChallengeFrame{Data: [8]byte{1}}}}, 78, protocol.Version1)
+	require.NoError(t, err)
+	defer buf.Release()
+	require.Equal(t, protocol.ByteCount(78), p.Length)
+	require.Len(t, buf.Data, 78)
+}
+
+func TestPackPathControlFramePadding(t *testing.T) {
+	for _, frame := range []wire.Frame{&wire.PathChallengeFrame{}, &wire.PathResponseFrame{}, &wire.PingFrame{}} {
+		t.Run(fmt.Sprintf("%T", frame), func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			tp := newTestPacketPacker(t, mockCtrl, protocol.PerspectiveServer)
+			tp.pnManager.EXPECT().PopPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x43))
+			buf := getPacketBuffer()
+			defer buf.Release()
+			pl := payload{frames: []ackhandler.Frame{{Frame: frame}}, length: frame.Length(protocol.Version1)}
+			_, err := tp.packer.appendShortHeaderPacket(buf, protocol.ParseConnectionID([]byte{1, 2, 3, 4}), 0x43,
+				protocol.PacketNumberLen2, protocol.KeyPhaseOne, pl, 0, 1200, newMockShortHeaderSealer(mockCtrl), false, protocol.Version1)
+			require.NoError(t, err)
+			if _, ping := frame.(*wire.PingFrame); ping {
+				require.Less(t, len(buf.Data), 1200)
+			} else {
+				require.Len(t, buf.Data, 1200)
+			}
+		})
+	}
 }

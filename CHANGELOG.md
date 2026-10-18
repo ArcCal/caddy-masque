@@ -4,6 +4,11 @@ Each version is tagged with its number; CI attaches Caddy builds to its release 
 
 ## Unreleased
 
+- Extend the RFC-based review with bounded HTTP/2 SETTINGS acknowledgments, request-length/flow-control errors and priority validation; prevent malformed HTTP/3 fields/status syntax and unsupported HTTP/2–HTTP/3 switching responses. Preserve valid website and CONNECT behavior.
+- Validate signed QPACK field-section Base values while accepting legal positive static-only Base encodings, including the required 62-bit range. Apply the same check to requests, responses and trailers without enabling dynamic compression or changing dependencies.
+- Enforce new-address QUIC amplification budgets, complete undersized-probe MTU validation, answer current-path and multiple challenges, and validate the previous path during migration. Preserve response routes, congestion credit and CID lifetime across deferred sends; select the highest non-probing path and promote its reserved CID.
+- Keep queued QUIC packets bound to their original destination/local metadata across migration, and credit buffered/coalesced packet receipts only once during decryption retries. Extend required QUIC package and actual-UDP migration gates for versions 1 and 2.
+- Preserve QUIC zero idle-timeout semantics and safely bound large timeout values. Suppress ICMPv6 errors in response to Redirect as RFC 4443 requires. Detailed evidence and validation limits are in the [comprehensive follow-up report](docs/comprehensive-recheck-2026-10-18.md).
 - Recheck earlier conformance judgments against original RFCs, verified errata and pinned independent implementations. Clarify permitted generic HTTP/QUIC errors and distinguish implementation policy from mandatory behavior.
 - Validate HTTP/2 method tokens and HTTP/2–HTTP/3 URI schemes, retaining valid custom schemes and extension methods. Reject HEADERS after successful HTTP/2 CONNECT and increasing client HTTP/3 GOAWAY identifiers.
 - Correct QUIC forbidden-packet error attribution and allow transport CONNECTION_CLOSE in 0-RTT. Correct internal wildcard expansion to `%2A` per verified RFC 9484 erratum 8444 while preserving tolerant request matching.
