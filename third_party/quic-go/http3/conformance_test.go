@@ -281,7 +281,7 @@ func TestConformanceResponseContentLengthExceptions(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tc.body, string(body))
 			if tc.method == "CONNECT" {
-				require.NotContains(t, rsp.Header, "Content-Length")
+				require.Equal(t, tc.lengths, rsp.Header.Values("Content-Length"))
 				require.Zero(t, rsp.ContentLength)
 			}
 		})

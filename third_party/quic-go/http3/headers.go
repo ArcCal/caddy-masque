@@ -131,7 +131,7 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
 				return header{}, fmt.Errorf("invalid response pseudo header: %s", h.Name)
 			}
 		} else {
-			if err := validateRegularHeaderField(h); err != nil {
+			if err := validateRegularHeaderField(h, isRequest); err != nil {
 				return header{}, err
 			}
 			readFirstRegularHeader = true
@@ -141,6 +141,9 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
 				// RFC 9110 section 9.3.6 requires ignoring any Content-Length
 				// on a successful CONNECT response, including invalid values.
 				if !isRequest && isConnect && len(hdr.Status) == 3 && hdr.Status[0] == '2' {
+					// Retain the field for extensions with stricter requirements,
+					// such as the Capsule Protocol (RFC 9297 section 3.2).
+					hdr.Headers.Add(h.Name, h.Value)
 					continue
 				}
 				// Ignore duplicate Content-Length headers.
@@ -169,32 +172,77 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
 	return hdr, nil
 }
 
+// connectionHeaderFields returns the fields nominated by a legacy Connection
+// header. Keep the caller's map intact when converting its response to HTTP/3.
+func connectionHeaderFields(header http.Header) map[string]struct{} {
+	var fields map[string]struct{}
+	for name, values := range header {
+		if !strings.EqualFold(name, "Connection") {
+			continue
+		}
+		for _, value := range values {
+			for token := range strings.SplitSeq(value, ",") {
+				token = strings.Trim(token, " \t")
+				if !httpguts.ValidHeaderFieldName(token) {
+					continue
+				}
+				if fields == nil {
+					fields = make(map[string]struct{})
+				}
+				fields[strings.ToLower(token)] = struct{}{}
+			}
+		}
+	}
+	return fields
+}
+
+func isConnectionSpecificHeader(name string) bool {
+	return name == "te" || slices.Contains(invalidHeaderFields[:], name)
+}
+
+func validTrailerHeader(name string) bool {
+	return httpguts.ValidTrailerHeader(name) && !isConnectionSpecificHeader(strings.ToLower(name))
+}
+
 func validateHeaderFieldNameAndValue(h qpack.HeaderField) error {
 	// field names need to be lowercase, see section 4.2 of RFC 9114
 	if strings.ToLower(h.Name) != h.Name {
 		return fmt.Errorf("header field is not lower-case: %s", h.Name)
 	}
-	if !httpguts.ValidHeaderFieldValue(h.Value) {
+	if !httpguts.ValidHeaderFieldValue(h.Value) || strings.Trim(h.Value, " \t") != h.Value {
 		return fmt.Errorf("invalid header field value for %s: %q", h.Name, h.Value)
 	}
 	return nil
 }
 
-func validateRegularHeaderField(h qpack.HeaderField) error {
+func validateRegularHeaderField(h qpack.HeaderField, isRequest bool) error {
 	if !httpguts.ValidHeaderFieldName(h.Name) {
 		return fmt.Errorf("invalid header field name: %q", h.Name)
 	}
 	if slices.Contains(invalidHeaderFields[:], h.Name) {
 		return fmt.Errorf("invalid header field name: %q", h.Name)
 	}
-	if h.Name == "te" && h.Value != "trailers" {
-		return fmt.Errorf("invalid TE header field value: %q", h.Value)
+	if h.Name == "te" {
+		// TE is a case-insensitive list (RFC 9110 section 10.1.4).
+		// HTTP/3 permits only the trailers member, in request headers.
+		for member := range strings.SplitSeq(h.Value, ",") {
+			member = strings.Trim(member, " \t")
+			// Recipients ignore empty list members (RFC 9110 section 5.6.1.2).
+			// Restrict folding to the ASCII keyword; Unicode lookalikes are
+			// not the trailers token, even if Unicode case folding matches.
+			if member != "" && (len(member) != len("trailers") || !strings.EqualFold(member, "trailers")) {
+				return fmt.Errorf("invalid TE header field value: %q", h.Value)
+			}
+		}
+		if !isRequest {
+			return errors.New("TE header field is only permitted in request headers")
+		}
 	}
 	return nil
 }
 
 func validateTrailerHeaderField(h qpack.HeaderField) error {
-	if err := validateRegularHeaderField(h); err != nil {
+	if err := validateRegularHeaderField(h, false); err != nil {
 		return err
 	}
 	if !httpguts.ValidTrailerHeader(h.Name) {
@@ -415,9 +463,11 @@ func extractAnnouncedTrailers(header http.Header) http.Header {
 // writeTrailers encodes and writes HTTP trailers as a HEADERS frame.
 // It returns true if trailers were written, false if there were no trailers to write.
 func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, qlogger qlogwriter.Recorder) (bool, error) {
+	hopFields := connectionHeaderFields(trailers)
 	var hasValues bool
 	for k, vals := range trailers {
-		if httpguts.ValidTrailerHeader(k) && len(vals) > 0 {
+		_, hop := hopFields[strings.ToLower(k)]
+		if validTrailerHeader(k) && !hop && len(vals) > 0 {
 			hasValues = true
 			break
 		}
@@ -437,11 +487,12 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
 		if len(vals) == 0 {
 			continue
 		}
-		if !httpguts.ValidTrailerHeader(k) {
+		lowercaseKey := strings.ToLower(k)
+		if _, hop := hopFields[lowercaseKey]; !validTrailerHeader(k) || hop {
 			continue
 		}
-		lowercaseKey := strings.ToLower(k)
 		for _, v := range vals {
+			v = strings.Trim(v, " \t")
 			if err := enc.WriteField(qpack.HeaderField{Name: lowercaseKey, Value: v}); err != nil {
 				return false, err
 			}

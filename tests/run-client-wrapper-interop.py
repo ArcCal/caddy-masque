@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build current Rust app APIs and test them against the real Caddy transports."""
+"""Test current Mac/Killswitch APIs and NF protocols against real Caddy transports."""
 
 import argparse
 import itertools
@@ -14,6 +14,7 @@ import tempfile
 
 
 TEST_NAME = "TestInteropCurrentMacAndKillswitch"
+NF_TEST_NAME = "TestInteropCurrentNF"
 
 
 def parse_args():
@@ -41,6 +42,7 @@ def main():
         "__MASQUE_KILLSWITCH_PATH__": vpn / "masque-vpn-killswitch",
         "__MASQUE_H3_PATH__": vpn / "vendor" / "h3",
         "__MASQUE_H3_QUINN_PATH__": vpn / "vendor" / "h3-quinn",
+        "__MASQUE_NF_PATH__": vpn / "masque-nf" / "Core",
     }
     for dependency in paths.values():
         if not (dependency / "Cargo.toml").is_file():
@@ -61,6 +63,12 @@ def main():
         (workspace / "Cargo.toml").write_text(template, encoding="utf-8")
         shutil.copyfile(assets / "Cargo.lock", workspace / "Cargo.lock")
         shutil.copyfile(assets / "main.rs", workspace / "src" / "main.rs")
+        shutil.copyfile(assets / "nf.rs", workspace / "src" / "nf.rs")
+        support = paths["__MASQUE_NF_PATH__"] / "tests" / "support" / "mod.rs"
+        (workspace / "src" / "nf_support.rs").write_text(
+            support.read_text(encoding="utf-8") + (assets / "nf_support-extension.rs").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
 
         metadata = subprocess.run(
             ["cargo", "metadata", "--locked", "--format-version=1", "--manifest-path", str(workspace / "Cargo.toml")],
@@ -88,13 +96,17 @@ def main():
         if not binary.is_file():
             raise SystemExit(f"The built Rust interoperability harness is missing: {binary}")
         environment["MASQUE_WRAPPER_COMPAT"] = str(binary)
+        nf_binary = target / profile / "caddy-nf-compat"
+        if not nf_binary.is_file():
+            raise SystemExit(f"The built NF interoperability harness is missing: {nf_binary}")
+        environment["MASQUE_NF_COMPAT"] = str(nf_binary)
 
         overlay = workspace / "overlay.json"
         overlay.write_text(json.dumps({"Replace": {
             str(repo / "zz_current_wrapper_compat_test.go"):
                 str(assets / "caddy_wrapper_compat_test.go.in"),
         }}), encoding="utf-8")
-        pattern = "^$" if args.compile_only else f"^{TEST_NAME}$"
+        pattern = "^$" if args.compile_only else f"^({TEST_NAME}|{NF_TEST_NAME})$"
         command = [
             "go", "test", "-race", f"-overlay={overlay}", "-count=1",
             "-timeout=10m", "-run", pattern, "-v", ".",
@@ -128,6 +140,16 @@ def main():
         if len(passed) != 16 or set(passed) != expected:
             raise SystemExit(f"Expected all 16 distinct interoperability cases; observed {len(passed)}.")
         print("All 16 current Mac/Killswitch Caddy interoperability cases passed under Go race checking.")
+        expected_nf = set(itertools.product(
+            ("ipv4-only", "dual-stack"), ("h3", "h2", "http1.1", "h3-capsules"),
+        ))
+        passed_nf = re.findall(
+            rf"^\s*--- PASS: {NF_TEST_NAME}/(ipv4-only|dual-stack)/(h3|h2|http1\.1|h3-capsules)(?=\s|$)",
+            output, re.MULTILINE,
+        )
+        if len(passed_nf) != 8 or set(passed_nf) != expected_nf:
+            raise SystemExit(f"Expected all 8 distinct NF interoperability cases; observed {len(passed_nf)}.")
+        print("All 8 current NF portable-core Caddy interoperability cases passed under Go race checking.")
         return 0
 
 

@@ -1,0 +1,19 @@
+[package]
+name = "caddy-cf-frontend-compat"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+masque-frontend = { path = __CF_FRONTEND_PATH__ }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.dev]
+debug = 0
+incremental = false

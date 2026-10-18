@@ -5,8 +5,8 @@ The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as
 
 - **Standards**: IETF MASQUE IP proxying, CONNECT-IP (RFC 9484); HTTP Datagrams and Capsules (RFC 9297);
   extended CONNECT over HTTP/2 and HTTP/3 (RFC 8441, RFC 9220). HTTP/3, HTTP/2 and HTTP/1.1 are all supported.
-- **Clients unchanged**: masque-vpn's `masque-client` and IETF Masque on macOS 27 arm64 connect directly, without changing a single
-  line of their configuration (a client with the server's IP address in its `uri_template` needs the `:443` in the site
+- **Client compatibility**: the acceptance scope includes `masque-client`, IETF Masque, Mac, Killswitch and Masque NF,
+  using their existing credentials and configurations (a client with the server's IP address in its `uri_template` needs the `:443` in the site
   addresses shown below; over HTTP/3 with IPv6 on, older clients need the note on the MTU probe below). Password hashes made by `caddy masque-passwd` and by masque-vpn's `masque-passwd` are interchangeable.
 - **Caddy handles certificates and traffic**: certificates are obtained and renewed automatically; the VPN and the website
   share port 443 (TCP and UDP); the same Caddy can go on hosting other sites and reverse proxies as usual.
@@ -26,6 +26,9 @@ Earlier review results and native-validation requirements are in [the October 4 
 Design goals and the checks required for Caddy updates are in [the design document](docs/design.md).
 The [October 18 standards repair report](docs/conformance-repair-2026-10-18.md) records the audit findings,
 repairs, current-client results and remaining native/kernel validation limits.
+The [all-client compatibility follow-up](docs/all-client-compatibility-2026-10-18.md) includes NF, the GUI's CLI process
+contract, the independent gateway client fixture, and confirmed client-side RFC limitations. Protocol-core tests do not
+establish native Network.framework or GUI acceptance.
 
 ## One-step install
 
@@ -377,17 +380,21 @@ in Go to do CONNECT-IP over HTTP/3, HTTP/2 and HTTP/1.1: sending and receiving p
 website, reloads (including failed ones), removed users, new blocks, idle timeouts and more.
 
 With the current sibling masque-vpn checkout available, also run the real Rust
-client and the current Mac/Killswitch public settings, packet and SOCKS APIs:
+client (file and GUI stdin configurations), Mac/Killswitch public APIs, the
+independent NF protocol/SOCKS core and the gateway's generic client fixture:
 
 ```sh
 MASQUE_CLIENT=../masque-vpn/target/release/masque-client go test -race -count=1 -run '^TestInteropMasqueClient$' -v .
 python3 tests/run-client-wrapper-interop.py --masque-vpn-root ../masque-vpn --release
+python3 tests/run-cf-client-interop.py --masque-vpn-root ../masque-vpn --release
 ```
 
-The wrapper check requires all 16 combinations: Mac and Killswitch, four
-transports, and IPv4-only or dual-stack servers. It validates protocol/core
-interoperability; native macOS utun, routes, DNS restoration and PF protection
-still require tests on a Mac. See [the harness and its scope](tests/clients/README.md).
+The wrapper check requires all 24 combinations: Mac, Killswitch and NF, four
+transports, and IPv4-only or dual-stack servers. The independent CF fixture
+requires another eight cases. These validate protocol/core interoperability;
+native macOS Network.framework, utun, routes, DNS restoration and PF protection
+still require tests on a Mac. See [the wrapper harness](tests/clients/README.md)
+and [the CF fixture](tests/cf-clients/README.md) for their scope.
 
 See the [Caddy 2.11.7 and Go 1.27 verification report](docs/compatibility-2026-10-11.md)
 for the tested artifacts, client coverage and remaining native-platform checks.

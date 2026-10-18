@@ -1,0 +1,139 @@
+package masque
+
+// The CF gateway's unchanged generic client fixture talks to real Caddy. Only
+// native host configuration and the server's destination network use channels.
+// This is separate from the CF gateway's Cloudflare-only outbound WARP client.
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+)
+
+func TestInteropCFGenericFrontend(t *testing.T) {
+	binary := os.Getenv("MASQUE_CF_FRONTEND_COMPAT")
+	if binary == "" {
+		t.Fatal("MASQUE_CF_FRONTEND_COMPAT must name the built immutable CF frontend client harness")
+	}
+	for _, family := range []string{"ipv4-only", "dual-stack"} {
+		for _, mode := range []struct{ name, transport string }{
+			{"h3", "h3"}, {"h2", "h2"}, {"http1.1", "http/1.1"}, {"h3-capsules", "h3"},
+		} {
+			t.Run(family+"/"+mode.name, func(t *testing.T) {
+				e := newCaddyEnv(t)
+				cert, caPEM := newTestChain(t)
+				e.cert = cert
+				makeConfig := func(user string) map[string]any {
+					cfg := masqueConfig(user)
+					cfg["blocked_destinations"] = []string{}
+					if family == "ipv4-only" {
+						delete(cfg, "ipv6")
+					}
+					if mode.name == "h3-capsules" {
+						cfg["http3"] = false
+					}
+					return cfg
+				}
+				if err := e.load(makeConfig("alice")); err != nil {
+					t.Fatal(err)
+				}
+				if mode.transport == "h3" {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					conn, err := quic.DialAddr(ctx, fmt.Sprintf("127.0.0.1:%d", e.port), http3.ConfigureTLSConfig(e.tlsConfig("h3")), &quic.Config{EnableDatagrams: true})
+					if err != nil {
+						t.Fatal(err)
+					}
+					cc := (&http3.Transport{EnableDatagrams: true}).NewClientConn(conn)
+					select {
+					case <-cc.ReceivedSettings():
+					case <-ctx.Done():
+						t.Fatal("HTTP/3 SETTINGS missing")
+					}
+					if cc.Settings().EnableDatagrams != (mode.name == "h3") || !cc.Settings().EnableExtendedConnect {
+						t.Fatalf("wrong HTTP/3 capabilities: %+v", cc.Settings())
+					}
+					_ = conn.CloseWithError(0, "")
+				}
+				go func() {
+					for {
+						select {
+						case packet := <-e.dev.toHost:
+							if response := reflectUDP(packet); response != nil {
+								select {
+								case e.dev.fromHost <- response:
+								case <-e.dev.closed:
+									return
+								}
+							}
+						case <-e.dev.closed:
+							return
+						}
+					}
+				}()
+				dir := t.TempDir()
+				caFile := filepath.Join(dir, "ca.pem")
+				wrongCA := filepath.Join(dir, "wrong-ca.pem")
+				if err := os.WriteFile(caFile, []byte(caPEM), 0600); err != nil {
+					t.Fatal(err)
+				}
+				_, otherCA := newTestChain(t)
+				if err := os.WriteFile(wrongCA, []byte(otherCA), 0600); err != nil {
+					t.Fatal(err)
+				}
+				marker := filepath.Join(dir, "reconnect-ready")
+				ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+				defer cancel()
+				command := exec.CommandContext(ctx, binary, fmt.Sprint(e.port), caFile, mode.transport, family, wrongCA, marker)
+				var output lockedBuffer
+				command.Stdout = &output
+				command.Stderr = &output
+				if err := command.Start(); err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { done <- command.Wait() }()
+				poll := time.NewTicker(20 * time.Millisecond)
+				defer poll.Stop()
+				reloaded := false
+				for {
+					select {
+					case err := <-done:
+						if err != nil {
+							t.Fatalf("CF generic client harness: %v\n%s", err, output.String())
+						}
+						if !reloaded {
+							t.Fatal("client exited without exercising reconnect")
+						}
+						t.Log(output.String())
+						waitNoSessions(t)
+						return
+					case <-poll.C:
+						if reloaded {
+							continue
+						}
+						if _, err := os.Stat(marker); err != nil {
+							continue
+						}
+						// Revocation ends the old tunnel. Restoration permits the
+						// unchanged Client::run loop to establish a fresh session.
+						if err := e.load(makeConfig("bob")); err != nil {
+							t.Fatal(err)
+						}
+						waitNoSessions(t)
+						if err := e.load(makeConfig("alice")); err != nil {
+							t.Fatal(err)
+						}
+						reloaded = true
+					}
+				}
+			})
+		}
+	}
+}
