@@ -132,6 +132,19 @@ rather than HTTP trailers; ordinary responses, including HEAD and 304, retain
 their HTTP semantics. Regressions exercise both server and client paths and
 the exact wire error codes from RFC 9114 and RFC 9204.
 
+Incoming fields also enforce RFC 9114 §10.3 and RFC 9110's field-content
+grammar: no leading or trailing SP/HTAB. TE is permitted only in request
+headers; its case-insensitive list accepts only trailers and ignored empty
+members. Outgoing regular fields normalize edge whitespace without mutating
+the caller's header map. Raw request, response and trailer tests verify
+H3_MESSAGE_ERROR and valid list controls. Successful CONNECT responses retain
+Content-Length metadata for stricter Capsule Protocol validation, while the
+HTTP framing layer still ignores its value as RFC 9110 §9.3.6 requires.
+Responses and outgoing trailers omit connection-specific fields and valid
+field names nominated by Connection values. This also keeps Caddy's supported
+`static_response close: true` pages and CONNECT refusals valid over HTTP/3;
+ordinary end-to-end headers, bodies and trailers remain covered by regressions.
+
 The narrow `Server.GetConnectionConfig` callback returns `ConnectionConfig`
 with the header limit and HTTP idle timeout for each new connection. The
 snapshot supplies both enforcement and advertised SETTINGS and is never

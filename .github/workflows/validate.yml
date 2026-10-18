@@ -127,15 +127,23 @@ jobs:
         run: |
           set -euo pipefail
           MASQUE_CLIENT="$PWD/masque-vpn/target/release/masque-client" go test -count=1 -run '^TestInteropMasqueClient$' -v . | tee "$RUNNER_TEMP/client-interop.log"
-          for transport in h3 h2 http1.1 h3-capsules; do
+          for transport in h3 h2 http1.1 h3-capsules stdin-h3 stdin-h2 stdin-http1.1 stdin-h3-capsules stdin-auto; do
             grep -q "^    --- PASS: TestInteropMasqueClient/$transport " "$RUNNER_TEMP/client-interop.log"
           done
           ! grep -q -- '--- SKIP' "$RUNNER_TEMP/client-interop.log"
-      - name: Current Mac and Killswitch protocol cores against Caddy
+      - name: Current Mac, Killswitch and NF protocol cores against Caddy
         run: |
           set -euo pipefail
           CARGO_TARGET_DIR="$PWD/masque-vpn/target" python3 tests/run-client-wrapper-interop.py \
             --masque-vpn-root "$PWD/masque-vpn" --release | tee "$RUNNER_TEMP/wrapper-interop.log"
+      - name: Independent CF gateway generic client fixture against Caddy
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$PWD/masque-vpn/target" python3 tests/run-cf-client-interop.py \
+            --masque-vpn-root "$PWD/masque-vpn" --release | tee "$RUNNER_TEMP/cf-client-interop.log"
+      - name: Client source remains unchanged
+        run: |
+          test -z "$(git -C masque-vpn status --porcelain)"
       - name: End-to-end test in network namespaces
         run: |
           set -euo pipefail

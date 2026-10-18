@@ -343,9 +343,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	defer l.release()
 
-	tun, err := h.accept(w, r, req)
+	tun, responseStarted, err := h.accept(w, r, req, l.handle)
 	if err != nil {
 		log.Debug("could not start the tunnel", zap.Error(err))
+		if !responseStarted {
+			return rejectLogged(rejection{status: http.StatusServiceUnavailable})
+		}
 		return nil
 	}
 	c.running.Add(1)
@@ -442,10 +445,6 @@ func isTimeout(err error) bool {
 	return errors.As(err, &dnsErr) && dnsErr.IsTimeout
 }
 
-// How long to wait for the client's HTTP/3 SETTINGS, which normally
-// arrive before its first request.
-const settingsTimeout = 3 * time.Second
-
 // h3DatagramsKey marks requests served by this module's HTTP/3 server,
 // which announces SETTINGS_H3_DATAGRAM.
 type h3DatagramsKey struct{}
@@ -453,20 +452,22 @@ type h3DatagramsKey struct{}
 // accept sends the successful response and returns the tunnel over the
 // request stream. The tunnel bypasses Caddy's idle-timeout wrappers and
 // clears the server's read and write deadlines: a tunnel lasts as long as
-// its client keeps the stream open (RFC 9484 §4).
-func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (tunnel, error) {
+// its client keeps the stream open (RFC 9484 §4). The boolean tells whether
+// the response has started, so an earlier failure can still get an error
+// status rather than an implicit successful response.
+func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request, handle *sessionHandle) (tunnel, bool, error) {
 	if req.http1 {
 		// RFC 9484 §4.3.
 		conn, brw, err := http.NewResponseController(w).Hijack()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		_ = conn.SetDeadline(time.Time{})
 		h.tuneConn(conn)
 		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\nCapsule-Protocol: ?1\r\n\r\n")
 		if err := brw.Flush(); err != nil {
 			conn.Close()
-			return nil, err
+			return nil, true, err
 		}
 		closeConn := func(ending) { conn.Close() }
 		return &streamTunnel{
@@ -474,17 +475,14 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 			capsuleWriter: capsuleWriter{w: conn},
 			stopFn:        closeConn,
 			forceFn:       func() {},
-		}, nil
+		}, true, nil
 	}
-	// No Content-Type sniffing: the response has no content (RFC 9297 §3.2).
-	w.Header()["Content-Type"] = nil
-	w.Header().Set("Capsule-Protocol", "?1")
 	raw := innermost(w)
 	rc := http.NewResponseController(raw)
 	if r.ProtoMajor == 3 {
 		s, ok := raw.(http3.HTTPStreamer)
 		if !ok {
-			return nil, errors.New("no HTTP/3 stream behind the response writer")
+			return nil, false, errors.New("no HTTP/3 stream behind the response writer")
 		}
 		// HTTP Datagrams go in QUIC DATAGRAM frames only if both sides
 		// announced SETTINGS_H3_DATAGRAM (RFC 9297 §2.1.1): this module's
@@ -493,29 +491,53 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 		quicDatagrams := false
 		ours, _ := r.Context().Value(h3DatagramsKey{}).(bool)
 		if st, ok := raw.(http3.Settingser); ok && ours {
-			timer := time.NewTimer(settingsTimeout)
+			// QUIC streams can arrive independently. A delayed control
+			// stream must not permanently select capsules and leave later
+			// negotiated QUIC Datagrams unread. Admission already holds a
+			// lease, bounded by the per-user session limit.
 			select {
 			case <-st.ReceivedSettings():
 				quicDatagrams = st.Settings().EnableDatagrams
-			case <-timer.C:
 			case <-r.Context().Done():
-				timer.Stop()
-				return nil, r.Context().Err()
+				return nil, false, r.Context().Err()
+			case <-h.app.core.ctx.Done():
+				return nil, false, h.app.core.ctx.Err()
+			case <-handle.revoked:
+				return nil, false, errors.New("session revoked before receiving HTTP/3 SETTINGS")
+			case <-handle.rescope:
+				return nil, false, errors.New("policy changed before receiving HTTP/3 SETTINGS")
 			}
-			timer.Stop()
+			// Prefer cancellation if it raced with receiving SETTINGS.
+			select {
+			case <-r.Context().Done():
+				return nil, false, r.Context().Err()
+			case <-h.app.core.ctx.Done():
+				return nil, false, h.app.core.ctx.Err()
+			case <-handle.revoked:
+				return nil, false, errors.New("session revoked before accepting the tunnel")
+			case <-handle.rescope:
+				return nil, false, errors.New("policy changed before accepting the tunnel")
+			default:
+			}
 		}
+		// Success headers must not appear on a cancelled pending request.
+		w.Header()["Content-Type"] = nil
+		w.Header().Set("Capsule-Protocol", "?1")
 		w.WriteHeader(http.StatusOK)
 		if err := rc.Flush(); err != nil {
-			return nil, err
+			return nil, true, err
 		}
 		str := s.HTTPStream()
 		_ = str.SetReadDeadline(time.Time{})
 		_ = str.SetWriteDeadline(time.Time{})
-		return newH3Tunnel(str, quicDatagrams), nil
+		return newH3Tunnel(str, quicDatagrams), true, nil
 	}
+	// No Content-Type sniffing: the response has no content (RFC 9297 §3.2).
+	w.Header()["Content-Type"] = nil
+	w.Header().Set("Capsule-Protocol", "?1")
 	w.WriteHeader(http.StatusOK)
 	if err := rc.Flush(); err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	_ = rc.SetReadDeadline(time.Time{})
 	_ = rc.SetWriteDeadline(time.Time{})
@@ -539,7 +561,7 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 			_ = body.Close()
 		},
 		forceFn: reset,
-	}, nil
+	}, true, nil
 }
 
 // tuneConn gives the connection of a tunnel over TCP the settings of

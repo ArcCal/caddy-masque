@@ -11,10 +11,21 @@ error pages may be reused within those protocol rules; exact endpoint indistingu
 Keep HTTP/1.1 Upgrade support and all four client modes: HTTP/3 Datagrams,
 HTTP/2, HTTP/1.1 and HTTP/3 DATAGRAM Capsules.
 
-The required clients are masque-client, masque-vpn-mac and
-masque-vpn-killswitch. Existing configuration, authentication, certificate
-verification, packet framing, address assignment and reconnect behavior must
-remain compatible. NF and Swift are outside this acceptance scope.
+All current clients in ArcCal/masque-vpn are in scope: masque-client (including
+its Linux system/LAN-gateway/SOCKS modes and macOS CLI), the IETF Masque GUI
+that launches that executable, masque-vpn-mac, masque-vpn-killswitch and
+Masque NF. NF has an independent protocol core with Network.framework I/O;
+the retired standalone Swift transport is no longer a current client.
+Existing configuration, authentication, certificate verification, packet
+framing, address assignment and reconnect behavior must remain compatible.
+Client-side RFC violations must be identified explicitly rather than hidden
+by a server workaround that violates mandatory IETF behavior. The client
+repository must remain unchanged.
+
+The experimental CF-MASQUE project is a Linux gateway server. Its embedded
+generic CONNECT-IP client fixture is also checked independently. Its outbound
+Cloudflare-device-authenticated WARP dialect is a separate service contract,
+not the authentication or wire protocol offered by this Caddy module.
 
 The VPN and ordinary Caddy websites share TCP/UDP port 443. Unauthenticated requests use the configured website response where protocol rules allow it;
 refused HTTP/2 and HTTP/3 CONNECT-IP responses use non-2xx status codes. Website routing, bodies,
@@ -74,8 +85,10 @@ Every proposed upgrade requires these checks:
    replacements can hide their upstream version from the source scan. Updating
    Go's standard library does not patch the separately vendored HTTP/2 server
    and transport; verify the actual source against a security-fixed snapshot.
-4. Run real masque-client interoperability and the current Mac/Killswitch
-   protocol-core matrix over all four modes. Run strict Linux kernel and wire
+4. Run real masque-client interoperability, the current Mac/Killswitch and NF
+   protocol-core matrices, and the independent embedded frontend client over
+   all four modes. Check auto selection, small native Datagram capacities and
+   legal later request streams behind an idle lower-numbered stream. Run strict Linux kernel and wire
    conformance checks against the final artifact. Cover TLS trust and refusal,
    authentication, idle survival, reload/revocation, failure recovery and
    reconnect, plus ordinary website bodies, trailers and routing. Release

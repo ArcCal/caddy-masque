@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strings"
 	"testing"
 
 	ossfuzzseeds "github.com/quic-go/go-ossfuzz-seeds"
@@ -647,16 +648,15 @@ func TestResponseTrailerFields(t *testing.T) {
 	}), rsp.Trailer)
 }
 
-func TestResponseTrailerParsingTE(t *testing.T) {
+func TestResponseHeaderTEIsNotPermitted(t *testing.T) {
 	headers := []qpack.HeaderField{
 		{Name: ":status", Value: "404"},
 		{Name: "te", Value: "trailers"},
 	}
-	require.NoError(t, updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false))
-	headers = []qpack.HeaderField{
-		{Name: ":status", Value: "404"},
-		{Name: "te", Value: "not-trailers"},
-	}
+	require.EqualError(t,
+		updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false),
+		"TE header field is only permitted in request headers")
+	headers[1].Value = "not-trailers"
 	require.EqualError(t,
 		updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false),
 		`invalid TE header field value: "not-trailers"`)
@@ -939,14 +939,19 @@ func requireValidFuzzHeader(t *testing.T, h http.Header, context string) {
 		require.Truef(t, httpguts.ValidHeaderFieldName(name), "%s contains invalid header field name %q", context, name)
 		for _, value := range values {
 			require.Truef(t, httpguts.ValidHeaderFieldValue(value), "%s contains invalid header field value for %q: %q", context, name, value)
+			require.Equal(t, strings.Trim(value, " \t"), value, "field value contains edge whitespace")
 		}
 	}
 	for _, name := range invalidHeaderFields {
 		require.Emptyf(t, h.Get(name), "%s contains connection-specific header %q", context, name)
 	}
 	if te := h.Values("Te"); len(te) > 0 {
+		require.Equal(t, "request", context, "TE is only permitted in request headers")
 		for _, value := range te {
-			require.Equalf(t, "trailers", value, "%s contains invalid TE header field value: %q", context, value)
+			for _, member := range strings.Split(value, ",") {
+				member = strings.Trim(member, " \t")
+				require.Truef(t, member == "" || len(member) == len("trailers") && strings.EqualFold(member, "trailers"), "%s contains invalid TE member: %q", context, member)
+			}
 		}
 	}
 }

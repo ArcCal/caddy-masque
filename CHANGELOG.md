@@ -4,6 +4,11 @@ Each version is tagged with its number; CI attaches Caddy builds to its release 
 
 ## Unreleased
 
+- Wait for delayed HTTP/3 SETTINGS rather than permanently disabling negotiated QUIC Datagrams after three seconds. Pending admissions remain cancellable and release their lease on user revocation or shutdown; failures before a response use a non-2xx status.
+- Preserve ignored CONNECT response Content-Length fields for Capsule Protocol validation without using them to delimit tunnel DATA.
+- Reject malformed HTTP/3 field-edge whitespace and response/trailer TE fields, accept valid request TE lists, and normalize outgoing header whitespace without changing the caller's header map.
+- Keep Caddy `close: true` website and refusal responses valid over HTTP/3 by omitting connection-specific fields and Connection-nominated fields, including trailers.
+- Expand unchanged-client acceptance to Masque NF, IETF Masque's stdin/EOF process contract and the experimental gateway's separate generic client fixture. Record client-side HTTP/3 conformance limitations separately; retain mandatory Cloudflare in every build.
 - **Cloudflare DNS is bundled in every build**, pinned at v0.2.4: normal `go build`, custom mains importing MASQUE, the installer and CI artifacts. Rebuilding no longer removes the provider. Module-registration checks require `dns.providers.cloudflare`.
 - **IETF behavior takes priority over response camouflage.** Refused HTTP/2 and HTTP/3 CONNECT-IP requests retain website bodies but use a non-2xx status; malformed anonymous upgrades receive protocol errors. HTTP/1.1 Upgrade refusals and ordinary web traffic retain their normal behavior.
 - Repair inherited HTTP/3 SETTINGS, QPACK critical-stream/error scope, required headers, content lengths, frame truncation and CONNECT/trailer validation, with independent wire regressions and valid website/tunnel controls.

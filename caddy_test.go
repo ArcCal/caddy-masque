@@ -383,26 +383,43 @@ func (e *caddyEnv) dialH2(t *testing.T, password, path string) *tunnelClient {
 
 func (e *caddyEnv) dialH1(t *testing.T, password, path string) *tunnelClient {
 	t.Helper()
-	conn, err := e.dialTCP(context.Background(), e.tlsConfig("http/1.1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: vpn.test:%d\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\n"+
-		"Capsule-Protocol: ?1\r\nAuthorization: %s\r\n\r\n", path, e.port, authorization(password))
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := &tunnelClient{status: resp.StatusCode, header: resp.Header, close: func() { conn.Close() }}
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		b, _ := io.ReadAll(resp.Body)
-		c.body = string(b)
-		c.close()
+	for attempt := 0; ; attempt++ {
+		conn, err := e.dialTCP(context.Background(), e.tlsConfig("http/1.1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: vpn.test:%d\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\n"+
+			"Capsule-Protocol: ?1\r\nAuthorization: %s\r\n\r\n", path, e.port, authorization(password)); err != nil {
+			conn.Close()
+			t.Fatal(err)
+		}
+		br := bufio.NewReader(conn)
+		// A retiring Caddy listener can finish TLS and then close before
+		// its first HTTP response. Retry only when no response byte arrived;
+		// partial or malformed responses must still fail ReadResponse.
+		if first, err := br.Peek(1); err != nil {
+			conn.Close()
+			if len(first) == 0 && attempt < 4 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)) {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			t.Fatal(err)
+		}
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			conn.Close()
+			t.Fatal(err)
+		}
+		c := &tunnelClient{status: resp.StatusCode, header: resp.Header, close: func() { conn.Close() }}
+		if resp.StatusCode != http.StatusSwitchingProtocols {
+			b, _ := io.ReadAll(resp.Body)
+			c.body = string(b)
+			c.close()
+			return c
+		}
+		streamClient(c, br, conn)
 		return c
 	}
-	streamClient(c, br, conn)
-	return c
 }
 
 type dialer func(*caddyEnv, *testing.T, string, string) *tunnelClient

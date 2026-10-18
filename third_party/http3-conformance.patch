@@ -46,7 +46,7 @@ index 252a288..4714ede 100644
 +}
 diff --git a/http3/conformance_test.go b/http3/conformance_test.go
 new file mode 100644
-index 0000000..880a699
+index 0000000..155db96
 --- /dev/null
 +++ b/http3/conformance_test.go
 @@ -0,0 +1,348 @@
@@ -333,7 +333,7 @@ index 0000000..880a699
 +			require.NoError(t, err)
 +			require.Equal(t, tc.body, string(body))
 +			if tc.method == "CONNECT" {
-+				require.NotContains(t, rsp.Header, "Content-Length")
++				require.Equal(t, tc.lengths, rsp.Header.Values("Content-Length"))
 +				require.Zero(t, rsp.ContentLength)
 +			}
 +		})
@@ -524,8 +524,226 @@ index 13fad6d..c568574 100644
 @@ -169 +173 @@ func TestParserPushFrames(t *testing.T) {
 -		require.ErrorIs(t, err, io.EOF)
 +		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+diff --git a/http3/header_field_conformance_test.go b/http3/header_field_conformance_test.go
+new file mode 100644
+index 0000000..305b1d1
+--- /dev/null
++++ b/http3/header_field_conformance_test.go
+@@ -0,0 +1,212 @@
++package http3
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"math"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/quic-go/qpack"
++	"github.com/quic-go/quic-go"
++	"github.com/stretchr/testify/require"
++)
++
++func TestHeaderFieldEdgeWhitespace(t *testing.T) {
++	for _, value := range []string{" leading", "trailing ", "\tleading", "trailing\t", " ", "\t", " \t"} {
++		t.Run(value, func(t *testing.T) {
++			require.Error(t, validateHeaderFieldNameAndValue(qpack.HeaderField{Name: "x-test", Value: value}))
++		})
++	}
++	for _, value := range []string{"", "value", "a b", "a\tb", "\x80", "\xff"} {
++		t.Run("valid/"+value, func(t *testing.T) {
++			require.NoError(t, validateHeaderFieldNameAndValue(qpack.HeaderField{Name: "x-test", Value: value}))
++		})
++	}
++}
++
++func TestTERequestListSemantics(t *testing.T) {
++	for _, value := range []string{"trailers", "Trailers", "TRAILERS", "trailers, trailers", "trailers,\tTRAILERS", ",trailers", "trailers,,", "", ",,"} {
++		t.Run(value, func(t *testing.T) {
++			fields := []qpack.HeaderField{{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "localhost"}, {Name: "te", Value: value}}
++			_, err := requestFromHeaders(decodeFromSlice(fields), math.MaxInt, nil)
++			require.NoError(t, err)
++		})
++	}
++	for _, value := range []string{"gzip", "trailers, gzip", "trailers;q=1", "\"trailers\"", "trailers ;q=1", "trailer\u017f"} {
++		t.Run("invalid/"+value, func(t *testing.T) {
++			fields := []qpack.HeaderField{{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}, {Name: ":authority", Value: "localhost"}, {Name: "te", Value: value}}
++			_, err := requestFromHeaders(decodeFromSlice(fields), math.MaxInt, nil)
++			require.Error(t, err)
++		})
++	}
++}
++
++func TestTEOnlyInRequestHeaders(t *testing.T) {
++	for _, value := range []string{"trailers", "Trailers", "trailers, trailers", ""} {
++		t.Run(value, func(t *testing.T) {
++			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice([]qpack.HeaderField{{Name: ":status", Value: "200"}, {Name: "te", Value: value}}), math.MaxInt, nil, false)
++			require.Error(t, err)
++			_, err = parseTrailers(decodeFromSlice([]qpack.HeaderField{{Name: "te", Value: value}}), math.MaxInt, nil)
++			require.Error(t, err)
++		})
++	}
++}
++
++func TestOutgoingHeaderWhitespaceNormalization(t *testing.T) {
++	const value = " \tvalue with\tinternal whitespace\t "
++	const trimmed = "value with\tinternal whitespace"
++	t.Run("request and request trailers", func(t *testing.T) {
++		req := httptest.NewRequest("GET", "https://localhost/", nil)
++		req.Header.Set("X-Trim", value)
++		req.Trailer = http.Header{"X-Trailer": {value}}
++		var buf bytes.Buffer
++		w := newRequestWriter()
++		require.NoError(t, w.WriteRequestHeader(&buf, req, false, 0, nil))
++		require.Equal(t, []string{trimmed}, decodeHeader(t, &buf)["x-trim"])
++		require.NoError(t, w.WriteRequestTrailer(&buf, req, 0, nil))
++		require.Equal(t, []string{trimmed}, decodeHeader(t, &buf)["x-trailer"])
++		require.Equal(t, value, req.Header.Get("X-Trim"))
++	})
++	t.Run("response and response trailers", func(t *testing.T) {
++		w := newTestResponseWriter(t)
++		w.Header().Set("X-Trim", value)
++		w.Header().Set("Te", "trailers")
++		w.Header().Set("Trailer", "X-Trailer")
++		_, err := w.Write([]byte("body"))
++		require.NoError(t, err)
++		w.Header().Set("X-Trailer", value)
++		headers := w.DecodeHeaders(t, 0)
++		require.Equal(t, []string{trimmed}, headers["x-trim"])
++		require.NotContains(t, headers, "te")
++		require.Equal(t, []byte("body"), w.DecodeBody(t))
++		require.Equal(t, []string{trimmed}, w.DecodeHeaders(t, 2)["x-trailer"])
++		require.Equal(t, value, w.Header().Get("X-Trim"))
++	})
++}
++
++func TestConformanceFieldRulesOnWire(t *testing.T) {
++	for _, tc := range []struct {
++		name    string
++		fields  []string
++		trailer bool
++		valid   bool
++	}{
++		{"leading space", []string{"x-test", " leading"}, false, false},
++		{"trailing tab", []string{"x-test", "trailing\t"}, false, false},
++		{"trailer edge whitespace", []string{"x-test", " leading"}, true, false},
++		{"TE case insensitive", []string{"te", "Trailers"}, false, true},
++		{"TE repeated list", []string{"te", "trailers,\tTRAILERS"}, false, true},
++		{"TE repeated fields", []string{"te", "trailers", "te", "TRAILERS"}, false, true},
++		{"TE empty list members", []string{"te", ",trailers,,"}, false, true},
++		{"TE forbidden coding", []string{"te", "trailers,gzip"}, false, false},
++		{"TE Unicode lookalike", []string{"te", "trailer\u017f"}, false, false},
++		{"TE trailer field", []string{"te", "trailers"}, true, false},
++	} {
++		t.Run("request/"+tc.name, func(t *testing.T) {
++			conn := conformanceServer(t, func(w http.ResponseWriter, r *http.Request) {
++				io.ReadAll(r.Body)
++				w.Write([]byte("ok"))
++			})
++			fields := []string{":method", "POST", ":scheme", "https", ":authority", "localhost", ":path", "/"}
++			var data []byte
++			if tc.trailer {
++				data = append(conformanceHeaders(t, fields...), conformanceHeaders(t, tc.fields...)...)
++			} else {
++				data = conformanceHeaders(t, append(fields, tc.fields...)...)
++			}
++			str := conformanceRequest(t, conn, data, true)
++			if tc.valid {
++				require.Equal(t, []string{"200"}, decodeHeader(t, str)[":status"])
++				_, err := io.ReadAll(str)
++				require.NoError(t, err)
++			} else {
++				_, err := io.ReadAll(str)
++				require.ErrorIs(t, err, &quic.StreamError{Remote: true, StreamID: str.StreamID(), ErrorCode: quic.StreamErrorCode(ErrCodeMessageError)})
++			}
++		})
++	}
++	for _, tc := range []struct {
++		name, key, value string
++		trailer          bool
++	}{
++		{"leading space", "x-test", " leading", false},
++		{"trailing tab", "x-test", "trailing\t", false},
++		{"trailer edge whitespace", "x-test", " leading", true},
++		{"TE response", "te", "trailers", false},
++		{"TE trailer", "te", "trailers", true},
++	} {
++		t.Run("response/"+tc.name, func(t *testing.T) {
++			client, server := newConnPair(t)
++			cc := (&Transport{DisableCompression: true}).NewClientConn(client)
++			stream, err := cc.OpenRequestStream(context.Background())
++			require.NoError(t, err)
++			require.NoError(t, stream.SetDeadline(time.Now().Add(time.Second)))
++			require.NoError(t, stream.SendRequestHeader(httptest.NewRequest("GET", "https://localhost/", nil)))
++			peer, err := server.AcceptStream(context.Background())
++			require.NoError(t, err)
++			data := conformanceHeaders(t, ":status", "200", tc.key, tc.value)
++			if tc.trailer {
++				data = append(conformanceHeaders(t, ":status", "200"), conformanceHeaders(t, tc.key, tc.value)...)
++			}
++			_, err = peer.Write(data)
++			require.NoError(t, err)
++			require.NoError(t, peer.Close())
++			rsp, err := stream.ReadResponse()
++			if err == nil {
++				_, err = io.ReadAll(rsp.Body)
++			}
++			require.Error(t, err)
++			require.NoError(t, peer.SetReadDeadline(time.Now().Add(time.Second)))
++			_, err = io.ReadAll(peer)
++			require.ErrorIs(t, err, &quic.StreamError{Remote: true, StreamID: peer.StreamID(), ErrorCode: quic.StreamErrorCode(ErrCodeMessageError)})
++		})
++	}
++}
++
++func TestResponseConnectionSpecificFieldsAreOmitted(t *testing.T) {
++	w := newTestResponseWriter(t)
++	for _, name := range []string{"connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te"} {
++		w.Header()[name] = []string{"legacy-value"}
++	}
++	// Exercise noncanonical keys, multiple field lines and case-insensitive
++	// connection options without editing the application's original Header map.
++	w.Header()["connection"] = []string{"close, X-Hop", "x-OTHER"}
++	w.Header().Set("X-Hop", "private")
++	w.Header().Set("X-Other", "also-private")
++	w.Header().Set("X-End-To-End", "public")
++	w.Header().Set("Trailer", "X-Trailer, Upgrade, X-Hop")
++	_, err := w.Write([]byte("body"))
++	require.NoError(t, err)
++	w.Header().Set("X-Trailer", "trailer-value")
++	w.Header().Set("X-Hop", "private-trailer")
++	w.Header().Set("Upgrade", "legacy-protocol")
++	headers := w.DecodeHeaders(t, 0)
++	require.Equal(t, []string{"public"}, headers["x-end-to-end"])
++	for _, name := range []string{"connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te", "x-hop", "x-other"} {
++		require.NotContains(t, headers, name)
++	}
++	require.Equal(t, []byte("body"), w.DecodeBody(t))
++	trailers := w.DecodeHeaders(t, 2)
++	require.Equal(t, map[string][]string{"x-trailer": {"trailer-value"}}, trailers)
++	require.Equal(t, []string{"close, X-Hop", "x-OTHER"}, w.Header()["connection"])
++	require.Equal(t, "private-trailer", w.Header().Get("X-Hop"))
++}
++
++func TestOutgoingTrailersOmitConnectionSpecificFields(t *testing.T) {
++	trailers := http.Header{
++		"Connection": {"X-Hop"}, "X-Hop": {"private"},
++		"Keep-Alive": {"timeout=5"}, "Proxy-Connection": {"close"},
++		"Transfer-Encoding": {"chunked"}, "Upgrade": {"legacy"},
++		"Te": {"trailers"}, "X-Trailer": {"public"},
++	}
++	var buf bytes.Buffer
++	written, err := writeTrailers(&buf, trailers, 0, nil)
++	require.NoError(t, err)
++	require.True(t, written)
++	require.Equal(t, map[string][]string{"x-trailer": {"public"}}, decodeHeader(t, &buf))
++	require.Equal(t, "private", trailers.Get("X-Hop"))
++}
 diff --git a/http3/headers.go b/http3/headers.go
-index 26bf168..a37cbe8 100644
+index 26bf168..a2878f6 100644
 --- a/http3/headers.go
 +++ b/http3/headers.go
 @@ -29,0 +30,7 @@ var errHeaderTooLarge = errors.New("http3: headers too large")
@@ -539,64 +757,156 @@ index 26bf168..a37cbe8 100644
 @@ -55 +62 @@ var invalidHeaderFields = [...]string{
 -func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, headerFields *[]qpack.HeaderField) (header, error) {
 +func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, headerFields *[]qpack.HeaderField, isConnect bool) (header, error) {
-@@ -132,0 +140,6 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
+@@ -127 +134 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
+-			if err := validateRegularHeaderField(h); err != nil {
++			if err := validateRegularHeaderField(h, isRequest); err != nil {
+@@ -132,0 +140,9 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
 +				// Pseudo headers precede regular fields, so :status is known.
 +				// RFC 9110 section 9.3.6 requires ignoring any Content-Length
 +				// on a successful CONNECT response, including invalid values.
 +				if !isRequest && isConnect && len(hdr.Status) == 3 && hdr.Status[0] == '2' {
++					// Retain the field for extensions with stricter requirements,
++					// such as the Capsule Protocol (RFC 9297 section 3.2).
++					hdr.Headers.Add(h.Name, h.Value)
 +					continue
 +				}
-@@ -147 +160 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
+@@ -147 +163 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
 -	if len(contentLengthStr) > 0 {
 +	if readContentLength {
-@@ -228 +241 @@ func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *
+@@ -158,0 +175,32 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
++// connectionHeaderFields returns the fields nominated by a legacy Connection
++// header. Keep the caller's map intact when converting its response to HTTP/3.
++func connectionHeaderFields(header http.Header) map[string]struct{} {
++	var fields map[string]struct{}
++	for name, values := range header {
++		if !strings.EqualFold(name, "Connection") {
++			continue
++		}
++		for _, value := range values {
++			for token := range strings.SplitSeq(value, ",") {
++				token = strings.Trim(token, " \t")
++				if !httpguts.ValidHeaderFieldName(token) {
++					continue
++				}
++				if fields == nil {
++					fields = make(map[string]struct{})
++				}
++				fields[strings.ToLower(token)] = struct{}{}
++			}
++		}
++	}
++	return fields
++}
++
++func isConnectionSpecificHeader(name string) bool {
++	return name == "te" || slices.Contains(invalidHeaderFields[:], name)
++}
++
++func validTrailerHeader(name string) bool {
++	return httpguts.ValidTrailerHeader(name) && !isConnectionSpecificHeader(strings.ToLower(name))
++}
++
+@@ -164 +212 @@ func validateHeaderFieldNameAndValue(h qpack.HeaderField) error {
+-	if !httpguts.ValidHeaderFieldValue(h.Value) {
++	if !httpguts.ValidHeaderFieldValue(h.Value) || strings.Trim(h.Value, " \t") != h.Value {
+@@ -170 +218 @@ func validateHeaderFieldNameAndValue(h qpack.HeaderField) error {
+-func validateRegularHeaderField(h qpack.HeaderField) error {
++func validateRegularHeaderField(h qpack.HeaderField, isRequest bool) error {
+@@ -177,2 +225,15 @@ func validateRegularHeaderField(h qpack.HeaderField) error {
+-	if h.Name == "te" && h.Value != "trailers" {
+-		return fmt.Errorf("invalid TE header field value: %q", h.Value)
++	if h.Name == "te" {
++		// TE is a case-insensitive list (RFC 9110 section 10.1.4).
++		// HTTP/3 permits only the trailers member, in request headers.
++		for member := range strings.SplitSeq(h.Value, ",") {
++			member = strings.Trim(member, " \t")
++			// Recipients ignore empty list members (RFC 9110 section 5.6.1.2).
++			// Restrict folding to the ASCII keyword; Unicode lookalikes are
++			// not the trailers token, even if Unicode case folding matches.
++			if member != "" && (len(member) != len("trailers") || !strings.EqualFold(member, "trailers")) {
++				return fmt.Errorf("invalid TE header field value: %q", h.Value)
++			}
++		}
++		if !isRequest {
++			return errors.New("TE header field is only permitted in request headers")
++		}
+@@ -184 +245 @@ func validateTrailerHeaderField(h qpack.HeaderField) error {
+-	if err := validateRegularHeaderField(h); err != nil {
++	if err := validateRegularHeaderField(h, false); err != nil {
+@@ -228 +289 @@ func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *
 -	hdr, err := parseHeaders(decodeFn, true, sizeLimit, headerFields)
 +	hdr, err := parseHeaders(decodeFn, true, sizeLimit, headerFields, false)
-@@ -298,0 +312,4 @@ func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *
+@@ -298,0 +360,4 @@ func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *
 +	if !isConnect && hdr.Scheme == "" {
 +		return nil, errors.New(":scheme must not be empty")
 +	}
 +
-@@ -350,2 +367,2 @@ func validExtendedConnectProtocol(protocol string) bool {
+@@ -350,2 +415,2 @@ func validExtendedConnectProtocol(protocol string) bool {
 -func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField) error {
 -	hdr, err := parseHeaders(decodeFn, false, sizeLimit, headerFields)
 +func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField, isConnect bool) error {
 +	hdr, err := parseHeaders(decodeFn, false, sizeLimit, headerFields, isConnect)
-@@ -450 +467 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
+@@ -400,0 +466 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
++	hopFields := connectionHeaderFields(trailers)
+@@ -403 +469,2 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+-		if httpguts.ValidTrailerHeader(k) && len(vals) > 0 {
++		_, hop := hopFields[strings.ToLower(k)]
++		if validTrailerHeader(k) && !hop && len(vals) > 0 {
+@@ -423 +490,2 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+-		if !httpguts.ValidTrailerHeader(k) {
++		lowercaseKey := strings.ToLower(k)
++		if _, hop := hopFields[lowercaseKey]; !validTrailerHeader(k) || hop {
+@@ -426 +493,0 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+-		lowercaseKey := strings.ToLower(k)
+@@ -427,0 +495 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
++			v = strings.Trim(v, " \t")
+@@ -450 +518 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
 -		return nil, fmt.Errorf("http3: HEADERS frame too large: %d bytes (max: %d)", hf.Length, maxHeaderBytes)
 +		return nil, &trailerError{fmt.Errorf("%w: HEADERS frame too large: %d bytes (max: %d)", errHeaderTooLarge, hf.Length, maxHeaderBytes)}
-@@ -467 +484 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
+@@ -467 +535 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
 -		return nil, err
 +		return nil, &trailerError{err}
 diff --git a/http3/headers_test.go b/http3/headers_test.go
-index ba1df9c..f651e45 100644
+index ba1df9c..d483e67 100644
 --- a/http3/headers_test.go
 +++ b/http3/headers_test.go
-@@ -85,0 +86 @@ func TestRequestHeadersContentLength(t *testing.T) {
+@@ -9,0 +10 @@ import (
++	"strings"
+@@ -85,0 +87 @@ func TestRequestHeadersContentLength(t *testing.T) {
 +			{Name: ":scheme", Value: "https"},
-@@ -96,0 +98 @@ func TestRequestHeadersContentLength(t *testing.T) {
+@@ -96,0 +99 @@ func TestRequestHeadersContentLength(t *testing.T) {
 +			{Name: ":scheme", Value: "https"},
-@@ -394,0 +397 @@ func TestCookieHeader(t *testing.T) {
+@@ -394,0 +398 @@ func TestCookieHeader(t *testing.T) {
 +		{Name: ":scheme", Value: "https"},
-@@ -409,0 +413 @@ func TestHeadersConcatenation(t *testing.T) {
+@@ -409,0 +414 @@ func TestHeadersConcatenation(t *testing.T) {
 +		{Name: ":scheme", Value: "https"},
-@@ -549 +553 @@ func TestResponseHeaderParsing(t *testing.T) {
+@@ -549 +554 @@ func TestResponseHeaderParsing(t *testing.T) {
 -	require.NoError(t, updateResponseFromHeaders(rsp, decodeFromSlice(headers), math.MaxInt, nil))
 +	require.NoError(t, updateResponseFromHeaders(rsp, decodeFromSlice(headers), math.MaxInt, nil, false))
-@@ -599 +603 @@ func TestResponseHeaderParsingValidation(t *testing.T) {
+@@ -599 +604 @@ func TestResponseHeaderParsingValidation(t *testing.T) {
 -			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(tc.headers), math.MaxInt, nil)
 +			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(tc.headers), math.MaxInt, nil, false)
-@@ -624 +628 @@ func TestResponseHeaderParsingValidation(t *testing.T) {
+@@ -624 +629 @@ func TestResponseHeaderParsingValidation(t *testing.T) {
 -			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil)
 +			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false)
-@@ -637 +641 @@ func TestResponseTrailerFields(t *testing.T) {
+@@ -637 +642 @@ func TestResponseTrailerFields(t *testing.T) {
 -	require.NoError(t, updateResponseFromHeaders(&rsp, decodeFromSlice(headers), math.MaxInt, nil))
 +	require.NoError(t, updateResponseFromHeaders(&rsp, decodeFromSlice(headers), math.MaxInt, nil, false))
-@@ -651 +655 @@ func TestResponseTrailerParsingTE(t *testing.T) {
+@@ -646 +651 @@ func TestResponseTrailerFields(t *testing.T) {
+-func TestResponseTrailerParsingTE(t *testing.T) {
++func TestResponseHeaderTEIsNotPermitted(t *testing.T) {
+@@ -651,5 +655,0 @@ func TestResponseTrailerParsingTE(t *testing.T) {
 -	require.NoError(t, updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil))
-+	require.NoError(t, updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false))
-@@ -657 +661 @@ func TestResponseTrailerParsingTE(t *testing.T) {
+-	headers = []qpack.HeaderField{
+-		{Name: ":status", Value: "404"},
+-		{Name: "te", Value: "not-trailers"},
+-	}
+@@ -657 +657,5 @@ func TestResponseTrailerParsingTE(t *testing.T) {
 -		updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil),
++		updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false),
++		"TE header field is only permitted in request headers")
++	headers[1].Value = "not-trailers"
++	require.EqualError(t,
 +		updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false),
 @@ -779 +783 @@ func TestQpackError(t *testing.T) {
 -		err := updateResponseFromHeaders(&http.Response{}, decodeFn, math.MaxInt, nil)
@@ -604,6 +914,16 @@ index ba1df9c..f651e45 100644
 @@ -914 +918 @@ func FuzzHeaderParsing(f *testing.F) {
 -		if err := updateResponseFromHeaders(rsp, decodeFromSlice(headers), maxHeaderBytes, nil); err == nil {
 +		if err := updateResponseFromHeaders(rsp, decodeFromSlice(headers), maxHeaderBytes, nil, false); err == nil {
+@@ -937,0 +942 @@ func requireValidFuzzHeader(t *testing.T, h http.Header, context string) {
++			require.Equal(t, strings.Trim(value, " \t"), value, "field value contains edge whitespace")
+@@ -943,0 +949 @@ func requireValidFuzzHeader(t *testing.T, h http.Header, context string) {
++		require.Equal(t, "request", context, "TE is only permitted in request headers")
+@@ -945 +951,4 @@ func requireValidFuzzHeader(t *testing.T, h http.Header, context string) {
+-			require.Equalf(t, "trailers", value, "%s contains invalid TE header field value: %q", context, value)
++			for _, member := range strings.Split(value, ",") {
++				member = strings.Trim(member, " \t")
++				require.Truef(t, member == "" || len(member) == len("trailers") && strings.EqualFold(member, "trailers"), "%s contains invalid TE member: %q", context, member)
++			}
 diff --git a/http3/qpack_stream.go b/http3/qpack_stream.go
 new file mode 100644
 index 0000000..3e88f4b
@@ -864,33 +1184,67 @@ index 0000000..fb942ea
 +	})
 +	return peer, str
 +}
+diff --git a/http3/request_writer.go b/http3/request_writer.go
+index ec362c2..0856584 100644
+--- a/http3/request_writer.go
++++ b/http3/request_writer.go
+@@ -65 +65 @@ func (w *requestWriter) writeHeaders(wr io.Writer, req *http.Request, gzip bool,
+-			if httpguts.ValidTrailerHeader(k) {
++			if validTrailerHeader(k) {
+@@ -198 +198 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
+-				f(k, v)
++				f(k, strings.Trim(v, " \t"))
 diff --git a/http3/response_writer.go b/http3/response_writer.go
-index 453c2f4..68fafe5 100644
+index 453c2f4..cdf956e 100644
 --- a/http3/response_writer.go
 +++ b/http3/response_writer.go
-@@ -100,0 +101,4 @@ func (w *responseWriter) WriteHeader(status int) {
+@@ -15,2 +14,0 @@ import (
+-
+-	"golang.org/x/net/http/httpguts"
+@@ -100,0 +99,4 @@ func (w *responseWriter) WriteHeader(status int) {
 +	if w.str.isConnect && status >= 200 && status < 300 {
 +		w.str.tunnel.Store(true)
 +		w.header.Del("Content-Length")
 +	}
-@@ -131 +135 @@ func (w *responseWriter) sniffContentType(p []byte) {
+@@ -131 +133 @@ func (w *responseWriter) sniffContentType(p []byte) {
 -	if !hasCE && !haveType && len(p) > 0 {
 +	if !w.str.tunnel.Load() && !hasCE && !haveType && len(p) > 0 {
-@@ -137 +141 @@ func (w *responseWriter) Write(p []byte) (int, error) {
+@@ -137 +139 @@ func (w *responseWriter) Write(p []byte) (int, error) {
 -	bodyAllowed := bodyAllowedForStatus(w.status)
 +	bodyAllowed := w.str.tunnel.Load() || bodyAllowedForStatus(w.status)
-@@ -139 +142,0 @@ func (w *responseWriter) Write(p []byte) (int, error) {
+@@ -139 +140,0 @@ func (w *responseWriter) Write(p []byte) (int, error) {
 -		w.sniffContentType(p)
-@@ -140,0 +144 @@ func (w *responseWriter) Write(p []byte) (int, error) {
+@@ -140,0 +142 @@ func (w *responseWriter) Write(p []byte) (int, error) {
 +		w.sniffContentType(p)
-@@ -233,0 +238,3 @@ func (w *responseWriter) writeHeader(status int) error {
+@@ -232,0 +235 @@ func (w *responseWriter) writeHeader(status int) error {
++	hopFields := connectionHeaderFields(w.header)
+@@ -233,0 +237,9 @@ func (w *responseWriter) writeHeader(status int) error {
++		name := strings.ToLower(k)
++		// HTTP/3 cannot carry Connection or other hop-by-hop response fields,
++		// including those explicitly nominated by a legacy Connection value.
++		if _, hop := hopFields[name]; isConnectionSpecificHeader(name) || hop {
++			continue
++		}
 +		if w.str.tunnel.Load() && strings.EqualFold(k, "Content-Length") {
 +			continue
 +		}
-@@ -309,0 +317,3 @@ func (w *responseWriter) writeTrailers() error {
+@@ -242,2 +254 @@ func (w *responseWriter) writeHeader(status int) error {
+-			name := strings.ToLower(k)
+-			value := v[index]
++			value := strings.Trim(v[index], " \t")
+@@ -295 +306 @@ func (w *responseWriter) declareTrailer(k string) {
+-	if !httpguts.ValidTrailerHeader(k) {
++	if !validTrailerHeader(k) {
+@@ -309,0 +321,3 @@ func (w *responseWriter) writeTrailers() error {
 +	if w.str.tunnel.Load() {
 +		return nil
 +	}
+@@ -321,0 +336 @@ func (w *responseWriter) writeTrailers() error {
++	hopFields := connectionHeaderFields(w.header)
+@@ -323,0 +339,3 @@ func (w *responseWriter) writeTrailers() error {
++		if _, hop := hopFields[strings.ToLower(strings.TrimPrefix(trailer, http.TrailerPrefix))]; hop {
++			continue
++		}
 diff --git a/http3/response_writer_test.go b/http3/response_writer_test.go
 index 8d0b2f4..efa50bb 100644
 --- a/http3/response_writer_test.go

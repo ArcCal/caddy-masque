@@ -62,7 +62,7 @@ func (w *requestWriter) writeHeaders(wr io.Writer, req *http.Request, gzip bool,
 	if len(req.Trailer) > 0 {
 		keys := make([]string, 0, len(req.Trailer))
 		for k := range req.Trailer {
-			if httpguts.ValidTrailerHeader(k) {
+			if validTrailerHeader(k) {
 				keys = append(keys, k)
 			}
 		}
@@ -195,7 +195,7 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
 			}
 
 			for _, v := range vv {
-				f(k, v)
+				f(k, strings.Trim(v, " \t"))
 			}
 		}
 		if shouldSendReqContentLength(req.Method, contentLength) {

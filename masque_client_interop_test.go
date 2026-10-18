@@ -6,7 +6,8 @@ package masque
 // IPv6, so IPv4 and IPv6 through the tunnel are checked on any host, over
 // HTTP/3 (with QUIC datagrams, and with DATAGRAM capsules), HTTP/2 and
 // HTTP/1.1. MASQUE_CLIENT names the binary; CI sets it in the end-to-end
-// job, which builds the client.
+// job, which builds the client. The stdin cases exercise IETF Masque GUI's
+// production CLI/configuration lifeline contract, not the Swift GUI itself.
 
 import (
 	"bytes"
@@ -226,6 +227,7 @@ func TestInteropMasqueClient(t *testing.T) {
 	e.cert = cert
 	cfg := masqueConfig("alice")
 	cfg["blocked_destinations"] = []string{}
+	cfg["max_sessions"] = 1
 	if err := e.load(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -249,20 +251,26 @@ func TestInteropMasqueClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	v4, v6 := netip.MustParseAddr("198.51.100.7"), netip.MustParseAddr("2001:db8::7")
-	for _, c := range []struct{ name, transport string }{
-		{"h3", "h3"}, {"h2", "h2"}, {"http1.1", "http/1.1"},
+	for _, c := range []struct {
+		name, transport string
+		stdin           bool
+	}{
+		{"h3", "h3", false}, {"h2", "h2", false}, {"http1.1", "http/1.1", false},
 		// With `http3 off`, Caddy's own HTTP/3 server, which announces no
 		// HTTP Datagrams: packets travel in DATAGRAM capsules (RFC 9297
 		// §3.5) on the HTTP/3 stream.
-		{"h3-capsules", "h3"},
+		{"h3-capsules", "h3", false},
+		{"stdin-h3", "h3", true}, {"stdin-h2", "h2", true}, {"stdin-http1.1", "http/1.1", true},
+		{"stdin-h3-capsules", "h3", true}, {"stdin-auto", "auto", true},
 	} {
 		transport := c.transport
 		t.Run(c.name, func(t *testing.T) {
-			if c.name == "h3-capsules" {
-				cfg["http3"] = false
-				if err := e.load(cfg); err != nil {
-					t.Fatal(err)
-				}
+			capsules := strings.HasSuffix(c.name, "h3-capsules")
+			cfg["http3"] = !capsules
+			if err := e.load(cfg); err != nil {
+				t.Fatal(err)
+			}
+			if capsules {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				conn, err := quic.DialAddr(ctx, fmt.Sprintf("127.0.0.1:%d", e.port),
@@ -279,8 +287,7 @@ func TestInteropMasqueClient(t *testing.T) {
 				}
 			}
 			socks := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-			config := filepath.Join(dir, "client.toml")
-			if err := os.WriteFile(config, []byte(fmt.Sprintf(`uri_template = "https://127.0.0.1:%d/.well-known/masque/ip/{target}/{ipproto}/"
+			configText := []byte(fmt.Sprintf(`uri_template = "https://127.0.0.1:%d/.well-known/masque/ip/{target}/{ipproto}/"
 server_name = "vpn.test"
 ca = %q
 username = "alice"
@@ -291,36 +298,65 @@ dns = ["198.51.100.53", "2001:db8::53"]
 
 [socks]
 listen = [%q]
-`, e.port, caFile, testPassword, transport, socks)), 0o600); err != nil {
-				t.Fatal(err)
+`, e.port, caFile, testPassword, transport, socks))
+			config := "-"
+			if !c.stdin {
+				config = filepath.Join(t.TempDir(), "client.toml")
+				if err := os.WriteFile(config, configText, 0o600); err != nil {
+					t.Fatal(err)
+				}
 			}
 			var out lockedBuffer
 			cmd := exec.Command(client, "--config", config)
 			cmd.Env = append(os.Environ(), "RUST_LOG=info")
 			cmd.Stdout, cmd.Stderr = &out, &out
+			var input io.WriteCloser
+			if c.stdin {
+				var err error
+				input, err = cmd.StdinPipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if input != nil {
+						_ = input.Close()
+					}
+				}()
+			}
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
 			exited := make(chan error, 1)
 			go func() { exited <- cmd.Wait() }()
+			stopped := false
 			defer func() {
-				_ = cmd.Process.Signal(os.Interrupt)
-				select {
-				case <-exited:
-				case <-time.After(5 * time.Second):
-					_ = cmd.Process.Kill()
-					<-exited
+				if !stopped {
+					_ = cmd.Process.Signal(os.Interrupt)
+					select {
+					case <-exited:
+					case <-time.After(5 * time.Second):
+						_ = cmd.Process.Kill()
+						<-exited
+					}
 				}
+				waitNoSessions(t)
 				if t.Failed() {
 					t.Logf("masque-client output:\n%s", out.String())
 				}
 			}()
+			if input != nil {
+				// The GUI sends UTF-8 TOML plus NUL and holds stdin open for
+				// the entire connection. No password file is created here.
+				if _, err := input.Write(append(configText, 0)); err != nil {
+					t.Fatal(err)
+				}
+			}
 			deadline := time.After(20 * time.Second)
-			want := map[string]string{"h3": "HTTP/3", "h2": "HTTP/2", "http/1.1": "HTTP/1.1"}[transport]
+			want := map[string]string{"h3": "HTTP/3", "h2": "HTTP/2", "http/1.1": "HTTP/1.1", "auto": "HTTP/3"}[transport]
 			for !strings.Contains(out.String(), "tunnel up") {
 				select {
 				case err := <-exited:
-					exited <- err // for the deferred cleanup
+					stopped = true
 					t.Fatalf("masque-client exited: %v", err)
 				case <-deadline:
 					t.Fatal("the tunnel did not come up")
@@ -357,6 +393,34 @@ listen = [%q]
 				if strings.Contains(out.String(), bad) {
 					t.Fatalf("the client logged %q", bad)
 				}
+			}
+			if c.stdin {
+				if err := input.Close(); err != nil {
+					t.Fatal(err)
+				}
+				input = nil
+				select {
+				case err := <-exited:
+					stopped = true
+					if err != nil {
+						t.Fatalf("masque-client exited after stdin EOF: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("masque-client did not exit after stdin EOF")
+				}
+				// Process exit must release both its listener and the SOCKS
+				// association's UDP socket; session cleanup releases the only
+				// quota slot before the next case opens another tunnel.
+				listener, err := net.Listen("tcp", socks)
+				if err != nil {
+					t.Fatalf("SOCKS listener remained bound after stdin EOF: %v", err)
+				}
+				_ = listener.Close()
+				relay, err := net.ListenUDP("udp", udp.to)
+				if err != nil {
+					t.Fatalf("SOCKS UDP association remained bound after stdin EOF: %v", err)
+				}
+				_ = relay.Close()
 			}
 		})
 	}

@@ -378,6 +378,16 @@ func (r *running) addr(v6 bool) string {
 	panic("no address of the family")
 }
 
+// Allocations are random, so a fixed address in the test pool might already
+// belong to a session. Keep negative packet and assignment cases unassigned.
+func unusedIPv4(leases ...*running) netip.Addr {
+	a := netip.MustParseAddr("10.89.0.250")
+	for slices.ContainsFunc(leases, func(r *running) bool { return slices.Contains(r.lease.addrs, a) }) {
+		a = a.Next()
+	}
+	return a
+}
+
 func (r *running) waitEnd(tb testing.TB) string {
 	tb.Helper()
 	select {
@@ -499,7 +509,7 @@ func TestClientPacketsThatAreDropped(t *testing.T) {
 	r := e.start(t, alice, true)
 	other := e.start(t, bob, true)
 	for name, payload := range map[string][]byte{
-		"spoofed IPv4 source":        append([]byte{0}, udp("10.89.0.200", "1.1.1.1", 10)...),
+		"spoofed IPv4 source":        append([]byte{0}, udp(unusedIPv4(r, other).String(), "1.1.1.1", 10)...),
 		"another client's source":    append([]byte{0}, udp(other.addr(false), "1.1.1.1", 10)...),
 		"spoofed IPv6 source":        append([]byte{0}, udp("2001:db8::1", "2606:4700::1111", 10)...),
 		"unknown context ID":         append([]byte{2}, udp(r.addr(false), "1.1.1.1", 10)...),
@@ -654,7 +664,7 @@ func TestNetworkPacketsReachTheirClient(t *testing.T) {
 		}
 		other.tun.quiet(t)
 		// Nobody's address: dropped.
-		e.dev.fromHost <- udp("1.1.1.1", "10.89.0.250", 10)
+		e.dev.fromHost <- udp("1.1.1.1", unusedIPv4(r, other).String(), 10)
 		r.tun.quiet(t)
 		other.tun.quiet(t)
 	}
@@ -666,7 +676,7 @@ func TestAddressRequestsAreAnswered(t *testing.T) {
 	r.tun.capsules <- proto.AddressRequest{
 		{RequestID: 7, Prefix: proto.Unspecified(false)},
 		{RequestID: 8, Prefix: proto.Unspecified(true)},
-		{RequestID: 9, Prefix: netip.MustParsePrefix("10.89.0.77/32")},
+		{RequestID: 9, Prefix: proto.Host(unusedIPv4(r))},
 	}
 	reply, ok := r.tun.next(t).(proto.AddressAssign)
 	if !ok || len(reply) != 3 {

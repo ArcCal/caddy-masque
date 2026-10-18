@@ -12,8 +12,6 @@ import (
 
 	"github.com/quic-go/qpack"
 	"github.com/quic-go/quic-go/http3/qlog"
-
-	"golang.org/x/net/http/httpguts"
 )
 
 // HTTPStreamer allows an HTTP handler to take over an HTTP/3 stream.
@@ -234,7 +232,14 @@ func (w *responseWriter) writeHeader(status int) error {
 		}
 	}
 
+	hopFields := connectionHeaderFields(w.header)
 	for k, v := range w.header {
+		name := strings.ToLower(k)
+		// HTTP/3 cannot carry Connection or other hop-by-hop response fields,
+		// including those explicitly nominated by a legacy Connection value.
+		if _, hop := hopFields[name]; isConnectionSpecificHeader(name) || hop {
+			continue
+		}
 		if w.str.tunnel.Load() && strings.EqualFold(k, "Content-Length") {
 			continue
 		}
@@ -246,8 +251,7 @@ func (w *responseWriter) writeHeader(status int) error {
 			continue
 		}
 		for index := range v {
-			name := strings.ToLower(k)
-			value := v[index]
+			value := strings.Trim(v[index], " \t")
 			if err := enc.WriteField(qpack.HeaderField{Name: name, Value: value}); err != nil {
 				return err
 			}
@@ -299,7 +303,7 @@ func (w *responseWriter) Flush() {
 // declareTrailer adds a trailer to the trailer list, while also validating that the trailer has a
 // valid name.
 func (w *responseWriter) declareTrailer(k string) {
-	if !httpguts.ValidTrailerHeader(k) {
+	if !validTrailerHeader(k) {
 		// Forbidden by RFC 9110, section 6.5.1.
 		if w.logger != nil {
 			w.logger.Debug("ignoring invalid trailer", slog.String("header", k))
@@ -329,8 +333,12 @@ func (w *responseWriter) writeTrailers() error {
 		return nil
 	}
 
+	hopFields := connectionHeaderFields(w.header)
 	trailers := make(http.Header, len(w.trailers))
 	for trailer := range w.trailers {
+		if _, hop := hopFields[strings.ToLower(strings.TrimPrefix(trailer, http.TrailerPrefix))]; hop {
+			continue
+		}
 		if vals, ok := w.header[trailer]; ok {
 			trailers[strings.TrimPrefix(trailer, http.TrailerPrefix)] = vals
 		}
