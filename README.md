@@ -29,6 +29,7 @@ repairs, current-client results and remaining native/kernel validation limits.
 The [all-client compatibility follow-up](docs/all-client-compatibility-2026-10-18.md) includes NF, the GUI's CLI process
 contract, the independent gateway client fixture, and confirmed client-side RFC limitations. Protocol-core tests do not
 establish native Network.framework or GUI acceptance.
+The separate [client IETF conformance audit](docs/client-ietf-conformance-2026-10-18.md) details each client finding, affected implementations, pinned source and RFC evidence, reproduction boundaries, and private WARP/SOCKS limitations.
 
 ## One-step install
 
