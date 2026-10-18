@@ -1,7 +1,7 @@
 [package]
 name = "caddy-wrapper-compat"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [workspace]
@@ -12,6 +12,26 @@ bytes = "1"
 masque-vpn = { path = __MASQUE_CORE_PATH__ }
 masque-vpn-mac = { path = __MASQUE_MAC_PATH__ }
 masque-vpn-killswitch = { path = __MASQUE_KILLSWITCH_PATH__ }
+masque-nf-core = { path = __MASQUE_NF_PATH__ }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls-pki-types = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+rcgen = "0.14"
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[[bin]]
+name = "caddy-nf-compat"
+path = "src/nf.rs"
+
+# Cargo only applies patches declared by the top-level workspace. Match the
+# current clients' transport fixes rather than silently testing upstream h3.
+[patch."https://github.com/hyperium/h3"]
+h3 = { path = __MASQUE_H3_PATH__ }
+h3-quinn = { path = __MASQUE_H3_QUINN_PATH__ }

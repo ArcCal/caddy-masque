@@ -182,14 +182,16 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
 	case streamTypeQPACKEncoderStream:
 		if isFirst := c.rcvdQPACKEncoderStr.CompareAndSwap(false, true); !isFirst {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK encoder stream")
+			return
 		}
-		// Our QPACK implementation doesn't use the dynamic table yet.
+		c.handleQPACKStream(str, true)
 		return
 	case streamTypeQPACKDecoderStream:
 		if isFirst := c.rcvdQPACKDecoderStr.CompareAndSwap(false, true); !isFirst {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK decoder stream")
+			return
 		}
-		// Our QPACK implementation doesn't use the dynamic table yet.
+		c.handleQPACKStream(str, false)
 		return
 	case streamTypePushStream:
 		if isServer {
@@ -218,6 +220,10 @@ func (c *rawConn) handleControlStream(str *quic.ReceiveStream) {
 	if err != nil {
 		if errors.Is(err, errPriorityUpdateForPush) {
 			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeMissingSettings), "")
+			return
+		}
+		if _, ok := errors.AsType[*settingsError](err); ok {
+			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeSettingsError), err.Error())
 			return
 		}
 		_, isStreamError := errors.AsType[*quic.StreamError](err)

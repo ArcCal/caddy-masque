@@ -22,110 +22,54 @@ jobs:
       MASQUE_VPN_TOKEN: ${{ secrets.MASQUE_VPN_TOKEN }}
 
   build:
-    name: Build Linux ${{ inputs.arch }}
+    name: Package tested Linux ${{ inputs.arch }}
     needs: validate
     runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
-          path: source
           persist-credentials: false
-
-      - uses: actions/checkout@v7
-        with:
-          repository: ArcCal/masque-vpn
-          token: ${{ secrets.MASQUE_VPN_TOKEN }}
-          path: masque-vpn
-          persist-credentials: false
-
       - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
           check-latest: true
-          cache: false
-
-      - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v8
         with:
-          workspaces: masque-vpn
-
-      - name: Build pinned modules
+          name: tested-caddy-linux-${{ inputs.arch }}
+          path: tested
+      # The default build now includes Cloudflare. Reuse the exact executable
+      # that passed validate.yml's kernel and wire interoperability gates.
+      - name: Package validated MASQUE and Cloudflare modules
         shell: bash
-        env:
-          CGO_ENABLED: '0'
-          GOOS: linux
-          GOARCH: ${{ inputs.arch }}
-          GOTOOLCHAIN: local
         run: |
           set -euo pipefail
-          mkdir build
-          cd build
-          go mod init caddy-custom-build
-          cat > main.go <<'EOF'
-          package main
-          import (
-              caddycmd "github.com/caddyserver/caddy/v2/cmd"
-              _ "github.com/caddyserver/caddy/v2/modules/standard"
-              _ "github.com/ArcCal/caddy-masque"
-              _ "github.com/caddy-dns/cloudflare"
-          )
-          func main() { caddycmd.Main() }
-          EOF
-          go mod edit -require=github.com/ArcCal/caddy-masque@v0.0.0 -replace=github.com/ArcCal/caddy-masque=../source
-          go mod edit -replace=golang.org/x/net=../source/third_party/xnet
-          go mod edit -replace=github.com/quic-go/quic-go=../source/third_party/quic-go
-          go get github.com/caddyserver/caddy/v2@v2.11.7 github.com/caddy-dns/cloudflare@a8737d095ad5a48ca031cea6ab704057dbc2d250
-          go mod tidy
-          go mod verify
-          mkdir -p dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}
-          go build -mod=readonly -buildvcs=false -trimpath -ldflags '-s -w' -o dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/caddy .
-          binary=dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/caddy
+          (cd tested && sha256sum -c caddy.sha256)
+          name=caddy-masque-cloudflare-linux-${{ inputs.arch }}
+          mkdir -p "dist/$name"
+          cp tested/caddy "dist/$name/caddy"
+          cp tested/caddy.sha256 "dist/$name/caddy.sha256"
+          chmod +x "dist/$name/caddy"
+          binary="dist/$name/caddy"
           "$binary" version
-          "$binary" list-modules > modules.txt
+          "$binary" list-modules > "$RUNNER_TEMP/modules.txt"
           for module in masque http.handlers.masque dns.providers.cloudflare; do
-            grep -Fx "$module" modules.txt
+            grep -Fx "$module" "$RUNNER_TEMP/modules.txt"
           done
-          go version -m "$binary" > dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/build-info.txt
-          git -C ../source rev-parse HEAD > dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/masque-source-commit.txt
-          cp go.mod go.sum dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/
-          cd dist
-          tar -czf caddy-masque-cloudflare-linux-${{ inputs.arch }}.tar.gz caddy-masque-cloudflare-linux-${{ inputs.arch }}
-          sha256sum caddy-masque-cloudflare-linux-${{ inputs.arch }}.tar.gz > caddy-masque-cloudflare-linux-${{ inputs.arch }}.tar.gz.sha256
-
-      - name: Reachable vulnerabilities in the Cloudflare build
-        working-directory: build
-        env:
-          CGO_ENABLED: '0'
-          GOOS: linux
-          GOARCH: ${{ inputs.arch }}
-          GOTOOLCHAIN: local
-          GOFLAGS: '-mod=readonly'
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest -mode=source ./...
-
-      - name: Build interoperability client and network simulator
-        run: |
-          cargo build --locked --release --manifest-path masque-vpn/Cargo.toml --bin masque-client
-          CGO_ENABLED=0 go -C source build -trimpath -o "$PWD/netsim" ./tests/netsim
-
-      - name: Required interoperability tests of the Cloudflare build
-        run: |
-          set -euo pipefail
-          sudo apt-get update -q
-          sudo apt-get install -y -q iperf3 nftables
-          sudo REQUIRE_ALL_TESTS=1 CADDY="$PWD/build/dist/caddy-masque-cloudflare-linux-${{ inputs.arch }}/caddy" CLIENT_BIN="$PWD/masque-vpn/target/release/masque-client" NETSIM="$PWD/netsim" source/tests/e2e-netns.sh | tee "$RUNNER_TEMP/masque-e2e.log"
-          if ! grep -Eq '^[1-9][0-9]* passed, 0 failed, 0 skipped$' "$RUNNER_TEMP/masque-e2e.log"; then
-            echo "::error::required interoperability tests must report passing checks with no failures or skips"
-            exit 1
-          fi
-
+          go version -m "$binary" > "dist/$name/build-info.txt"
+          grep -qP '^\tbuild\tGOOS=linux$' "dist/$name/build-info.txt"
+          grep -qP '^\tbuild\tGOARCH=${{ inputs.arch }}$' "dist/$name/build-info.txt"
+          grep -qP "^\tbuild\tvcs.revision=$(git rev-parse HEAD)$" "dist/$name/build-info.txt"
+          git rev-parse HEAD > "dist/$name/masque-source-commit.txt"
+          cp go.mod go.sum "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
       - name: Upload downloadable artifact
         uses: actions/upload-artifact@v7
         with:
           name: caddy-masque-cloudflare-linux-${{ inputs.arch }}
           path: |
-            build/dist/*.tar.gz
-            build/dist/*.sha256
+            dist/*.tar.gz
+            dist/*.sha256
           if-no-files-found: error
           retention-days: 30

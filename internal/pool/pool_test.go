@@ -173,3 +173,35 @@ func TestTinyIPv4Prefixes(t *testing.T) {
 		}
 	}
 }
+
+func TestLargePoolsBoundHistoryAndRequireCleanup(t *testing.T) {
+	for _, prefix := range []string{"10.0.0.1/8", "fd00::1/65"} {
+		t.Run(prefix, func(t *testing.T) {
+			f := newFamily(p(prefix))
+			for range maxReturned + 1000 {
+				a, used, ok := f.allocate()
+				if !ok || used != f.historyFull {
+					t.Fatalf("allocation %v used=%v historyFull=%v ok=%v", a, used, f.historyFull, ok)
+				}
+				f.release(a)
+				if len(f.returned) > maxReturned || len(f.order) > 2*maxReturned+64 {
+					t.Fatalf("unbounded history: %d returned, %d ordered", len(f.returned), len(f.order))
+				}
+			}
+			if !f.historyFull || len(f.inUse) != 0 || len(f.returned) != 0 || len(f.order) != 0 {
+				t.Fatalf("history was not retired safely: %+v", f)
+			}
+			a, used, ok := f.allocate()
+			if !ok || !used {
+				t.Fatal("uncertain history must trigger conntrack cleanup")
+			}
+			f.release(a)
+			if !f.claim(a) || f.claim(a) {
+				t.Fatal("same-user reclaim must still reserve the address once")
+			}
+			if b, used, ok := f.allocate(); !ok || !used || b == a {
+				t.Fatal("active addresses must remain excluded after history retirement")
+			}
+		})
+	}
+}

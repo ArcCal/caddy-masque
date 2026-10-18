@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"sync/atomic"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3/qlog"
@@ -53,18 +54,47 @@ type frameParser struct {
 	client bool
 	// request is set on request streams, where frames that belong only on
 	// the control stream are rejected as soon as their type is read.
+	tunnel    *atomic.Bool
 	request   bool
 	r         io.Reader
 	streamID  quic.StreamID
 	closeConn func(quic.ApplicationErrorCode, string) error
 }
 
-func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
+// truncatedFrame distinguishes a clean frame-boundary EOF from a FIN inside a
+// frame. Peer resets and transport errors retain their original semantics.
+func truncatedFrame(closeConn func(quic.ApplicationErrorCode, string) error, err error) error {
+	if err != io.EOF && err != io.ErrUnexpectedEOF {
+		return err
+	}
+	if closeConn != nil {
+		closeConn(quic.ApplicationErrorCode(ErrCodeFrameError), "truncated HTTP/3 frame")
+	}
+	return io.ErrUnexpectedEOF
+}
+
+func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (_ frame, err error) {
 	r := &countingByteReader{Reader: quicvarint.NewReader(p.r)}
+	defer func() {
+		if err == io.ErrUnexpectedEOF || err == io.EOF && r.NumRead > 0 {
+			err = truncatedFrame(p.closeConn, err)
+		} else if errors.Is(err, errMalformedFrame) && p.closeConn != nil {
+			p.closeConn(quic.ApplicationErrorCode(ErrCodeFrameError), err.Error())
+		}
+	}()
 	for {
 		t, err := quicvarint.Read(r)
 		if err != nil {
 			return nil, err
+		}
+		if p.tunnel != nil && p.tunnel.Load() {
+			switch t {
+			case 0x1, 0x3, 0x4, 0x5, 0x7, 0xd, 0xf0700, 0xf0701:
+				// RFC 9114 section 4.4 permits only DATA and applicable extensions
+				// after successful CONNECT, in both stream directions.
+				p.closeConn(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "unexpected frame on a CONNECT tunnel")
+				return nil, fmt.Errorf("peer sent an unexpected frame: type %#x on a CONNECT tunnel", t)
+			}
 		}
 		// Frames that are not permitted on this stream are connection errors
 		// whatever their payload, so they are rejected before it is read.
@@ -222,6 +252,11 @@ type settingsFrame struct {
 	Other           map[uint64]uint64 // all settings that we don't explicitly recognize
 }
 
+// settingsError reports invalid setting semantics, rather than a malformed frame.
+type settingsError struct{ message string }
+
+func (e *settingsError) Error() string { return e.message }
+
 const maxSettingsFrameSize = 8 << 10
 
 func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*settingsFrame, error) {
@@ -250,20 +285,22 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
 		}
 
 		switch id {
+		case 0x2, 0x3, 0x4, 0x5:
+			return nil, &settingsError{fmt.Sprintf("reserved HTTP/2 setting: %d", id)}
 		case settingMaxFieldSectionSize:
 			if readMaxFieldSectionSize {
-				return nil, fmt.Errorf("duplicate setting: %d", id)
+				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
 			}
 			readMaxFieldSectionSize = true
 			frame.MaxFieldSectionSize = int64(val)
 			settingsFrame.MaxFieldSectionSize = int64(val)
 		case settingExtendedConnect:
 			if readExtendedConnect {
-				return nil, fmt.Errorf("duplicate setting: %d", id)
+				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
 			}
 			readExtendedConnect = true
 			if val != 0 && val != 1 {
-				return nil, fmt.Errorf("invalid value for SETTINGS_ENABLE_CONNECT_PROTOCOL: %d", val)
+				return nil, &settingsError{fmt.Sprintf("invalid value for SETTINGS_ENABLE_CONNECT_PROTOCOL: %d", val)}
 			}
 			frame.ExtendedConnect = val == 1
 			if qlogger != nil {
@@ -271,11 +308,11 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
 			}
 		case settingDatagram:
 			if readDatagram {
-				return nil, fmt.Errorf("duplicate setting: %d", id)
+				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
 			}
 			readDatagram = true
 			if val != 0 && val != 1 {
-				return nil, fmt.Errorf("invalid value for SETTINGS_H3_DATAGRAM: %d", val)
+				return nil, &settingsError{fmt.Sprintf("invalid value for SETTINGS_H3_DATAGRAM: %d", val)}
 			}
 			frame.Datagram = val == 1
 			if qlogger != nil {
@@ -283,7 +320,7 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
 			}
 		default:
 			if _, ok := frame.Other[id]; ok {
-				return nil, fmt.Errorf("duplicate setting: %d", id)
+				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
 			}
 			if frame.Other == nil {
 				frame.Other = make(map[uint64]uint64)

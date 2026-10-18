@@ -74,6 +74,12 @@ func parseV4(p []byte) (Header, bool) {
 	if headerLen < 20 || total < headerLen || total > len(p) {
 		return Header{}, false
 	}
+	// Validate before any local ICMP response or forwarding. The kernel
+	// cannot discard checksum-invalid packets that policy rejects here
+	// in userspace (RFC 1812 §§4.2.2.5 and 4.3.2.7).
+	if Checksum(p[:headerLen]) != 0 {
+		return Header{}, false
+	}
 	first := binary.BigEndian.Uint16(p[6:8])&0x1fff == 0
 	off := -1
 	if first {

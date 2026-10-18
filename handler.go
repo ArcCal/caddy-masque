@@ -39,9 +39,9 @@ func init() {
 // Handler answers CONNECT-IP requests (RFC 9484): extended CONNECT with
 // :protocol connect-ip over HTTP/2 and HTTP/3, and GET with Upgrade:
 // connect-ip over HTTP/1.1. Every other request, and any CONNECT-IP request
-// without TLS or without valid credentials, goes to the next handler, so
-// visitors and probes see the site as usual and status codes only reach
-// authenticated users.
+// without TLS or without valid credentials, goes to the next handler.
+// Refused extended CONNECT requests retain the site's response body but
+// use a non-2xx status: a 2xx response would declare a working IP tunnel.
 type Handler struct {
 	// Path and query of the URI Template clients are configured with.
 	Template string `json:"template,omitempty"`
@@ -177,6 +177,70 @@ func (h *Handler) reject(w http.ResponseWriter, r *http.Request, rej rejection) 
 	return nil
 }
 
+// serveRefusal keeps the site's response for requests that do not establish
+// a tunnel. Unlike HTTP/1.1 Upgrade, any 2xx extended CONNECT response means
+// success (RFC 9484 §4.5); ordinary content must therefore have an error
+// status. Preserve a site's existing error or redirect status and stream its
+// body without buffering it.
+func serveRefusal(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if r.ProtoMajor < 2 {
+		return next.ServeHTTP(w, r)
+	}
+	rw := &refusalResponseWriter{ResponseWriter: w}
+	err := next.ServeHTTP(rw, r)
+	if !rw.wroteHeader {
+		status := http.StatusNotFound
+		if err != nil {
+			// Caddy invokes handle_errors with its original writer, outside
+			// this wrapper. Commit an error status before returning so its
+			// error page cannot turn the refusal into a successful tunnel.
+			status = http.StatusInternalServerError
+			var he caddyhttp.HandlerError
+			if errors.As(err, &he) && he.StatusCode >= 300 && he.StatusCode <= 599 {
+				status = he.StatusCode
+			}
+		}
+		rw.WriteHeader(status)
+	}
+	return err
+}
+
+type refusalResponseWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *refusalResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *refusalResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	if status >= 200 && status < 300 {
+		status = http.StatusNotFound
+	}
+	if status >= 200 {
+		w.wroteHeader = true
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *refusalResponseWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusNotFound)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *refusalResponseWriter) FlushError() error {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusNotFound)
+	}
+	return http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *refusalResponseWriter) Flush() { _ = w.FlushError() }
+
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	h.advertiseHTTP3(w, r)
@@ -184,15 +248,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if !ok {
 		return next.ServeHTTP(w, r)
 	}
+	// These requirements apply even when the proxy will refuse the
+	// request, including an anonymous HTTP/1.1 upgrade (RFC 9484 §4.2).
+	if !req.wellFormed || carriesContent(r) {
+		return h.reject(w, r, malformed)
+	}
 	// IP proxying runs over TLS or QUIC only (RFC 9484 §4): without it, the
-	// request is not ours.
+	// request cannot establish a tunnel.
 	if r.TLS == nil {
 		h.log.Debug("CONNECT-IP request without TLS", zap.String("remote", r.RemoteAddr))
-		return next.ServeHTTP(w, r)
+		return serveRefusal(w, r, next)
 	}
 	vars, ok := h.tpl.Match(r.URL.RequestURI())
 	if !ok {
-		return next.ServeHTTP(w, r)
+		return serveRefusal(w, r, next)
 	}
 	c := h.app.core
 	remote := r.RemoteAddr
@@ -206,7 +275,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if !ok && hasCredentials && haveClient && c.loginLimit.Blocked(client) {
 		c.counters.throttled.Add(1)
 		h.log.Debug("too many failed logins, not checking credentials", zap.String("remote", remote))
-		return next.ServeHTTP(w, r)
+		return serveRefusal(w, r, next)
 	}
 	if !ok {
 		var err error
@@ -237,27 +306,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		} else {
 			h.log.Debug("CONNECT-IP request without credentials", zap.String("remote", remote), zap.String("transport", req.transport))
 		}
-		return next.ServeHTTP(w, r)
+		return serveRefusal(w, r, next)
 	}
 	log := h.log.With(zap.String("user", user.Name), zap.String("remote", remote), zap.String("transport", req.transport))
 	rejectLogged := func(rej rejection) error {
 		log.Info("rejected request", zap.Int("status", rej.status), zap.String("error", rej.proxyError))
 		return h.reject(w, r, rej)
 	}
-	// The recognized upgrade or extended CONNECT selects the Capsule
-	// Protocol, so the Capsule-Protocol header is not required (RFC 9297
-	// §3.4 only recommends it); content header fields make the request
-	// malformed (§3.2).
-	if !req.wellFormed || carriesContent(r) {
-		return rejectLogged(malformed)
-	}
-	// A variable of the template missing, or not percent-encoded UTF-8,
-	// makes the request malformed (RFC 9484 §4.1).
-	for _, name := range []string{"target", "ipproto"} {
-		if _, has := vars[name]; h.tpl.HasVariable(name) && !has {
-			return rejectLogged(malformed)
-		}
-	}
+	// Omitted optional variables mean wildcard scope (§4.6). Empty or
+	// invalidly encoded values remain present and fail parsing below.
 	value := func(name string) string {
 		if v, has := vars[name]; has {
 			return v
@@ -277,7 +334,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	l := c.acquire(r.Context(), user, sc.routes.HasIPv4(), sc.routes.HasIPv6())
 	if l == nil {
 		if !c.auth.IsCurrent(user) {
-			return next.ServeHTTP(w, r)
+			return serveRefusal(w, r, next)
 		}
 		if c.tooManySessions(user) {
 			return rejectLogged(rejection{status: http.StatusTooManyRequests})
@@ -286,9 +343,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	defer l.release()
 
-	tun, err := h.accept(w, r, req)
+	tun, responseStarted, err := h.accept(w, r, req, l.handle)
 	if err != nil {
 		log.Debug("could not start the tunnel", zap.Error(err))
+		if !responseStarted {
+			return rejectLogged(rejection{status: http.StatusServiceUnavailable})
+		}
 		return nil
 	}
 	c.running.Add(1)
@@ -385,10 +445,6 @@ func isTimeout(err error) bool {
 	return errors.As(err, &dnsErr) && dnsErr.IsTimeout
 }
 
-// How long to wait for the client's HTTP/3 SETTINGS, which normally
-// arrive before its first request.
-const settingsTimeout = 3 * time.Second
-
 // h3DatagramsKey marks requests served by this module's HTTP/3 server,
 // which announces SETTINGS_H3_DATAGRAM.
 type h3DatagramsKey struct{}
@@ -396,20 +452,22 @@ type h3DatagramsKey struct{}
 // accept sends the successful response and returns the tunnel over the
 // request stream. The tunnel bypasses Caddy's idle-timeout wrappers and
 // clears the server's read and write deadlines: a tunnel lasts as long as
-// its client keeps the stream open (RFC 9484 §4).
-func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (tunnel, error) {
+// its client keeps the stream open (RFC 9484 §4). The boolean tells whether
+// the response has started, so an earlier failure can still get an error
+// status rather than an implicit successful response.
+func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request, handle *sessionHandle) (tunnel, bool, error) {
 	if req.http1 {
 		// RFC 9484 §4.3.
 		conn, brw, err := http.NewResponseController(w).Hijack()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		_ = conn.SetDeadline(time.Time{})
 		h.tuneConn(conn)
 		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\nCapsule-Protocol: ?1\r\n\r\n")
 		if err := brw.Flush(); err != nil {
 			conn.Close()
-			return nil, err
+			return nil, true, err
 		}
 		closeConn := func(ending) { conn.Close() }
 		return &streamTunnel{
@@ -417,17 +475,14 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 			capsuleWriter: capsuleWriter{w: conn},
 			stopFn:        closeConn,
 			forceFn:       func() {},
-		}, nil
+		}, true, nil
 	}
-	// No Content-Type sniffing: the response has no content (RFC 9297 §3.2).
-	w.Header()["Content-Type"] = nil
-	w.Header().Set("Capsule-Protocol", "?1")
 	raw := innermost(w)
 	rc := http.NewResponseController(raw)
 	if r.ProtoMajor == 3 {
 		s, ok := raw.(http3.HTTPStreamer)
 		if !ok {
-			return nil, errors.New("no HTTP/3 stream behind the response writer")
+			return nil, false, errors.New("no HTTP/3 stream behind the response writer")
 		}
 		// HTTP Datagrams go in QUIC DATAGRAM frames only if both sides
 		// announced SETTINGS_H3_DATAGRAM (RFC 9297 §2.1.1): this module's
@@ -436,29 +491,53 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 		quicDatagrams := false
 		ours, _ := r.Context().Value(h3DatagramsKey{}).(bool)
 		if st, ok := raw.(http3.Settingser); ok && ours {
-			timer := time.NewTimer(settingsTimeout)
+			// QUIC streams can arrive independently. A delayed control
+			// stream must not permanently select capsules and leave later
+			// negotiated QUIC Datagrams unread. Admission already holds a
+			// lease, bounded by the per-user session limit.
 			select {
 			case <-st.ReceivedSettings():
 				quicDatagrams = st.Settings().EnableDatagrams
-			case <-timer.C:
 			case <-r.Context().Done():
-				timer.Stop()
-				return nil, r.Context().Err()
+				return nil, false, r.Context().Err()
+			case <-h.app.core.ctx.Done():
+				return nil, false, h.app.core.ctx.Err()
+			case <-handle.revoked:
+				return nil, false, errors.New("session revoked before receiving HTTP/3 SETTINGS")
+			case <-handle.rescope:
+				return nil, false, errors.New("policy changed before receiving HTTP/3 SETTINGS")
 			}
-			timer.Stop()
+			// Prefer cancellation if it raced with receiving SETTINGS.
+			select {
+			case <-r.Context().Done():
+				return nil, false, r.Context().Err()
+			case <-h.app.core.ctx.Done():
+				return nil, false, h.app.core.ctx.Err()
+			case <-handle.revoked:
+				return nil, false, errors.New("session revoked before accepting the tunnel")
+			case <-handle.rescope:
+				return nil, false, errors.New("policy changed before accepting the tunnel")
+			default:
+			}
 		}
+		// Success headers must not appear on a cancelled pending request.
+		w.Header()["Content-Type"] = nil
+		w.Header().Set("Capsule-Protocol", "?1")
 		w.WriteHeader(http.StatusOK)
 		if err := rc.Flush(); err != nil {
-			return nil, err
+			return nil, true, err
 		}
 		str := s.HTTPStream()
 		_ = str.SetReadDeadline(time.Time{})
 		_ = str.SetWriteDeadline(time.Time{})
-		return newH3Tunnel(str, quicDatagrams), nil
+		return newH3Tunnel(str, quicDatagrams), true, nil
 	}
+	// No Content-Type sniffing: the response has no content (RFC 9297 §3.2).
+	w.Header()["Content-Type"] = nil
+	w.Header().Set("Capsule-Protocol", "?1")
 	w.WriteHeader(http.StatusOK)
 	if err := rc.Flush(); err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	_ = rc.SetReadDeadline(time.Time{})
 	_ = rc.SetWriteDeadline(time.Time{})
@@ -482,7 +561,7 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request) (t
 			_ = body.Close()
 		},
 		forceFn: reset,
-	}, nil
+	}, true, nil
 }
 
 // tuneConn gives the connection of a tunnel over TCP the settings of

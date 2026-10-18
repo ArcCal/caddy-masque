@@ -1,4 +1,4 @@
-# Shared required validation; no artifact or release publishing permissions.
+# Shared required validation; no release publishing permissions.
 name: validate
 
 on:
@@ -65,10 +65,17 @@ jobs:
         run: go test ./internal/proto -run '^$' -fuzz '^FuzzCapsuleStream$' -fuzztime=30s -parallel=2
       - name: Upstream HTTP/2 and HPACK tests for the patched dependency
         working-directory: third_party/xnet
-        run: go test -race ./http2 ./http2/hpack
+        run: go test -race ./http2 ./http2/hpack ./internal/httpcommon
       - name: Upstream HTTP/3 tests for the patched dependency
         working-directory: third_party/quic-go
-        run: go test -race ./http3
+        run: go test -race ./http3/...
+      - name: Patched QUIC transport regressions
+        working-directory: third_party/quic-go
+        run: |
+          go test . ./internal/ackhandler ./internal/congestion ./internal/wire
+          # The baseline allocation-count assertion is instrument-sensitive;
+          # it runs above without race instrumentation. Keep all functional cases.
+          go test -race -skip '^TestFrameParserAllocs$' . ./internal/ackhandler ./internal/congestion ./internal/wire
 
   e2e:
     name: end-to-end with masque-client (Go ${{ matrix.go }}, ${{ matrix.runner }})
@@ -108,22 +115,35 @@ jobs:
           workspaces: masque-vpn
       - name: Build
         run: |
-          CGO_ENABLED=0 go build -trimpath -o caddy ./cmd/caddy
+          CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o caddy ./cmd/caddy
+          sha256sum caddy > caddy.sha256
+          ./caddy list-modules > "$RUNNER_TEMP/modules.txt"
+          for module in masque http.handlers.masque dns.providers.cloudflare; do
+            grep -qFx "$module" "$RUNNER_TEMP/modules.txt"
+          done
           CGO_ENABLED=0 go build -o netsim ./tests/netsim
           cargo build --locked --release --manifest-path masque-vpn/Cargo.toml --bin masque-client
       - name: masque-client against Caddy in process, IPv4 and IPv6 over every transport and datagram mode
         run: |
           set -euo pipefail
           MASQUE_CLIENT="$PWD/masque-vpn/target/release/masque-client" go test -count=1 -run '^TestInteropMasqueClient$' -v . | tee "$RUNNER_TEMP/client-interop.log"
-          for transport in h3 h2 http1.1 h3-capsules; do
+          for transport in h3 h2 http1.1 h3-capsules stdin-h3 stdin-h2 stdin-http1.1 stdin-h3-capsules stdin-auto; do
             grep -q "^    --- PASS: TestInteropMasqueClient/$transport " "$RUNNER_TEMP/client-interop.log"
           done
           ! grep -q -- '--- SKIP' "$RUNNER_TEMP/client-interop.log"
-      - name: Current Mac and Killswitch protocol cores against Caddy
+      - name: Current Mac, Killswitch and NF protocol cores against Caddy
         run: |
           set -euo pipefail
           CARGO_TARGET_DIR="$PWD/masque-vpn/target" python3 tests/run-client-wrapper-interop.py \
             --masque-vpn-root "$PWD/masque-vpn" --release | tee "$RUNNER_TEMP/wrapper-interop.log"
+      - name: Independent CF gateway generic client fixture against Caddy
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$PWD/masque-vpn/target" python3 tests/run-cf-client-interop.py \
+            --masque-vpn-root "$PWD/masque-vpn" --release | tee "$RUNNER_TEMP/cf-client-interop.log"
+      - name: Client source remains unchanged
+        run: |
+          test -z "$(git -C masque-vpn status --porcelain)"
       - name: End-to-end test in network namespaces
         run: |
           set -euo pipefail
@@ -144,3 +164,17 @@ jobs:
           sudo REQUIRE_ALL_TESTS=1 SERVER_KIND=caddy CADDY="$PWD/caddy" PROBE="$RUNNER_TEMP/conformance" \
             masque-vpn/tests/conformance.sh | tee "$RUNNER_TEMP/conformance.log"
           grep -Eq '^[1-9][0-9]* passed, 0 failed, 0 skipped$' "$RUNNER_TEMP/conformance.log"
+      # Promote exactly the Go 1.26 executable that passed the kernel and wire
+      # gates. Packaging workflows verify its checksum and never rebuild it.
+      - name: Verify tested executable unchanged
+        run: sha256sum -c caddy.sha256
+      - name: Upload tested executable for packaging
+        if: matrix.go == '1.26'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tested-caddy-linux-${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
+          path: |
+            caddy
+            caddy.sha256
+          if-no-files-found: error
+          retention-days: 1

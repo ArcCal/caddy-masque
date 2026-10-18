@@ -112,7 +112,7 @@ func newMTUDiscoverer(
 }
 
 func (f *mtuFinder) init(start, max protocol.ByteCount) {
-	f.min = start
+	f.min = min(start, max)
 	for i := range f.lost {
 		if i == 0 {
 			f.lost[i] = max
@@ -149,13 +149,15 @@ func (f *mtuFinder) ShouldSendProbe(now monotime.Time) bool {
 	return !now.Before(f.lastProbeTime.Add(mtuProbeDelay * f.rttStats.SmoothedRTT()))
 }
 
-func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteCount) {
-	var size protocol.ByteCount
+func (f *mtuFinder) nextProbeSize() protocol.ByteCount {
 	if f.lastProbeWasLost {
-		size = (f.min + f.lost[0]) / 2
-	} else {
-		size = (f.min + f.max()) / 2
+		return (f.min + f.lost[0]) / 2
 	}
+	return (f.min + f.max()) / 2
+}
+
+func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteCount) {
+	size := f.nextProbeSize()
 	f.lastProbeTime = now
 	f.inFlight = size
 	return ackhandler.Frame{

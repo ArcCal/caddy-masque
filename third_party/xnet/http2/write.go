@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2/hpack"
@@ -196,6 +197,9 @@ type writeResHeaders struct {
 }
 
 func encKV(enc *hpack.Encoder, k, v string) {
+	// Match net/http's field-value normalization when serializing headers
+	// and trailers. RFC 9113 section 8.2.1 prohibits this whitespace on wire.
+	v = strings.Trim(v, " \t")
 	if VerboseLogs {
 		log.Printf("http2: server encoding header %q = %q", k, v)
 	}

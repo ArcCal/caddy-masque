@@ -168,11 +168,12 @@ async fn main() -> Result<()> {
     let mut bad_config = config.clone(); bad_config.password = Password::new("incorrect-test-password");
     let bad = Vpn::start(&bad_config, server).await?;
     tokio::time::timeout(Duration::from_secs(10), bad.events.notify.notified()).await?;
-    // The fixture deliberately serves a normal 200 cover page for every
-    // unauthenticated request. The client must reject it as non-CONNECT-IP;
-    // production camouflage status belongs to the configured website.
+    // The fixture's website serves a 200 cover page. Refused HTTP/2 and HTTP/3
+    // CONNECT requests retain its body but require a non-success status; a
+    // refused HTTP/1.1 Upgrade can retain the website's ordinary 200 response.
     let refused = bad.events.errors.lock().unwrap().clone();
-    ensure!(refused.iter().any(|message| message.contains("200 OK") && (message.contains("Capsule Protocol forbids") || message.contains("did not accept the CONNECT-IP request"))), "Caddy did not refuse bad credentials with the expected cover page: {:?}", refused);
+    let expected_status = if transport == "http/1.1" { "200 OK" } else { "404 Not Found" };
+    ensure!(refused.iter().any(|message| message.contains(expected_status) && (message.contains("Capsule Protocol forbids") || message.contains("did not accept the CONNECT-IP request"))), "Caddy did not refuse bad credentials with the expected status {}: {:?}", expected_status, refused);
     ensure!(bad.state.borrow().is_none(), "bad credentials configured host networking"); bad.stop().await;
     vpn.echo(app, source, 1350, 1).await?;
     let mut socks_config = app.config(port, transport, "socks")?; socks_config.ca = Some(ca);

@@ -31,7 +31,7 @@ func TestCaddyLoginThrottle(t *testing.T) {
 	// Throttled: even the right password is not checked, and the answer is
 	// the site's, like for any request without credentials.
 	got := tr.dial(e, t, testPassword, anyTarget)
-	if got.status != http.StatusOK || got.body != "cover page" {
+	if got.status != http.StatusNotFound || got.body != "cover page" {
 		t.Errorf("throttled client: %d %q", got.status, got.body)
 	}
 }
@@ -62,7 +62,7 @@ func TestCaddyRememberedLoginSkipsTheThrottle(t *testing.T) {
 	}
 	got.close()
 	// The address is still throttled for other credentials.
-	if other := tr.dial(e, t, "wrong password!!", anyTarget); other.status != http.StatusOK || other.body != "cover page" {
+	if other := tr.dial(e, t, "wrong password!!", anyTarget); other.status != http.StatusNotFound || other.body != "cover page" {
 		t.Errorf("throttled client: %d %q", other.status, other.body)
 	}
 }

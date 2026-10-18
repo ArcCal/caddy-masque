@@ -42,6 +42,15 @@ Run `python3 tests/verify-http2-fork.py` from this repository to compare the
 entire fork against the pinned upstream source plus the recorded patch.
 When updating x/net or Go, refresh this patch and run both sets of tests.
 
+`http2-conformance.patch` is applied after the reset patch and before the
+English fixtures. It validates extended-CONNECT pseudo-headers, the OPTIONS
+asterisk target, forbidden connection fields, TE lists and field-edge
+whitespace, including undeclared trailers. Malformed messages reset only the
+affected stream with PROTOCOL_ERROR (RFC 9113 §§8.1.1, 8.2.1, 8.3 and
+RFC 8441 §4). Ordinary CONNECT and permitted Host fallback remain supported.
+Outbound field whitespace is normalized before framing. Raw HPACK regression
+cases verify both the error code and continued use of the same connection.
+
 The HTTP/1-response diagnostic regression test also synchronizes response
 reads with request-header writes. The upstream test otherwise sometimes
 observes an already-closed unused connection instead of its intended active
@@ -52,7 +61,7 @@ are unchanged.
 
 `quic-go` is the pinned `github.com/quic-go/quic-go v0.63.0`
 source. `http3-datagram-rejection.patch` records
-the only changes: an explicit `http3.RejectDatagrams` API, request-scoped
+an explicit `http3.RejectDatagrams` API, request-scoped
 Datagram rejection state, and regression tests.
 
 RFC 9297 §2 requires requests with no HTTP Datagram semantics to abort
@@ -107,6 +116,56 @@ an empty, shorter or longer payload is H3_FRAME_ERROR (section 7.1). The
 upstream parser test that required push frames to be skipped is replaced by one
 for this behavior; `h3_push_frames_test.go` checks the wire errors against the
 server and the fork's client.
+
+## HTTP/3 and QUIC conformance repairs
+
+After the two HTTP/3 patches above, verification applies
+`quic-conformance.patch` and `http3-conformance.patch`. It still reconstructs
+the entire dependency and compares every shipped byte; these records do not
+permit untracked downstream edits.
+
+The HTTP/3 patch enforces reserved SETTINGS identifiers, QPACK critical-stream
+lifetime and zero-capacity instruction rules, connection-scoped decompression
+errors, required request fields, Content-Length consistency, frame ordering
+and truncated payload errors. Successful CONNECT streams carry tunnel DATA
+rather than HTTP trailers; ordinary responses, including HEAD and 304, retain
+their HTTP semantics. Regressions exercise both server and client paths and
+the exact wire error codes from RFC 9114 and RFC 9204.
+
+Incoming fields also enforce RFC 9114 §10.3 and RFC 9110's field-content
+grammar: no leading or trailing SP/HTAB. TE is permitted only in request
+headers; its case-insensitive list accepts only trailers and ignored empty
+members. Outgoing regular fields normalize edge whitespace without mutating
+the caller's header map. Raw request, response and trailer tests verify
+H3_MESSAGE_ERROR and valid list controls. Successful CONNECT responses retain
+Content-Length metadata for stricter Capsule Protocol validation, while the
+HTTP framing layer still ignores its value as RFC 9110 §9.3.6 requires.
+Responses and outgoing trailers omit connection-specific fields and valid
+field names nominated by Connection values. This also keeps Caddy's supported
+`static_response close: true` pages and CONNECT refusals valid over HTTP/3;
+ordinary end-to-end headers, bodies and trailers remain covered by regressions.
+
+The narrow `Server.GetConnectionConfig` callback returns `ConnectionConfig`
+with the header limit and HTTP idle timeout for each new connection. The
+snapshot supplies both enforcement and advertised SETTINGS and is never
+mutated after connection creation. Caddy's HTTP/3 takeover uses it on reload;
+no new global QUIC setting or change to existing tunnels is required.
+
+The QUIC patch accounts for the actual remaining anti-amplification byte
+budget on normal, ACK, PTO, coalesced and close paths (RFC 9000 §8.1), honors
+the peer's UDP payload limit, reserves sufficient congestion-window credit
+for ordinary packets, and sizes PMTU probes against actual available credit
+(RFC 9002 §7). DATAGRAM payload estimates include the maximum packet overhead;
+receipt of an unnegotiated DATAGRAM reports PROTOCOL_VIOLATION (RFC 9221).
+Unvalidated close packets are not retained for retransmission by the handler
+that lacks access to the connection's byte budget.
+
+Run the affected transport packages, the HTTP/3 race suite, real UDP
+handshake/loss/migration/DATAGRAM/PMTU integration tests, and the main client
+matrix when refreshing these patches. The upstream allocation-count STREAM
+parser assertion is instrument-sensitive under `-race`; run it normally and
+retain race coverage of all functional parser cases. Do not use that exception
+to skip an ordinary functional or protocol assertion.
 
 ## English source presentation
 

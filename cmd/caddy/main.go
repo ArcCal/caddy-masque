@@ -1,4 +1,4 @@
-// Command caddy is Caddy with the MASQUE CONNECT-IP module built in.
+// Command caddy bundles standard Caddy modules, MASQUE CONNECT-IP and Cloudflare DNS.
 package main
 
 import (

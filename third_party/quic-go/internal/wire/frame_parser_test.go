@@ -523,13 +523,14 @@ func TestFrameParserDatagramFrame(t *testing.T) {
 }
 
 func TestFrameParserDatagramUnsupported(t *testing.T) {
-	parser := NewFrameParser(false, true, true)
-	f := &DatagramFrame{Data: []byte("foobar")}
-	b, err := f.Append(nil, protocol.Version1)
-	require.NoError(t, err)
-
-	_, _, err = parser.ParseType(b, protocol.Encryption1RTT)
-	checkFrameUnsupported(t, err, 0x30)
+	for _, withLength := range []bool{false, true} {
+		parser := NewFrameParser(false, true, true)
+		f := &DatagramFrame{Data: []byte("foobar"), DataLenPresent: withLength}
+		b, err := f.Append(nil, protocol.Version1)
+		require.NoError(t, err)
+		_, _, err = parser.ParseType(b, protocol.Encryption1RTT)
+		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation, FrameType: uint64(b[0])})
+	}
 }
 
 func TestFrameParserResetStreamAtUnsupported(t *testing.T) {
