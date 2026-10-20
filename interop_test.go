@@ -142,18 +142,27 @@ func TestInteropConnectIPGo(t *testing.T) {
 		}
 	}
 
-	// A blocked destination: the ICMP error passes connect-ip-go's checks
-	// (from a routed address, to our own).
-	if _, err := conn.WritePacket(udp(v4.String(), "10.1.2.3", 10)); err != nil {
-		t.Fatal(err)
+	// A destination outside the advertised routes never reaches us at
+	// all. connect-ip-go v0.6.0 implements the source/destination/
+	// protocol checks that v0.4.0 left as a "TODO" (RFC 9484 Section 11),
+	// so the client library drops such a packet itself and reports
+	// neither an error nor an ICMP. This used to expect our
+	// administratively-prohibited answer, which the server still sends
+	// for a packet that does arrive -- see TestScopedProtocol and
+	// TestScopedIPv6KeepsICMPv6ToTheGateway in session_test.go and
+	// TestLinkLocalUnicastDoesNotCrossTunnel in core_regression_test.go.
+	if icmp, err := conn.WritePacket(udp(v4.String(), "10.1.2.3", 10)); err != nil || icmp != nil {
+		t.Fatalf("WritePacket to a non-routed destination: %v %x", err, icmp)
 	}
-	buf := make([]byte, 2000)
-	n, err := readPacket(conn, buf)
-	if err != nil {
-		t.Fatal(err)
+	noHostPacket(t, e.dev)
+	// The refusal is local to the client and must leave the tunnel
+	// usable.
+	after := udp(v4.String(), "1.1.1.1", 100)
+	if icmp, err := conn.WritePacket(slices.Clone(after)); err != nil || icmp != nil {
+		t.Fatalf("WritePacket after the refusal: %v %x", err, icmp)
 	}
-	if n < 28 || buf[9] != 1 || buf[20] != 3 || buf[21] != 13 {
-		t.Errorf("expected ICMP administratively prohibited, got % x", buf[:min(n, 28)])
+	if got := hostPacket(t, e.dev); len(got) != len(after) {
+		t.Errorf("after the refusal the tunnel forwarded %d bytes, sent %d", len(got), len(after))
 	}
 }
 
