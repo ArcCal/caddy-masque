@@ -68,13 +68,24 @@ Existing users carry over as they are: each `[[user]]` in `server.toml` becomes 
 Needs Go 1.26.9 or 1.27.2, or a later reviewed patch of those lines:
 
 ```sh
-go build -o caddy ./cmd/caddy
+(
+  set -eu
+  go build -mod=readonly -o caddy ./cmd/caddy
+  modules=$(./caddy list-modules)
+  for module in masque http.handlers.masque dns.providers.cloudflare; do
+    printf '%s\n' "$modules" | grep -Fx "$module" >/dev/null
+  done
+)
 ```
 
 The resulting `caddy` includes all standard Caddy modules, MASQUE and **Cloudflare DNS v0.2.4**.
 Cloudflare is registered by the MASQUE package itself, so custom main modules importing MASQUE include it too.
-Verify the required provider with `./caddy list-modules | grep -Fx dns.providers.cloudflare`.
-The installer and CI use this same default; rebuilding never removes Cloudflare. Builds use
+**Cloudflare is required in every build**, including custom main modules, xcaddy and cross-compilation,
+even when a deployment uses HTTP-01 instead of DNS challenges. The check above fails unless all three
+required modules are present. Check the exact artifact before installing, packaging or publishing it;
+cross-built artifacts need this check on their target architecture or a suitable runner.
+The installer verifies its staged binary before replacing `/usr/local/bin/caddy`; CI also checks the
+same three modules. A failed installer check leaves the existing binary in place. Builds use
 the pinned protocol patches in `third_party/xnet` and `third_party/quic-go`.
 The HTTP/2 fork retains its patched server and transport on both Go 1.26
 and Go 1.27; no extra build tag is needed. From this checkout, xcaddy uses
@@ -86,6 +97,9 @@ xcaddy build v2.11.7 --with github.com/ArcCal/caddy-masque=. \
   --replace golang.org/x/net=./third_party/xnet \
   --replace github.com/quic-go/quic-go=./third_party/quic-go
 ```
+
+Run the same three-module check on xcaddy's resulting `./caddy` before using it.
+Do not omit Cloudflare or either protocol fork to make a custom build succeed.
 
 Go does not inherit dependency replacements. Custom main modules must also
 replace `golang.org/x/net` and `github.com/quic-go/quic-go` with these trees;

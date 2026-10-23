@@ -122,9 +122,17 @@ if [ $((mem_kb + swap_kb)) -lt 2500000 ]; then
 fi
 (cd "$SRC" && GOTOOLCHAIN=local CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags "-s -w" -o "$BUILD_DIR/caddy" ./cmd/caddy)
 cleanup_swap
+# Validate the staged executable before replacing an installed working binary.
+# Cloudflare DNS is mandatory even when this deployment uses another challenge.
+BUILD_MODULES="$BUILD_DIR/modules.txt"
+"$BUILD_DIR/caddy" list-modules > "$BUILD_MODULES" ||
+    die "cannot inspect the built Caddy modules; the installed binary was not replaced"
+for module in masque http.handlers.masque dns.providers.cloudflare; do
+    grep -Fxq -- "$module" "$BUILD_MODULES" ||
+        die "the build is missing required module $module; the installed binary was not replaced"
+done
 install -m 755 "$BUILD_DIR/caddy" /usr/local/bin/caddy
 caddy version
-caddy list-modules | grep -x 'dns.providers.cloudflare' >/dev/null || die "the build is missing the required Cloudflare DNS module"
 
 say "Ports"
 # masque-vpn's own server, or another web server, would hold 443.

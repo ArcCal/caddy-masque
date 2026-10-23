@@ -6,6 +6,14 @@
   Its Linux host networking creates TUN, forwarding and NAT state.
 - Start with `docs/USER_GUIDE.md`, `app.go`, `caddyfile.go` and `go.mod`.
   Preserve the local patched QUIC/x/net dependency replacements when building.
+- Every normal, custom-main, xcaddy and cross-compiled build must include
+  `github.com/caddy-dns/cloudflare`. Preserve its unconditional package import
+  and pinned dependency; do not make it optional through tags or build variants.
+- Check the exact final executable for `masque`, `http.handlers.masque` and
+  `dns.providers.cloudflare` before installation, packaging or publication.
+  Cross-built executables need the check on the target or a suitable runner.
+  A failed check must not replace a working installed binary. Using Cloudflare
+  DNS challenges is optional; bundling the provider is mandatory.
 - Maintain client interoperability, authentication, certificate handling and
   the protocol-specific distinctions between H3 Datagrams and Capsules.
 - Preserve ownership and cleanup boundaries for listeners, sessions, routing

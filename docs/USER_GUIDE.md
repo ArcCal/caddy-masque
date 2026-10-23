@@ -137,6 +137,12 @@ in `/root/masque-credentials.txt`, mode 0600. That file contains the plaintext
 client password: keep it private, outside website roots and support bundles,
 and retain or remove it deliberately after storing the credentials securely.
 
+Before replacing `/usr/local/bin/caddy`, the installer executes `list-modules`
+on its privately staged build and requires `masque`, `http.handlers.masque` and
+`dns.providers.cloudflare`. An inspection failure or missing module stops the
+installation without replacing the existing binary. Earlier package/toolchain
+setup may already have occurred; this is not a rollback of the entire script.
+
 The installer checks for TUN availability and conflicting web services. It
 handles an active ufw configuration for its documented ports/forwarding and
 warns about a Docker FORWARD policy that needs operator attention. It cannot
@@ -159,14 +165,21 @@ reviewed patch in those lines. The module's minimum language declaration is
 not a substitute for applying standard-library security patches.
 
 ```sh
-go version
-go mod verify
-go build -mod=readonly -o caddy ./cmd/caddy
-./caddy version
-./caddy list-modules
+(
+  set -eu
+  go version
+  go mod verify
+  go build -mod=readonly -o caddy ./cmd/caddy
+  ./caddy version
+  modules=$(./caddy list-modules)
+  for module in masque http.handlers.masque dns.providers.cloudflare; do
+    printf '%s\n' "$modules" | grep -Fx "$module" >/dev/null
+  done
+)
 ```
 
-Confirm the output includes all three modules:
+The build/check block fails unless the exact executable registers all three
+modules. To inspect them interactively, run `./caddy list-modules` and find:
 
 ```text
 masque
@@ -174,8 +187,12 @@ http.handlers.masque
 dns.providers.cloudflare
 ```
 
-The default binary includes standard Caddy modules and Cloudflare DNS
-v0.2.4. It uses the pinned local HTTP/2 and HTTP/3/QUIC trees. A plain upstream
+Cloudflare DNS v0.2.4 is mandatory in every supported build, including custom
+main modules, xcaddy and cross-compiled artifacts. This requirement does not
+depend on whether a deployment uses DNS challenges. The MASQUE package imports
+the provider unconditionally. Preserve that import and the pinned dependency.
+The binary also includes standard Caddy modules and uses the pinned local
+HTTP/2 and HTTP/3/QUIC trees. A plain upstream
 Caddy binary does not contain this module. Custom `xcaddy` or separate-main
 builds must preserve both dependency replacements; Go does not inherit them
 from a dependency's `go.mod`:
@@ -191,6 +208,9 @@ Run that command from this checkout. Review
 [the dependency patch instructions](../third_party/README.md); do not
 silently replace the shipped forks with an unpatched library merely to make
 a custom build succeed. Verify the final executable's modules and checksum.
+Apply the same three-module check after xcaddy builds, before installation or
+publication. For cross-compilation, execute the check on the target or a suitable
+runner rather than removing a module to avoid a host architecture mismatch.
 
 For a manual systemd installation, install the executable, create the Caddy
 configuration/site files and copy the supplied unit:
@@ -364,8 +384,8 @@ out-of-band/direct-path assumption.
 ## Certificates and Cloudflare DNS
 
 Normal Caddy automatic HTTPS can obtain/renew certificates for a reachable
-domain using its standard challenges. Cloudflare DNS support is included in
-every default build; using it is optional and requires your own scoped
+domain using its standard challenges. Cloudflare DNS support must be included in
+every build; using it for certificate issuance is optional and requires your own scoped
 Cloudflare API credential.
 
 For DNS challenges, a site can use a root-readable token file:
