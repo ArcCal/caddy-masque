@@ -3,7 +3,7 @@
 
 The following rules apply to this repository and all its subdirectories.
 
-AI agents must not modify any AGENTS.md file.
+AI agents must not modify THIS AGENTS.md file.
 
 ### 1. Anonymity and English
 
