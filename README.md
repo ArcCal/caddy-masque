@@ -19,8 +19,13 @@ The [masque-vpn](https://github.com/ArcCal/masque-vpn) server rewritten in Go as
 
 Linux x86_64 and arm64 only (needs root: it creates a TUN device and sets up forwarding and NAT).
 
-The latest release tag is `v1.2.0`; main contains newer fixes. Rebuild from updated
-main for the [HTTP/2 security repair](docs/http2-security-2026-10-11.md).
+Read the [practical user guide](docs/USER_GUIDE.md) for installation, client setup,
+credentials, certificates, operation, recovery and evidence-qualified acceptance.
+
+The `v1.2.0` release record is a draft, not a published downloadable release or
+an available Git tag. Check Releases for current availability. Main contains
+newer fixes; rebuild from updated main for the
+[HTTP/2 security repair](docs/http2-security-2026-10-11.md).
 The differences between versions are in [CHANGELOG.md](CHANGELOG.md).
 Earlier review results and native-validation requirements are in [the October 4 production review](docs/review-2026-10-04-production.md).
 Design goals and the checks required for Caddy updates are in [the design document](docs/design.md).
