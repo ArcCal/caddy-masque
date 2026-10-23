@@ -43,7 +43,7 @@ entire fork against the pinned upstream source plus the recorded patch.
 When updating x/net or Go, refresh this patch and run both sets of tests.
 
 `http2-conformance.patch` is applied after the reset patch and before the
-English fixtures. It validates extended-CONNECT pseudo-headers, the OPTIONS
+conformance fixtures. It validates extended-CONNECT pseudo-headers, the OPTIONS
 asterisk target, forbidden connection fields, TE lists and field-edge
 whitespace, including undeclared trailers. Malformed messages reset only the
 affected stream with PROTOCOL_ERROR (RFC 9113 §§8.1.1, 8.2.1, 8.3 and
@@ -174,12 +174,10 @@ parser assertion is instrument-sensitive under `-race`; run it normally and
 retain race coverage of all functional parser cases. Do not use that exception
 to skip an ordinary functional or protocol assertion.
 
-## English source presentation
+## Conformance fixtures
 
-`english-unicode-fixtures.json` records the ASCII presentation changes separately
-from protocol patches. Its JSON strings escape Unicode, including removed text,
-so the record itself contains no Chinese literals. Exact baseline/output hashes
-and strict patch application remain part of fork verification. Unicode strings
-in Go source use escapes with identical runtime bytes. In the HTML parser
-fixture, U+00BA replaces U+41BA while retaining four hexadecimal digits, greedy
-character-reference consumption, and the missing-semicolon condition.
+`fixture-patches.json` defines additional fixture patches applied during upstream
+verification. Exact input and output hashes and strict patch application are
+required. Go string values retain identical runtime bytes. The HTML parser
+fixture uses U+00BA and exercises four hexadecimal digits, greedy
+character-reference consumption, and a missing semicolon.

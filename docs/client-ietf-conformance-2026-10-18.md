@@ -1,6 +1,6 @@
 # Client IETF conformance audit: findings, affected implementations and evidence
 
-Date: 18 October 2026 (Asia/Shanghai). Language: English.
+Date: 18 October 2026.
 
 **Audited client repository:** ArcCal/masque-vpn, commit
 `e10a6ec9fcf0e005d36572830539802df36f6638`.

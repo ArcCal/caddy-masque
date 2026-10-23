@@ -1,6 +1,6 @@
 # IETF interpretation reassessment and minimal follow-up repairs
 
-Date: 18 October 2026 (Asia/Shanghai). Baseline server commit:
+Date: 18 October 2026. Baseline server commit:
 `538a22a9ee6d237fa1b697cb693848dd992ffb86`.
 Protected client commit: `e10a6ec9fcf0e005d36572830539802df36f6638`.
 

@@ -179,24 +179,24 @@ def apply_patch(directory, patch_path):
         raise SystemExit(f"Documented fork patch did not apply exactly:\n{output}")
 
 
-def apply_english_fixtures(directory, record_path):
-    """Apply ASCII-encoded Unicode fixture edits to a verified baseline."""
+def apply_fixture_patches(directory, record_path):
+    """Apply checked fixture patches to a verified baseline."""
     records = json.loads(Path(record_path).read_text())
     if records["format"] != 1:
-        raise SystemExit("Unsupported English fixture record")
+        raise SystemExit("Unsupported fixture record")
     for entry in records["files"]:
         name = entry["path"]
         if Path(name).is_absolute() or ".." in Path(name).parts:
-            raise SystemExit("Invalid English fixture path")
+            raise SystemExit("Invalid fixture path")
         path = Path(directory) / name
         if hashlib.sha256(path.read_bytes()).hexdigest() != entry["before_sha256"]:
-            raise SystemExit(f"English fixture baseline mismatch: {name}")
+            raise SystemExit(f"Fixture baseline mismatch: {name}")
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as patch:
             patch.write(entry["patch"])
             patch.flush()
             apply_patch(directory, patch.name)
         if hashlib.sha256(path.read_bytes()).hexdigest() != entry["after_sha256"]:
-            raise SystemExit(f"English fixture output mismatch: {name}")
+            raise SystemExit(f"Fixture output mismatch: {name}")
 
 
 def tree_files(directory):
