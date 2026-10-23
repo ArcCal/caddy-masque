@@ -200,8 +200,8 @@ var publicSuffixTestCases = []struct {
 	{"co.uk", "co.uk", true},
 	{"www.co.uk", "co.uk", true},
 
-	// The .рф rules are
-	// рф (xn--p1ai)
+	// The .xn--p1ai rules are
+	// xn--p1ai (Cyrillic code points U+0440 U+0444)
 	{"xn--p1ai", "xn--p1ai", true},
 	{"aaa.xn--p1ai", "xn--p1ai", true},
 	{"www.xxx.yyy.xn--p1ai", "xn--p1ai", true},

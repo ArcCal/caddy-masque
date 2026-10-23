@@ -148,7 +148,7 @@ func TestPunycodeHostPort(t *testing.T) {
 		in, want string
 	}{
 		{"www.google.com", "www.google.com"},
-		{"гофер.рф", "xn--c1ae0ajs.xn--p1ai"},
+		{"\u0433\u043e\u0444\u0435\u0440.\u0440\u0444", "xn--c1ae0ajs.xn--p1ai"},
 		{"bücher.de", "xn--bcher-kva.de"},
 		{"bücher.de:8080", "xn--bcher-kva.de:8080"},
 		{"[1::6]:8080", "[1::6]:8080"},

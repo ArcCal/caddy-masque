@@ -2355,12 +2355,12 @@ func TestTransportFailsOnInvalidHeadersAndTrailers(t *testing.T) {
 			wantErr: `invalid HTTP header name "with space"`,
 		},
 		1: {
-			h:       http.Header{"name": {"Брэд"}},
+			h:       http.Header{"name": {"\u0411\u0440\u044d\u0434"}},
 			wantErr: "", // okay
 		},
 		2: {
-			h:       http.Header{"имя": {"Brad"}},
-			wantErr: `invalid HTTP header name "имя"`,
+			h:       http.Header{"\u0438\u043c\u044f": {"Brad"}},
+			wantErr: "invalid HTTP header name \"\u0438\u043c\u044f\"",
 		},
 		3: {
 			h:       http.Header{"foo": {"foo\x01bar"}},

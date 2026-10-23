@@ -864,7 +864,7 @@ func TestAPITransportIDNA(t *testing.T) {
 		url:          "https://xn-example-.tld/",
 		wantDialAddr: "xn-example-.tld",
 	}, {
-		url:          "https://гофер.го/",
+		url:          "https://\u0433\u043e\u0444\u0435\u0440.\u0433\u043e/",
 		wantDialAddr: "xn--c1ae0ajs.xn--c1aw",
 	}, {
 		// IDNA translation returns an error, we try using the untranslated string.
