@@ -1,27 +1,3 @@
-# Agent instructions for caddy-masque
-
-## Project context
-
-- This is a Caddy CONNECT-IP server module, not an Apple Network Relay plugin.
-  Its Linux host networking creates TUN, forwarding and NAT state.
-- Start with `docs/USER_GUIDE.md`, `app.go`, `caddyfile.go` and `go.mod`.
-  Preserve the local patched QUIC/x/net dependency replacements when building.
-- Every normal, custom-main, xcaddy and cross-compiled build must include
-  `github.com/caddy-dns/cloudflare`. Preserve its unconditional package import
-  and pinned dependency; do not make it optional through tags or build variants.
-- Check the exact final executable for `masque`, `http.handlers.masque` and
-  `dns.providers.cloudflare` before installation, packaging or publication.
-  Cross-built executables need the check on the target or a suitable runner.
-  A failed check must not replace a working installed binary. Using Cloudflare
-  DNS challenges is optional; bundling the provider is mandatory.
-- Maintain client interoperability, authentication, certificate handling and
-  the protocol-specific distinctions between H3 Datagrams and Capsules.
-- Preserve ownership and cleanup boundaries for listeners, sessions, routing
-  and firewall objects; do not reset unrelated host networking.
-- Protect Caddy's administration endpoint separately from tunnel credentials.
-  Check actual release attachments and published tags before promising binaries.
-- Separate local protocol/client fixtures from native systemd, WAN and actual
-  client-device acceptance. Use the retained validation records accurately.
 
 ## Repository-wide contribution rules
 
@@ -55,10 +31,6 @@ unless the user explicitly requests changing those objectives.
 
 All MASQUE-related servers must have no violations of applicable IETF
 specifications, no known performance or security issues, and no regressions.
-
-All network-relay-related servers must have no violations of applicable IETF
-specifications and Apple's specifications, no known performance or security
-issues, and no regressions.
 
 ### 5. Client requirements
 
