@@ -1,7 +1,7 @@
 
 ## Repository-wide contribution rules
 
-The following six rules apply to this repository and all its subdirectories.
+The following rules apply to this repository and all its subdirectories.
 
 ### 1. Anonymity and English
 
