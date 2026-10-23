@@ -32,13 +32,7 @@ unless the user explicitly requests changing those objectives.
 All MASQUE-related servers must have no violations of applicable IETF
 specifications, no known performance or security issues, and no regressions.
 
-### 5. Client requirements
-
-Clients are not required to strictly follow IETF or Apple specifications, but
-must remain fully compatible and interoperable with their corresponding
-servers, with no serious performance or security issues and no regressions.
-
-### 6. Test before committing
+### 5. Test before committing
 
 - No change may introduce new problems or regressions.
 - Test changes before committing. Commit only after the tests appropriate to
