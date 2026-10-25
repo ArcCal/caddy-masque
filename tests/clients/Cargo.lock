@@ -989,7 +989,7 @@ checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
 name = "masque-nf-core"
-version = "1.0.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "masque-proto"
-version = "1.2.0"
+version = "3.0.0"
 dependencies = [
  "bytes",
  "thiserror",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "masque-vpn"
-version = "1.2.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "masque-vpn-killswitch"
-version = "1.0.3"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "masque-vpn-mac"
-version = "1.0.4"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "bytes",
