@@ -4,6 +4,7 @@ Each version is tagged with its number; CI attaches Caddy builds to its release 
 
 ## Unreleased
 
+- Every published release gets its Caddy builds, whatever its tag: the tag no longer has to appear in this changelog. `RELEASE-MANIFEST.txt` records the tag, source commit and checksums. Uploads still wait for every required test.
 - Extend the RFC-based review with bounded HTTP/2 SETTINGS acknowledgments, request-length/flow-control errors and priority validation; prevent malformed HTTP/3 fields/status syntax and unsupported HTTP/2–HTTP/3 switching responses. Preserve valid website and CONNECT behavior.
 - Validate signed QPACK field-section Base values while accepting legal positive static-only Base encodings, including the required 62-bit range. Apply the same check to requests, responses and trailers without enabling dynamic compression or changing dependencies.
 - Enforce new-address QUIC amplification budgets, complete undersized-probe MTU validation, answer current-path and multiple challenges, and validate the previous path during migration. Preserve response routes, congestion credit and CID lifetime across deferred sends; select the highest non-probing path and promote its reserved CID.

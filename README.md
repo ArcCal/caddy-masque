@@ -463,7 +463,8 @@ the following throughput figures are previous measurements, with current validat
 GitHub Actions runs the unit tests on every push to main and on every PR, plus `govulncheck` (weekly, and also on every
 push and PR) to check dependencies and the standard library for known vulnerabilities. Dependabot sends weekly PRs with
 dependency and Actions updates. Publishing a GitHub Release builds Caddy for Linux x86_64 and arm64, checks each
-program's architecture and the archives' checksums, and attaches the archives with their SHA-256 files once every test
+program's architecture and the archives' checksums, and attaches the archives with their SHA-256 files and a
+`RELEASE-MANIFEST.txt` (tag, source commit, checksums), whatever the release's tag, once every test
 has passed (Actions → ci → Run workflow with a release's tag does the same for an existing release); while the
 repository is public they also carry build provenance attestations
 (`gh attestation verify FILE --repo ArcCal/caddy-masque`), which GitHub does not offer to private repositories. The

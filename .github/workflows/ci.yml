@@ -71,13 +71,10 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
+          # Any release tag gets its builds; the archive name carries the tag.
           version=${TAG#v}
+          version=${version//\//-}
           [ -n "$TAG" ] || version=$(git rev-parse --short HEAD)
-          # A release's tag must be a version the changelog describes.
-          if [ -n "$TAG" ] && ! grep -qF "Tag: **\`$TAG\`**" CHANGELOG.md; then
-            echo "::error::the release tag $TAG is not a version in CHANGELOG.md"
-            exit 1
-          fi
           name=caddy-masque-$version-${{ matrix.os }}-${{ matrix.arch }}
           mkdir -p "dist/$name"
           (cd tested && sha256sum -c caddy.sha256)
@@ -124,6 +121,12 @@ jobs:
       id-token: write # for the build provenance attestation
       attestations: write
     steps:
+      # The same ref the builds checked out, to record its commit.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.event.pull_request.head.sha || github.sha }}
+          path: source
       - uses: actions/download-artifact@v8
         with:
           pattern: caddy-masque-*
@@ -136,12 +139,22 @@ jobs:
       # a private repository's release goes without.
       - name: Both archives, intact
         working-directory: dist
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           ls -l
           archives=(*.tar.gz) sums=(*.tar.gz.sha256)
           test "${#archives[@]}" -eq 2
           test "${#sums[@]}" -eq 2
           sha256sum -c -- *.sha256
+          # Any tag gets the builds; record which tag and commit they came from.
+          commit=$(git -C "$GITHUB_WORKSPACE/source" rev-parse HEAD)
+          {
+            printf 'Release tag: %s\nSource commit: %s\n' "$TAG" "$commit"
+            printf 'Workflow run: %s/%s/actions/runs/%s\n\nSHA-256:\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            cat -- *.sha256
+          } > RELEASE-MANIFEST.txt
+          cat RELEASE-MANIFEST.txt
       - uses: actions/attest-build-provenance@v4
         if: ${{ !github.event.repository.private }}
         with:
