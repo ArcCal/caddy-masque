@@ -66,7 +66,7 @@ say "Installing the newest patch release of Go $GO_LINE (skipped if already inst
 export PATH=/usr/local/go/bin:$PATH
 # The official release list: the newest stable release of the line, and the
 # SHA-256 of its archive.
-GO_RELEASES=$(curl -fsSL --max-time 60 'https://go.dev/dl/?mode=json&include=all') || die "cannot get the official list of Go releases"
+GO_RELEASES=$(curl -fsSL --retry 3 --retry-delay 5 --max-time 60 'https://go.dev/dl/?mode=json&include=all') || die "cannot get the official list of Go releases"
 GO_VERSION=$(jq -r --arg l "go$GO_LINE." 'first(.[] | select(.stable and (.version | startswith($l))) | .version) // empty' <<<"$GO_RELEASES")
 [ -n "$GO_VERSION" ] || die "the official list of Go releases has no stable release of $GO_LINE"
 GO_VERSION=${GO_VERSION#go}
@@ -79,7 +79,8 @@ if ! go version 2>/dev/null | grep -q "go$GO_VERSION "; then
     GO_FILE="go$GO_VERSION.linux-$GOARCH.tar.gz"
     # A directory of our own: nobody else can put a file in its place.
     GO_TMP=$(mktemp -d)
-    curl -fsSL "https://go.dev/dl/$GO_FILE" -o "$GO_TMP/$GO_FILE" || die "downloading Go failed"
+    curl -fsSL --retry 3 --retry-delay 5 "https://go.dev/dl/$GO_FILE" -o "$GO_TMP/$GO_FILE" ||
+        die "downloading Go failed; check that this server can reach https://go.dev, then run this again"
     GO_SHA256=$(jq -r --arg f "$GO_FILE" 'first(.[].files[] | select(.filename == $f) | .sha256) // empty' <<<"$GO_RELEASES")
     [ -n "$GO_SHA256" ] || die "the official list of Go releases has no $GO_FILE"
     echo "$GO_SHA256  $GO_TMP/$GO_FILE" | sha256sum -c --quiet - || die "the Go archive's SHA-256 is wrong; not installed"
@@ -113,6 +114,12 @@ cleanup() {
 trap cleanup EXIT
 mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 swap_kb=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
+# The build and Go's caches need about 3 GB, and a temporary swap file 2 GB more.
+need_gb=3
+[ $((mem_kb + swap_kb)) -ge 2500000 ] || need_gb=$((need_gb + 2))
+free_gb=$(df -Pk "$SRC" | awk 'NR == 2 { print int($4 / 1048576) }')
+[ "${free_gb:-$need_gb}" -ge "$need_gb" ] ||
+    die "only $free_gb GB of disk space is free, and the build needs about $need_gb GB; free up space (for example: apt-get clean), then run this again"
 if [ $((mem_kb + swap_kb)) -lt 2500000 ]; then
     echo "Little memory: adding 2 GB of temporary swap space for the build"
     SWAP=$(mktemp /caddy-build-XXXXXX.swap) # a new file, mode 600
@@ -120,7 +127,9 @@ if [ $((mem_kb + swap_kb)) -lt 2500000 ]; then
     mkswap -q "$SWAP"
     swapon "$SWAP"
 fi
-(cd "$SRC" && GOTOOLCHAIN=local CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags "-s -w" -o "$BUILD_DIR/caddy" ./cmd/caddy)
+if ! (cd "$SRC" && GOTOOLCHAIN=local CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags "-s -w" -o "$BUILD_DIR/caddy" ./cmd/caddy); then
+    die "the build failed (see the messages above); the installed binary was not replaced. If the messages mention downloading modules, check that this server can reach https://proxy.golang.org, then run this again"
+fi
 cleanup_swap
 # Validate the staged executable before replacing an installed working binary.
 # Cloudflare DNS is mandatory even when this deployment uses another challenge.
