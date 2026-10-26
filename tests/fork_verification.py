@@ -54,18 +54,38 @@ def verify_module_directory(directory, name, version, expected_sum):
         raise SystemExit("Extracted upstream module checksum mismatch")
 
 
-def download_verified_module(root, name, version):
-    """Keep the upstream download pinned to the repository's existing checksum."""
+def pinned_sum(root, name, version):
+    """The expected upstream checksum, from a value committed in this repository.
+
+    go.sum is the preferred source, but it cannot hold an entry for a module
+    that a replace directive redirects to third_party/: Go records no checksum
+    for a replacement it reads from disk. The fork baselines are therefore
+    pinned in third_party/upstream-checksums.json. Either way the expected
+    value is committed here and is never taken from whatever a download
+    happens to return.
+    """
     sums = [line.split()[2] for line in (root / "go.sum").read_text().splitlines()
             if line.startswith(f"{name} {version} ")]
-    if len(sums) != 1:
+    if len(sums) > 1:
         raise SystemExit(f"Expected one pinned checksum for {name} {version}")
+    if sums:
+        return sums[0]
+    pinned = json.loads((root / "third_party" / "upstream-checksums.json").read_text())
+    expected = pinned.get(f"{name} {version}")
+    if not isinstance(expected, str) or not expected.startswith("h1:"):
+        raise SystemExit(f"Expected one pinned checksum for {name} {version}")
+    return expected
+
+
+def download_verified_module(root, name, version):
+    """Keep the upstream download pinned to the repository's existing checksum."""
+    expected = pinned_sum(root, name, version)
     module = json.loads(subprocess.check_output(
         ["go", "mod", "download", "-json", f"{name}@{version}"], cwd=root))
-    if module.get("Sum") != sums[0]:
+    if module.get("Sum") != expected:
         raise SystemExit("Pinned upstream module checksum mismatch")
     directory = Path(module["Dir"])
-    verify_module_directory(directory, name, version, sums[0])
+    verify_module_directory(directory, name, version, expected)
     return directory
 
 

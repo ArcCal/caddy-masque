@@ -1,0 +1,13 @@
+{
+  "_comment": [
+    "Expected upstream module checksums for the forks under third_party/.",
+    "go.sum cannot hold these: Go records no checksum for a module that a",
+    "replace directive reads from disk, so the fork verification scripts read",
+    "their expected value here instead. Each value is Go's dirhash h1: sum as",
+    "published by the checksum database, and was verified against",
+    "sum.golang.org when recorded.",
+    "Update an entry only together with the fork it pins and its patches."
+  ],
+  "golang.org/x/net v0.60.0": "h1:79p50tfZlm0J9YfoDsSi639qSXNGVwEzOPLCxM2FsYU=",
+  "github.com/quic-go/quic-go v0.63.0": "h1:LIFGHI4PFUhhw2dDD1ARHdCff143ffMHwZtbnbuJ78A="
+}

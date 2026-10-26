@@ -10,6 +10,13 @@ notice cleanup and Go formatting, applies the patch without fuzzy or offset
 matching, then compares every shipped file byte. Unexpected files, missing
 files, or other edits fail verification.
 
+That expected checksum comes from `upstream-checksums.json` in this directory,
+not from `go.sum`. Go records no checksum for a module it reads through a
+replace directive from disk, so `go.sum` cannot hold an entry for either fork,
+and the verification scripts read their pinned `h1:` value here instead. The
+values are Go's dirhash sums as published by the checksum database. Change an
+entry only together with the fork it pins and that fork's patches.
+
 The v0.60.0 baseline includes the upstream HTTP/2 security fixes for trailer
 allocation limits (GO-2026-6603), response-header normalization
 (GO-2026-6610), lazy flow-window accounting (GO-2026-6611), closed-stream
