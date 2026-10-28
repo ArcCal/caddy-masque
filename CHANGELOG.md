@@ -4,6 +4,7 @@ Each version is tagged with its number; CI attaches Caddy builds to its release 
 
 ## Unreleased
 
+- Run the systemd service as a dedicated non-login `caddy-masque` account with only network-management and low-port capabilities. Keep server configuration root-owned and group-readable, exported client passwords root-only, and state/log directories private. Restrict device access, other users' process visibility and writable kernel tunables while preserving managed TUN, forwarding, NAT, reload and recovery. Both installers prepare the account; manual upgrades must adjust configuration and external site/TLS file permissions as described in the user guide.
 - Every published release gets its Caddy builds, whatever its tag: the tag no longer has to appear in this changelog. `RELEASE-MANIFEST.txt` records the tag, source commit and checksums. Uploads still wait for every required test.
 - Extend the RFC-based review with bounded HTTP/2 SETTINGS acknowledgments, request-length/flow-control errors and priority validation; prevent malformed HTTP/3 fields/status syntax and unsupported HTTP/2–HTTP/3 switching responses. Preserve valid website and CONNECT behavior.
 - Validate signed QPACK field-section Base values while accepting legal positive static-only Base encodings, including the required 62-bit range. Apply the same check to requests, responses and trailers without enabling dynamic compression or changing dependencies.

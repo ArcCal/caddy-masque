@@ -3,7 +3,7 @@
 # Run from an authenticated, complete checkout:
 #   sudo bash setup-caddy-masque-autoarch-cloudflare-dns.sh
 # Supports Debian 12/13 and Ubuntu 22.04/24.04 on Linux amd64/arm64.
-# Only this file is added to the repository. Runtime files are installed outside it.
+# Runtime files are installed outside the checkout.
 # Caddy obtains and renews its certificate using the bundled Cloudflare module.
 # Re-running preserves this installer's Caddyfile, users and certificate lineage.
 # Existing unrelated Caddyfiles are refused; migrate those manually.
@@ -15,12 +15,14 @@ Usage: sudo bash setup-caddy-masque-autoarch-cloudflare-dns.sh
 
 Interactively build and install a native Linux amd64/arm64 MASQUE server
 with the bundled caddy-dns/cloudflare plugin, configure DNS-01 issuance
-and automatic renewal in Caddy, and start the hardened systemd service.
+and automatic renewal in Caddy, and start the hardened systemd service
+under the dedicated non-login caddy-masque account with network capabilities.
 
 Required: Debian 12/13 or Ubuntu 22.04/24.04, root, systemd, TUN and Internet.
 Have a DNS-only domain at Cloudflare and a CF_API_TOKEN scoped to that zone
 with Zone:DNS:Edit and Zone:Zone:Read. The token is entered without echo and
-stored in a mode-0600 file for renewal; it is never a command argument.
+stored root-owned and service-group-readable (0640) for renewal; it is never
+a command argument. Client passwords remain root-only (0600).
 TCP/UDP 443 must reach this server. DNS-01 does not require inbound port 80.
 Only domain and token are requested. The script selects an IPv4-only tunnel
 pool automatically; client LANs must not overlap the reported pool.
@@ -85,6 +87,7 @@ init_paths() {
     WAS_ENABLE_STATE=disabled
     ENABLE_TOUCHED=0
     HAD_CONFIG=0
+    STATE_METADATA=''
 }
 
 acquire_lock() {
@@ -114,6 +117,8 @@ transaction_paths() {
 
 check_target_paths() {
     local path
+    [[ ! -L $STATE && ( ! -e $STATE || -d $STATE ) ]] ||
+        die "the configuration directory must be a directory, not a symlink: $STATE"
     while IFS= read -r path; do
         [[ ! -L $path && ( ! -e $path || -f $path ) ]] ||
             die "deployment files must be regular files, not symlinks: $path"
@@ -130,7 +135,8 @@ preflight() {
         debian:12 | debian:13 | ubuntu:22.04 | ubuntu:24.04) ;;
         *) die "supported systems: Debian 12/13 and Ubuntu 22.04/24.04 (found $ID $VERSION_ID)" ;;
     esac
-    [[ -f $SRC/go.mod && -d $SRC/third_party/xnet && -d $SRC/third_party/quic-go && -f $SRC/deploy/caddy-masque.service ]] ||
+    [[ -f $SRC/go.mod && -d $SRC/third_party/xnet && -d $SRC/third_party/quic-go &&
+        -f $SRC/deploy/caddy-masque.service && -f $SRC/deploy/prepare-service-user.sh ]] ||
         die "keep this script at the root of the complete caddy-masque checkout"
     [[ -d /run/systemd/system ]] || die "systemd must be running as the system service manager"
     command -v flock >/dev/null || die "install util-linux (flock) first"
@@ -502,6 +508,8 @@ install_server() {
     while IFS= read -r path; do
         if [[ -e $path ]]; then cp -p -- "$path" "$BUILD_DIR/backup/$(basename -- "$path")"; fi
     done < <(transaction_paths)
+    if [[ -d $STATE ]]; then STATE_METADATA=$(stat -c '%u:%g:%a' -- "$STATE"); fi
+    bash "$SRC/deploy/prepare-service-user.sh"
     INSTALLING=1
     install -d -m 0755 "$(dirname -- "$BINARY")" "$SITE" "$UNIT_DIR"
     if [[ ! -e $SITE/index.html ]]; then
@@ -511,9 +519,9 @@ install_server() {
     # Rename within the destination filesystem, including while the old binary runs.
     install -m 0755 "$BUILD_DIR/caddy-masque" "$BINARY.masque-new"
     mv -f -- "$BINARY.masque-new" "$BINARY"
-    install -d -m 0700 "$STATE"
-    install -m 0600 "$BUILD_DIR/cloudflare-token" "$TOKEN_FILE"
-    install -m 0600 "$BUILD_DIR/Caddyfile" "$CONFIG"
+    install -d -o root -g caddy-masque -m 0750 "$STATE"
+    install -o root -g caddy-masque -m 0640 "$BUILD_DIR/cloudflare-token" "$TOKEN_FILE"
+    install -o root -g caddy-masque -m 0640 "$BUILD_DIR/Caddyfile" "$CONFIG"
     install -m 0644 "$BUILD_DIR/$SERVICE" "$UNIT_DIR/$SERVICE"
     if (( ! HAD_CONFIG )); then
         install -m 0600 "$BUILD_DIR/client-credentials.txt" "$CREDENTIALS"
@@ -544,7 +552,7 @@ verify_server() {
 }
 
 cleanup() {
-    local result=$? path backup rollback_failed=0
+    local result=$? path backup state_uid state_gid state_mode rollback_failed=0
     trap - EXIT
     set +e
     if [[ -n $INSTALLING && $result != 0 ]]; then
@@ -562,6 +570,11 @@ cleanup() {
                 rm -f -- "$path" || rollback_failed=1
             fi
         done < <(transaction_paths)
+        if [[ -n $STATE_METADATA ]]; then
+            IFS=: read -r state_uid state_gid state_mode <<<"$STATE_METADATA"
+            chown "$state_uid:$state_gid" "$STATE" || rollback_failed=1
+            chmod "$state_mode" "$STATE" || rollback_failed=1
+        fi
         systemctl daemon-reload || rollback_failed=1
         if (( ENABLE_TOUCHED )); then
             case "$WAS_ENABLE_STATE" in
@@ -628,7 +641,7 @@ main() {
     printf 'On the Linux client: sudo masque-client --config ./masque-client.toml\n'
     printf 'Provider firewall: allow TCP 443 and UDP 443; TCP 80 is optional for HTTPS redirects.\n'
     printf 'Status: systemctl status %s\n' "$SERVICE"
-    printf 'Caddy automatically renews certificates; keep %s valid and private.\n' "$TOKEN_FILE"
+    printf 'Caddy automatically renews certificates; keep %s valid, root-owned and readable only by the service group.\n' "$TOKEN_FILE"
     printf 'Check that client LANs do not overlap the server tunnel pool in %s.\n' "$CONFIG"
     printf 'Verify a real client tunnel, DNS, TCP/UDP traffic and reconnect from another device.\n'
 }

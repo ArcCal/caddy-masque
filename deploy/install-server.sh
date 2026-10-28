@@ -32,6 +32,7 @@ die() { printf '\n\033[1;31mError: %s\033[0m\n' "$*" >&2; exit 1; }
 [ -n "$DOMAIN" ] || die "usage: bash deploy/install-server.sh YOUR_DOMAIN [USER_NAME]"
 [ "$(id -u)" = 0 ] || die "run this as root (sudo -i first)"
 if [ ! -f "$SRC/go.mod" ] || ! grep -q caddy-masque "$SRC/go.mod"; then die "run this in the caddy-masque source directory"; fi
+# shellcheck disable=SC1091
 . /etc/os-release
 case "$ID" in
     debian | ubuntu) ;;
@@ -186,11 +187,11 @@ fi
 say "Configuration"
 if [ -f "$CONFIG" ]; then
     echo "$CONFIG already exists; kept (with its users unchanged)"
-    # The service puts Caddy's admin API on a socket only root can use
+    # The service puts Caddy's admin API on a private service-account socket
     # (CADDY_ADMIN in deploy/caddy-masque.service); an admin option here
-    # replaces that.
+    # replaces that. Root can also reach the socket.
     if grep -qE '^[[:space:]]*admin([[:space:]]|$)' "$CONFIG"; then
-        echo "Note: $CONFIG sets Caddy's admin endpoint itself, so the service's root-only socket /run/caddy-masque/admin.sock is not used."
+        echo "Note: $CONFIG sets Caddy's admin endpoint itself, so the service's private socket /run/caddy-masque/admin.sock is not used."
         echo "      Unless that endpoint is a unix socket only root can reach (or off), remove the admin line: on localhost:2019"
         echo "      every local user and process can read the configuration, password hashes included, and change it."
     fi
@@ -264,6 +265,16 @@ else
 fi
 
 say "Starting the service"
+bash "$SRC/deploy/prepare-service-user.sh"
+# The service can read configuration but cannot modify it or read the root-only
+# client credentials. systemd migrates ownership of its managed state directories.
+chown root:caddy-masque /etc/caddy "$CONFIG"
+chmod 0750 /etc/caddy
+chmod 0640 "$CONFIG"
+if [[ -f /etc/caddy/cloudflare-token && ! -L /etc/caddy/cloudflare-token ]]; then
+    chown root:caddy-masque /etc/caddy/cloudflare-token
+    chmod 0640 /etc/caddy/cloudflare-token
+fi
 install -m 644 "$SRC/deploy/caddy-masque.service" /etc/systemd/system/caddy-masque.service
 systemctl daemon-reload
 systemctl enable --now caddy-masque

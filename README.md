@@ -55,10 +55,17 @@ The script also checks that `/dev/net/tun` exists (on OpenVZ- and LXC-type VPSes
 when it finds ufw running, it opens the ports and allows forwarding from `masque0`; when Docker has set the FORWARD default
 policy to DROP, it prints a warning and the command to allow the traffic.
 
-The service runs as root (it writes to `/proc/sys`), but `deploy/caddy-masque.service` cuts its privileges down to
-CAP_NET_ADMIN, CAP_NET_BIND_SERVICE and CAP_DAC_READ_SEARCH, makes the file system read-only except `/var/lib/caddy*` and
-`/var/log/caddy`, and restricts system calls and address families. When a site needs to write to another directory
-(for example its own log file): `systemctl edit caddy-masque`, and add `[Service]` and `ReadWritePaths=/that/directory`.
+The installers create a dedicated, non-login `caddy-masque` system account. The service keeps only
+CAP_NET_ADMIN (TUN, routes, nftables, conntrack and network sysctls) and CAP_NET_BIND_SERVICE;
+ambient capabilities preserve the network permissions needed by its `ip` and `nft` subprocesses.
+Configuration stays root-owned and service-group-readable; plaintext client passwords stay root-only.
+The service isolates devices and other users' processes, makes kernel tunables read-only except the
+network paths MASQUE uses, and restricts filesystem writes, system calls and address families.
+State and log directories are private (0700), and newly created files use umask 0077.
+Imported configuration, custom site files and TLS keys must be readable by this account; there is no DAC read bypass.
+For another writable directory, grant the service account access and add `[Service]` and
+`ReadWritePaths=/that/directory` through `systemctl edit caddy-masque`.
+See the [runtime hardening and migration instructions](docs/USER_GUIDE.md#operate-reload-and-monitor).
 
 Already running the masque-vpn server? First `systemctl disable --now masque-server`; both need port 443.
 Existing users carry over as they are: each `[[user]]` in `server.toml` becomes one `user NAME HASH` line in the Caddyfile.
@@ -172,11 +179,11 @@ interface). With `manage_network off` no rules are installed, and this is up to 
 
 Caddy's admin API (it shows and replaces the configuration, password hashes included, and can stop the server) has no
 authentication. Caddy's default for it is `localhost:2019`, where every local user and process could use it, and the
-service runs as root. So `deploy/caddy-masque.service` moves it to a unix socket only root can use,
+service has host network-management privileges. `deploy/caddy-masque.service` uses a Unix socket accessible only to the service account and root,
 `/run/caddy-masque/admin.sock` (`CADDY_ADMIN` in the unit). `systemctl reload caddy-masque` uses it; to call it by hand,
 as root: `caddy reload --config /etc/caddy/Caddyfile --address 'unix//run/caddy-masque/admin.sock'`, or
 `curl --unix-socket /run/caddy-masque/admin.sock http://localhost/config/`. An `admin` option in the Caddyfile replaces
-the socket; if you set one, keep it a unix socket only root can reach, or `admin off`, and never put it on a network
+the socket; if you set one, keep it a private Unix socket, or `admin off`, and never put it on a network
 address.
 
 ### Against password guessing and pool exhaustion

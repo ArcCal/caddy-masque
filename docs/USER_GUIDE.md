@@ -44,7 +44,7 @@ forward TCP/UDP traffic or resolve DNS through the server.
 | Cloudflare DNS provider module | Optional DNS-challenge certificate issuance, not the tunnel's remote backend |
 
 Linux amd64 and arm64 are the product targets. Runtime needs TUN and
-network-management privileges, normally supplied by the root systemd unit.
+network-management privileges, supplied by the unit's dedicated account and network capabilities.
 Do not confuse a successful arm64 cross-build with native arm64 acceptance.
 
 Ordinary non-tunnel requests follow Caddy's normal site handlers. Refused
@@ -93,7 +93,7 @@ You need:
 5. A nonoverlapping tunnel pool. The examples use `10.89.0.1/24`; avoid
    overlap with server networks, client LANs and other VPNs.
 6. A secure way to administer and recover the machine while changing a
-   root network service.
+   network-privileged service.
 
 Useful initial checks:
 
@@ -212,12 +212,13 @@ Apply the same three-module check after xcaddy builds, before installation or
 publication. For cross-compilation, execute the check on the target or a suitable
 runner rather than removing a module to avoid a host architecture mismatch.
 
-For a manual systemd installation, install the executable, create the Caddy
+For a manual systemd installation, prepare the service account, install the executable, create the Caddy
 configuration/site files and copy the supplied unit:
 
 ```sh
 sudo install -m 0755 caddy /usr/local/bin/caddy
-sudo install -d -m 0700 /etc/caddy
+sudo bash deploy/prepare-service-user.sh
+sudo install -d -o root -g caddy-masque -m 0750 /etc/caddy
 sudo install -d -m 0755 /var/www/site
 sudo install -m 0644 deploy/caddy-masque.service /etc/systemd/system/caddy-masque.service
 ```
@@ -265,7 +266,8 @@ Create actual site content in `/var/www/site`, keep configuration ownership
 restricted, and adapt/validate before starting:
 
 ```sh
-sudo chmod 0600 /etc/caddy/Caddyfile
+sudo chown root:caddy-masque /etc/caddy/Caddyfile
+sudo chmod 0640 /etc/caddy/Caddyfile
 sudo /usr/local/bin/caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile --pretty
 sudo /usr/local/bin/caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo systemctl daemon-reload
@@ -388,7 +390,7 @@ domain using its standard challenges. Cloudflare DNS support must be included in
 every build; using it for certificate issuance is optional and requires your own scoped
 Cloudflare API credential.
 
-For DNS challenges, a site can use a root-readable token file:
+For DNS challenges, a site can use a root-owned, service-group-readable token file:
 
 ```caddyfile
 example.com, *.example.com, :443 {
@@ -402,7 +404,8 @@ example.com, *.example.com, :443 {
 ```
 
 Keep the global `masque` block from the previous example. Store only the
-token in `/etc/caddy/cloudflare-token`, restrict its permissions, and grant
+token in `/etc/caddy/cloudflare-token`, set its owner/group to `root:caddy-masque`
+and mode to `0640`, and grant
 only the DNS permissions/zones required by your deployment. Do not embed
 tokens in public configs or diagnostic dumps. Check file access under the
 actual service restrictions.
@@ -414,19 +417,58 @@ directories across upgrades so ACME account/certificate state is retained.
 
 ## Operate, reload and monitor
 
-The supplied unit runs as root but restricts capabilities, devices,
-filesystem writes, system calls and address families. State lives under
+The supplied unit runs as the dedicated, non-login `caddy-masque` account with
+only `CAP_NET_ADMIN` and `CAP_NET_BIND_SERVICE`. The same ambient capabilities
+reach `ip` and `nft`; Linux permits the network sysctl writes under
+`CAP_NET_ADMIN` without UID 0. The unit restricts devices, other users' process
+visibility, filesystem writes, system calls and address families. State lives under
 `/var/lib/caddy` and `/var/lib/caddy-config`; logs may use `/var/log/caddy`.
 A site that needs another writable directory requires a service drop-in
-with the corresponding `ReadWritePaths`. Do not remove sandboxing simply
+with the corresponding `ReadWritePaths` and Unix permissions for the service account. Do not remove sandboxing simply
 because a custom log path fails.
 
-The admin API can read/replace the full configuration and stop this root
-service. The unit sets it to a root-only Unix socket:
+The admin API can read/replace the full configuration and stop this network-privileged
+service. The unit sets it to a private Unix socket for the service account and root:
 `/run/caddy-masque/admin.sock`, mode 0600 inside a mode-0700 runtime directory.
 An explicit Caddyfile `admin` option overrides that choice. Do not expose an
 unauthenticated network admin address. Caddy's ordinary localhost default
 is still reachable by other local users/processes.
+
+For the native Cloudflare installer, the executable is `/usr/local/bin/caddy-masque`,
+configuration/token files are under `/etc/caddy-masque`, and state/log roots use
+`/var/lib/caddy-masque`, `/var/lib/caddy-masque-config` and `/var/log/caddy-masque`.
+Caddy appends `/caddy` to each XDG base. Both installers keep server configuration
+root-owned (`0640`, group `caddy-masque`) in a `0750` directory; exported client
+passwords remain root-owned `0600`. Managed runtime, state and log directories use
+`0700`; the service uses `UMask=0077` and cannot write its configuration or binary.
+
+When upgrading a root-based service, rerun the matching installer to create/validate
+the account and adjust configuration access before installing the new unit.
+For a manual installation, run `deploy/prepare-service-user.sh`, set the configuration
+directory to `root:caddy-masque`/`0750`, and set Caddyfile/token files to
+`root:caddy-masque`/`0640`. Keep client password files `root:root`/`0600`.
+On startup, systemd adjusts ownership of its `StateDirectory` and `LogsDirectory`
+trees when their top-level ownership changes. If a top-level directory is already
+owned by the service but contains old root-owned files, repair those files' ownership
+within the managed state/log trees before starting. Grant explicit read access to
+imported configuration, custom site files and externally managed TLS keys formerly read using the removed
+`CAP_DAC_READ_SEARCH`; do not make private keys world-readable.
+
+`ProtectKernelTunables=yes` leaves writable only `/proc/sys/net/ipv4/ip_forward`,
+`/proc/sys/net/ipv4/conf` and the optional `/proc/sys/net/ipv6/conf`. The interface
+directories must remain available for dynamically created TUN interfaces and IPv6
+router-advertisement preservation. Keep the host network namespace, `AF_NETLINK`
+and `/dev/net/tun`; `PrivateNetwork=yes`, `PrivateUsers=yes` or `ProcSubset=pid`
+would break network management. `PrivateDevices=yes` explicitly binds the TUN device.
+The host's TUN node must allow the service account to read and write it, as standard
+distribution udev rules do; a device allow-list does not bypass Unix file permissions.
+The remaining `CAP_NET_ADMIN` can still change host routes/firewall through netlink;
+this is a privilege reduction, not isolation from the host network.
+
+These settings follow [Caddy's service guidance](https://caddyserver.com/docs/running)
+and the [systemd 249 execution documentation](https://www.freedesktop.org/software/systemd/man/249/systemd.exec.html),
+the oldest systemd line among the supported distributions. Network sysctl permission
+handling is visible in the [Linux kernel implementation](https://github.com/torvalds/linux/blob/v5.15/net/sysctl_net.c).
 
 Common operations with the supplied unit:
 
@@ -437,6 +479,18 @@ sudo systemctl reload caddy-masque
 sudo systemctl restart caddy-masque
 sudo systemctl stop caddy-masque
 ```
+
+Inspect the effective unit and any local overrides after an upgrade:
+
+```sh
+systemctl cat caddy-masque
+systemctl show caddy-masque -p User -p Group -p CapabilityBoundingSet -p AmbientCapabilities -p NoNewPrivileges
+sudo systemd-analyze security --no-pager caddy-masque.service
+```
+
+The user/group should be `caddy-masque` and capabilities should contain only
+`CAP_NET_ADMIN` and `CAP_NET_BIND_SERVICE`. The security score is a heuristic;
+it does not prove a working tunnel or account for every writable sysctl exception.
 
 `reload` applies compatible user/site/policy changes without blanket tunnel
 teardown and forces certificate rereading through the unit's command. Removed
