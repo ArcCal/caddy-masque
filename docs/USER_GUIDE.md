@@ -236,7 +236,9 @@ Generate one account per device:
 
 The command prints a complete `user laptop $argon2id$...` line for the
 server, plus `username` and plaintext `password` lines for the client. Copy
-each to the correct side. Generated passwords have 144 bits of entropy.
+each to the correct side. Generated passwords are exactly 22 random characters,
+with at least one uppercase letter, lowercase letter, digit and symbol (`-` or `_`).
+These URL-safe characters need no escaping in the generated client configuration.
 Usernames allow 1-64 letters, digits, hyphen, underscore or dot.
 
 `--stdin` reads a chosen password instead of generating one. It must contain

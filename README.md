@@ -192,7 +192,8 @@ address.
   requests that carry credentials are not checked for the next minute but are treated as ordinary web requests (like
   requests without credentials). Users sharing an outgoing address affect one another during that minute, except
   those whose credentials are remembered (below).
-  Generated passwords have 144 bits and cannot be guessed; passwords of your own given to `masque-passwd --stdin` need
+  Generated passwords are 22 random characters and always include uppercase, lowercase, digits and the symbols `-` or `_`;
+  passwords of your own given to `masque-passwd --stdin` need
   at least 12 characters; make them long and random.
 - Checking a password (Argon2id) takes tens of milliseconds and megabytes of memory, so only a few checks run at once
   and a limited number wait. One client address (for IPv6, per /64) may have at most 4 checks waiting or running;

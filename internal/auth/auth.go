@@ -63,14 +63,35 @@ func ParseBasic(value string) (string, string, bool) {
 	return user, password, ok
 }
 
-// GeneratePassword is a random password with 144 bits of entropy: out of
-// reach of online guessing, so the server needs no lockout.
+// GeneratePassword returns 22 random URL-safe characters, including uppercase,
+// lowercase, digits and symbols (- and _).
 func GeneratePassword() string {
-	b := make([]byte, 18)
-	if _, err := rand.Read(b); err != nil {
-		panic(err)
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	for {
+		var b [22]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			panic(err)
+		}
+		var upper, lower, digit, symbol bool
+		for i := range b {
+			// All 64 symbols are equally likely: 64 divides the byte range.
+			b[i] = alphabet[b[i]&63]
+			switch {
+			case b[i] >= 'A' && b[i] <= 'Z':
+				upper = true
+			case b[i] >= 'a' && b[i] <= 'z':
+				lower = true
+			case b[i] >= '0' && b[i] <= '9':
+				digit = true
+			default:
+				symbol = true
+			}
+		}
+		// Reject whole candidates to keep every valid password equally likely.
+		if upper && lower && digit && symbol {
+			return string(b[:])
+		}
 	}
-	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // Argon2id parameters of the argon2 crate's defaults that masque-passwd

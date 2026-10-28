@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 )
@@ -15,6 +16,43 @@ const (
 )
 
 var src = netip.MustParseAddr("192.0.2.1")
+
+func TestGeneratePassword(t *testing.T) {
+	const allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	seen := make(map[string]bool)
+	for range 1024 {
+		password := GeneratePassword()
+		if len(password) != 22 {
+			t.Fatalf("generated password length = %d, want 22", len(password))
+		}
+		for _, c := range password {
+			if !strings.ContainsRune(allowed, c) {
+				t.Fatalf("generated password contains unsupported character %q", c)
+			}
+		}
+		for _, class := range []string{"ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz", "0123456789", "-_"} {
+			if !strings.ContainsAny(password, class) {
+				t.Fatalf("generated password is missing character class %q", class)
+			}
+		}
+		if seen[password] {
+			t.Fatal("generated a duplicate password")
+		}
+		seen[password] = true
+	}
+}
+
+func TestGeneratedPasswordHashAndBasic(t *testing.T) {
+	password := GeneratePassword()
+	hash := HashPassword(password)
+	user, decoded, ok := ParseBasic(BasicAuthorization("laptop", password))
+	if !ok || user != "laptop" || decoded != password || !verifyHash(decoded, hash) {
+		t.Fatal("generated password failed the Basic authentication and hash round trip")
+	}
+	if verifyHash(password+"wrong", hash) {
+		t.Fatal("incorrect password matched the generated password hash")
+	}
+}
 
 // source is the i-th of many distinct sources.
 func source(i int) netip.Addr {
