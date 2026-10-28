@@ -17,6 +17,18 @@ Interactively build and install a native Linux amd64/arm64 MASQUE server
 with the bundled caddy-dns/cloudflare plugin, configure DNS-01 issuance
 and automatic renewal in Caddy, and start the hardened systemd service
 under the dedicated non-login caddy-masque account with network capabilities.
+A private filesystem view exposes managed configuration/site/state and required
+TLS, DNS and runtime files under /etc, /run and /var. Execution is limited to
+Caddy, ip/nft and trusted OS library directories.
+Custom paths need root-maintained systemd bind/execute overrides.
+For blocked custom paths, adjust InaccessiblePaths as well.
+Restart the service after host resolver/hosts files are atomically replaced.
+Memory normally uses at most half visible RAM (max 1 GiB); small hosts may use
+up to 75% to keep the service usable. The service has no swap allowance,
+and at most 512 tasks. Excess memory can restart the service. Inspect limits
+with systemctl show caddy-masque; adjust them with systemctl edit if needed.
+Caddy still reads its server keys/token and retains host CAP_NET_ADMIN, which
+can change host networking. Abstract Unix sockets also remain in the host network.
 
 Required: Debian 12/13 or Ubuntu 22.04/24.04, root, systemd, TUN and Internet.
 Have a DNS-only domain at Cloudflare and a CF_API_TOKEN scoped to that zone
@@ -73,6 +85,7 @@ init_paths() {
     TOKEN_FILE="$STATE/cloudflare-token"
     CREDENTIALS="$STATE/client-credentials.txt"
     CLIENT_CONFIG="$STATE/masque-client.toml"
+    RUNTIME_VIEW="$STATE/.systemd-run-view"
     SITE=/var/www/caddy-masque
     GO_INSTALL_ROOT=/opt/caddy-masque
     BUILD_CACHE=/var/cache/caddy-masque
@@ -119,6 +132,12 @@ check_target_paths() {
     local path
     [[ ! -L $STATE && ( ! -e $STATE || -d $STATE ) ]] ||
         die "the configuration directory must be a directory, not a symlink: $STATE"
+    [[ ! -L $RUNTIME_VIEW && ( ! -e $RUNTIME_VIEW || -d $RUNTIME_VIEW ) ]] ||
+        die "the private runtime view must be a directory, not a symlink: $RUNTIME_VIEW"
+    if [[ -d $RUNTIME_VIEW ]]; then
+        [[ $(stat -c '%u:%g:%a' -- "$RUNTIME_VIEW") == 0:0:755 ]] ||
+            die "the private runtime view must remain root-owned and mode 0755: $RUNTIME_VIEW"
+    fi
     while IFS= read -r path; do
         [[ ! -L $path && ( ! -e $path || -f $path ) ]] ||
             die "deployment files must be regular files, not symlinks: $path"
@@ -427,7 +446,37 @@ PYCODE
     fi
 }
 
+runtime_memory_limits() {
+    local total_kb budget_mib limit_mib path bytes candidate ceiling
+    total_kb=$(awk '$1 == "MemTotal:" {print $2; exit}' /proc/meminfo)
+    [[ $total_kb =~ ^[0-9]+$ ]] || die "cannot determine the service memory budget"
+    budget_mib=$((total_kb / 1024))
+    # Respect a visible container limit as well as physical RAM.
+    for path in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+        if [[ -r $path ]]; then
+            IFS= read -r bytes <"$path" || die "cannot read memory limit: $path"
+            if [[ $bytes =~ ^[0-9]+$ ]]; then
+                candidate=$((bytes / 1048576))
+                if (( candidate < budget_mib )); then budget_mib=$candidate; fi
+            fi
+        fi
+    done
+    limit_mib=$((budget_mib / 2))
+    if (( limit_mib < 256 )); then limit_mib=256; fi
+    ceiling=$((budget_mib * 3 / 4))
+    if (( limit_mib > ceiling )); then limit_mib=$ceiling; fi
+    if (( limit_mib > 1024 )); then limit_mib=1024; fi
+    (( limit_mib >= 64 )) || die "insufficient memory for the confined Caddy service"
+    printf '%s %s %s\n' "$limit_mib" "$((limit_mib * 3 / 4))" "$((limit_mib * 7 / 10))"
+}
+
 stage_service() {
+    local ip_binary nft_binary memory_max memory_high go_limit
+    ip_binary=$(PATH=/usr/sbin:/usr/bin:/sbin:/bin command -v ip) || die "iproute2 is required"
+    nft_binary=$(PATH=/usr/sbin:/usr/bin:/sbin:/bin command -v nft) || die "nftables is required"
+    ip_binary=$(readlink -e -- "$ip_binary")
+    nft_binary=$(readlink -e -- "$nft_binary")
+    read -r memory_max memory_high go_limit < <(runtime_memory_limits)
     # Keep this installer's paths separate from the manual deployment template.
     # Caddy appends /caddy to each XDG base directory.
     sed \
@@ -440,6 +489,53 @@ stage_service() {
         -e 's|^StateDirectory=.*|StateDirectory=caddy-masque caddy-masque-config|' \
         -e 's|^LogsDirectory=.*|LogsDirectory=caddy-masque|' \
         "$SRC/deploy/caddy-masque.service" >"$BUILD_DIR/$SERVICE"
+    cat >>"$BUILD_DIR/$SERVICE" <<EOF
+
+# Installer-specific containment. Directory binds preserve atomic config/token
+# replacements. TemporaryFileSystem also makes namespace setup fail closed.
+[Service]
+TemporaryFileSystem=/etc:ro,noexec /var:ro,noexec
+# systemd 249's API-VFS /run mount overrides a tmpfs entry. A trusted directory
+# bind has higher priority and preserves the intended private runtime view.
+BindReadOnlyPaths=$RUNTIME_VIEW:/run
+# Set noexec on the overlays themselves; same-path NoExecPaths would bind the
+# host directories over them. Private tmpfs also bounds temporary disk usage.
+PrivateTmp=no
+TemporaryFileSystem=/tmp:rw,noexec,nosuid,nodev,mode=1777,size=64M /var/tmp:rw,noexec,nosuid,nodev,mode=1777,size=64M
+TemporaryFileSystem=/dev/shm:rw,noexec,nosuid,nodev,mode=1777,size=16M
+BindReadOnlyPaths=$STATE $SITE /etc/ssl
+BindReadOnlyPaths=-/etc/resolv.conf -/etc/hosts -/etc/nsswitch.conf -/etc/passwd -/etc/group
+BindReadOnlyPaths=-/etc/gai.conf -/etc/services -/etc/protocols -/etc/localtime -/etc/ld.so.cache
+BindReadOnlyPaths=-/run/systemd/notify -/run/systemd/resolve -/run/resolvconf
+BindPaths=/var/lib/caddy-masque /var/lib/caddy-masque-config /var/log/caddy-masque /run/caddy-masque
+InaccessiblePaths=-/opt -/srv -/mnt -/media -/boot -/etc/ssl/private
+InaccessiblePaths=-$CREDENTIALS -$CLIENT_CONFIG -$STATE/domain
+NoExecPaths=/
+# Bind mounts and private tmp/shm mounts need explicit noexec entries too.
+NoExecPaths=/run $STATE $SITE
+NoExecPaths=/var/lib/caddy-masque /var/lib/caddy-masque-config /var/log/caddy-masque /run/caddy-masque
+NoExecPaths=/etc/ssl -/run/systemd/resolve -/run/resolvconf -/run/systemd/notify
+NoExecPaths=-/etc/resolv.conf -/etc/hosts -/etc/nsswitch.conf -/etc/passwd -/etc/group
+NoExecPaths=-/etc/gai.conf -/etc/services -/etc/protocols -/etc/localtime -/etc/ld.so.cache
+ExecPaths=$BINARY $ip_binary $nft_binary -/usr/lib -/usr/lib64 -/lib -/lib64
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# MDWE and noexec mounts alone do not block executable memfd payloads.
+SystemCallFilter=~memfd_create
+PrivateIPC=yes
+RemoveIPC=yes
+KeyringMode=private
+LimitCORE=0
+CPUAccounting=yes
+CPUWeight=50
+MemoryAccounting=yes
+MemoryHigh=${memory_high}M
+MemoryMax=${memory_max}M
+MemorySwapMax=0
+Environment=GOMEMLIMIT=${go_limit}MiB
+TasksAccounting=yes
+TasksMax=512
+OOMPolicy=kill
+EOF
 }
 
 stage_client_config() {
@@ -520,6 +616,9 @@ install_server() {
     install -m 0755 "$BUILD_DIR/caddy-masque" "$BINARY.masque-new"
     mv -f -- "$BINARY.masque-new" "$BINARY"
     install -d -o root -g caddy-masque -m 0750 "$STATE"
+    # PID 1 may create empty mountpoint placeholders here. The service cannot
+    # alter this source: both this directory and its parent are root-controlled.
+    install -d -o root -g root -m 0755 "$RUNTIME_VIEW"
     install -o root -g caddy-masque -m 0640 "$BUILD_DIR/cloudflare-token" "$TOKEN_FILE"
     install -o root -g caddy-masque -m 0640 "$BUILD_DIR/Caddyfile" "$CONFIG"
     install -m 0644 "$BUILD_DIR/$SERVICE" "$UNIT_DIR/$SERVICE"
@@ -528,6 +627,10 @@ install_server() {
         printf '%s\n' "$DOMAIN" >"$STATE/domain"
         chmod 0600 "$STATE/domain"
     fi
+    # Exported client files are never runtime input, including on upgrades.
+    for path in "$CREDENTIALS" "$CLIENT_CONFIG" "$STATE/domain"; do
+        if [[ -f $path ]]; then chown root:root "$path"; chmod 0600 "$path"; fi
+    done
     systemctl daemon-reload
     systemctl restart "$SERVICE"
 }
@@ -641,6 +744,9 @@ main() {
     printf 'On the Linux client: sudo masque-client --config ./masque-client.toml\n'
     printf 'Provider firewall: allow TCP 443 and UDP 443; TCP 80 is optional for HTTPS redirects.\n'
     printf 'Status: systemctl status %s\n' "$SERVICE"
+    printf 'Containment: systemctl show %s -p MemoryMax -p TasksMax -p NoExecPaths\n' "$SERVICE"
+    printf 'Private filesystem view: managed configuration/site/state and required system files; custom paths need root-maintained unit overrides.\n'
+    printf 'CAP_NET_ADMIN is still required in the host network namespace; this profile is not full host isolation.\n'
     printf 'Caddy automatically renews certificates; keep %s valid, root-owned and readable only by the service group.\n' "$TOKEN_FILE"
     printf 'Check that client LANs do not overlap the server tunnel pool in %s.\n' "$CONFIG"
     printf 'Verify a real client tunnel, DNS, TCP/UDP traffic and reconnect from another device.\n'
