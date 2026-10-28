@@ -25,9 +25,11 @@ TCP/UDP 443 must reach this server. DNS-01 does not require inbound port 80.
 Only domain and token are requested. The script selects an IPv4-only tunnel
 pool automatically; client LANs must not overlap the reported pool.
 
-This installs packages and writes /usr/local/bin/caddy, /etc/caddy,
-/etc/caddy-masque, a systemd unit, a cover page and private client credentials.
+This installs packages and writes /usr/local/bin/caddy-masque, /etc/caddy-masque,
+/var/lib/caddy-masque, /var/lib/caddy-masque-config, /var/log/caddy-masque,
+/var/www/caddy-masque, a systemd unit and private client credentials.
 The generated masque-client.toml uses Rust's Linux system mode (full VPN).
+Older installation layouts require manual migration before re-running.
 It preserves the checkout. Run --help without root for this information.
 EOF
 }
@@ -63,13 +65,13 @@ valid_token() { [[ $1 =~ ^[A-Za-z0-9_-]{35,50}$ || $1 =~ ^cf(ut|at)_[A-Za-z0-9_-
 
 init_paths() {
     SRC=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-    CONFIG=/etc/caddy/Caddyfile
-    BINARY=/usr/local/bin/caddy
+    BINARY=/usr/local/bin/caddy-masque
     STATE=/etc/caddy-masque
-    TOKEN_FILE=/etc/caddy/cloudflare-token
+    CONFIG="$STATE/Caddyfile"
+    TOKEN_FILE="$STATE/cloudflare-token"
     CREDENTIALS="$STATE/client-credentials.txt"
     CLIENT_CONFIG="$STATE/masque-client.toml"
-    SITE=/var/www/site
+    SITE=/var/www/caddy-masque
     GO_INSTALL_ROOT=/opt/caddy-masque
     BUILD_CACHE=/var/cache/caddy-masque
     UNIT_DIR=/etc/systemd/system
@@ -134,6 +136,9 @@ preflight() {
     command -v flock >/dev/null || die "install util-linux (flock) first"
     acquire_lock
     check_target_paths
+    if [[ ! -e $CONFIG && -e $STATE/domain ]]; then
+        die "saved installation state exists without $CONFIG; migrate the older Caddyfile, token and certificate state to the caddy-masque paths manually before retrying"
+    fi
     if [[ ! -c /dev/net/tun ]]; then modprobe tun 2>/dev/null || true; fi
     [[ -c /dev/net/tun ]] || die "enable TUN/TAP in your VPS provider's panel; /dev/net/tun is missing"
     [[ -w /proc/sys/net/ipv4/ip_forward ]] || die "the host must allow network sysctl changes (not a restricted container)"
@@ -324,11 +329,11 @@ build_server() {
         GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 GOTOOLCHAIN=local GOWORK=off GOENV=off \
         GOTMPDIR="$BUILD_DIR/go-tmp" \
         GOCACHE="$BUILD_CACHE/build" GOMODCACHE="$BUILD_CACHE/mod" \
-        "$go_root/bin/go" build -p 1 -mod=readonly -trimpath -ldflags '-s -w' -o "$BUILD_DIR/caddy" ./cmd/caddy); then
+        "$go_root/bin/go" build -p 1 -mod=readonly -trimpath -ldflags '-s -w' -o "$BUILD_DIR/caddy-masque" ./cmd/caddy); then
         die "build failed; the installed binary was not replaced. Check disk/memory and access to proxy.golang.org"
     fi
     cleanup_swap
-    "$BUILD_DIR/caddy" list-modules >"$BUILD_DIR/modules.txt"
+    "$BUILD_DIR/caddy-masque" list-modules >"$BUILD_DIR/modules.txt"
     local module
     for module in masque http.handlers.masque dns.providers.cloudflare; do
         grep -Fxq -- "$module" "$BUILD_DIR/modules.txt" || die "built server is missing $module; installation stopped"
@@ -358,7 +363,7 @@ stage_config() {
         say "Keeping existing users and Caddyfile"
     else
         local account hash password
-        account=$("$BUILD_DIR/caddy" masque-passwd --name "$USER_NAME")
+        account=$("$BUILD_DIR/caddy-masque" masque-passwd --name "$USER_NAME")
         hash=$(awk '/^user / {print $3}' <<<"$account")
         password=$(awk '/^password = / {gsub(/"/, "", $3); print $3}' <<<"$account")
         [[ $hash == "\$argon2id\$"* && -n $password ]] || die "account generation failed"
@@ -405,7 +410,7 @@ if placeholder not in text:
 pathlib.Path(target).write_text(text.replace(placeholder, '{file.' + staged_path + '}'))
 PYCODE
     # Provisioning does not start the TUN/network or obtain a certificate.
-    if ! "$BUILD_DIR/caddy" validate --config "$BUILD_DIR/validate.Caddyfile" --adapter caddyfile >"$BUILD_DIR/validation.log" 2>&1; then
+    if ! "$BUILD_DIR/caddy-masque" validate --config "$BUILD_DIR/validate.Caddyfile" --adapter caddyfile >"$BUILD_DIR/validation.log" 2>&1; then
         python3 - "$BUILD_DIR/validation.log" "$BUILD_DIR/cloudflare-token" <<'PYCODE'
 import pathlib, sys
 message = pathlib.Path(sys.argv[1]).read_text()
@@ -414,6 +419,21 @@ print(message.replace(token, '[REDACTED]'), file=sys.stderr)
 PYCODE
         die "Caddy configuration validation failed; the installed server was not changed"
     fi
+}
+
+stage_service() {
+    # Keep this installer's paths separate from the manual deployment template.
+    # Caddy appends /caddy to each XDG base directory.
+    sed \
+        -e "s|/usr/local/bin/caddy|$BINARY|g" \
+        -e "s|/etc/caddy/Caddyfile|$CONFIG|g" \
+        -e 's|/var/lib/caddy,|/var/lib/caddy-masque/caddy,|' \
+        -e 's|/var/lib/caddy-config\.|/var/lib/caddy-masque-config/caddy.|' \
+        -e 's|XDG_CONFIG_HOME=/var/lib/caddy-config|XDG_CONFIG_HOME=/var/lib/caddy-masque-config|' \
+        -e 's|XDG_DATA_HOME=/var/lib |XDG_DATA_HOME=/var/lib/caddy-masque |' \
+        -e 's|^StateDirectory=.*|StateDirectory=caddy-masque caddy-masque-config|' \
+        -e 's|^LogsDirectory=.*|LogsDirectory=caddy-masque|' \
+        "$SRC/deploy/caddy-masque.service" >"$BUILD_DIR/$SERVICE"
 }
 
 stage_client_config() {
@@ -483,18 +503,18 @@ install_server() {
         if [[ -e $path ]]; then cp -p -- "$path" "$BUILD_DIR/backup/$(basename -- "$path")"; fi
     done < <(transaction_paths)
     INSTALLING=1
-    install -d -m 0755 "$(dirname -- "$BINARY")" "$(dirname -- "$CONFIG")" "$SITE" "$UNIT_DIR"
+    install -d -m 0755 "$(dirname -- "$BINARY")" "$SITE" "$UNIT_DIR"
     if [[ ! -e $SITE/index.html ]]; then
         printf '<!doctype html><html lang="en"><meta charset="utf-8"><title>Welcome</title><h1>Welcome</h1><p>This site is under construction.</p></html>\n' >"$SITE/index.html"
         chmod 0644 "$SITE/index.html"
     fi
     # Rename within the destination filesystem, including while the old binary runs.
-    install -m 0755 "$BUILD_DIR/caddy" "$BINARY.masque-new"
+    install -m 0755 "$BUILD_DIR/caddy-masque" "$BINARY.masque-new"
     mv -f -- "$BINARY.masque-new" "$BINARY"
     install -d -m 0700 "$STATE"
     install -m 0600 "$BUILD_DIR/cloudflare-token" "$TOKEN_FILE"
     install -m 0600 "$BUILD_DIR/Caddyfile" "$CONFIG"
-    install -m 0644 "$SRC/deploy/caddy-masque.service" "$UNIT_DIR/$SERVICE"
+    install -m 0644 "$BUILD_DIR/$SERVICE" "$UNIT_DIR/$SERVICE"
     if (( ! HAD_CONFIG )); then
         install -m 0600 "$BUILD_DIR/client-credentials.txt" "$CREDENTIALS"
         printf '%s\n' "$DOMAIN" >"$STATE/domain"
@@ -591,6 +611,7 @@ main() {
     build_server
     stage_token
     stage_config
+    stage_service
     stage_client_config
     install_server
     verify_server
