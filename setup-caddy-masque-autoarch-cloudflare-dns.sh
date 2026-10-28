@@ -74,12 +74,48 @@ init_paths() {
     BUILD_CACHE=/var/cache/caddy-masque
     UNIT_DIR=/etc/systemd/system
     SERVICE=caddy-masque.service
+    LOCK_DIR=/run/caddy-masque-setup
     BUILD_DIR=''
+    GO_STAGE=''
     INSTALLING=''
     SWAP=''
     WAS_ACTIVE=0
-    WAS_ENABLED=0
+    WAS_ENABLE_STATE=disabled
+    ENABLE_TOUCHED=0
     HAD_CONFIG=0
+}
+
+acquire_lock() {
+    local lock="$LOCK_DIR/install.lock" owner
+    owner=$(id -u)
+    [[ ! -L $LOCK_DIR ]] || die "the installer runtime directory must not be a symlink"
+    if [[ -e $LOCK_DIR ]]; then
+        [[ -d $LOCK_DIR && $(stat -c %u -- "$LOCK_DIR") == "$owner" ]] ||
+            die "the installer runtime directory has an unexpected owner or type"
+    else
+        mkdir -m 0700 -- "$LOCK_DIR"
+    fi
+    chmod 0700 -- "$LOCK_DIR"
+    [[ ! -L $lock ]] || die "the installer lock must not be a symlink"
+    if [[ -e $lock ]]; then
+        [[ -f $lock && $(stat -c %u:%h -- "$lock") == "$owner:1" ]] ||
+            die "the installer lock has an unexpected owner, type or link count"
+    fi
+    exec 9>>"$lock"
+    flock -n 9 || die "another instance of this installer is running"
+}
+
+transaction_paths() {
+    printf '%s\n' "$BINARY" "$CONFIG" "$TOKEN_FILE" "$CLIENT_CONFIG" \
+        "$CREDENTIALS" "$STATE/domain" "$UNIT_DIR/$SERVICE"
+}
+
+check_target_paths() {
+    local path
+    while IFS= read -r path; do
+        [[ ! -L $path && ( ! -e $path || -f $path ) ]] ||
+            die "deployment files must be regular files, not symlinks: $path"
+    done < <(transaction_paths)
 }
 
 preflight() {
@@ -96,8 +132,8 @@ preflight() {
         die "keep this script at the root of the complete caddy-masque checkout"
     [[ -d /run/systemd/system ]] || die "systemd must be running as the system service manager"
     command -v flock >/dev/null || die "install util-linux (flock) first"
-    exec 9>/run/lock/caddy-masque-setup.lock
-    flock -n 9 || die "another instance of this installer is running"
+    acquire_lock
+    check_target_paths
     if [[ ! -c /dev/net/tun ]]; then modprobe tun 2>/dev/null || true; fi
     [[ -c /dev/net/tun ]] || die "enable TUN/TAP in your VPS provider's panel; /dev/net/tun is missing"
     [[ -w /proc/sys/net/ipv4/ip_forward ]] || die "the host must allow network sysctl changes (not a restricted container)"
@@ -129,7 +165,7 @@ collect_settings() {
 install_packages() {
     say "Installing build and network dependencies"
     DEBIAN_FRONTEND=noninteractive apt-get update -q </dev/null
-    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q \
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends \
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold curl ca-certificates nftables iproute2 dnsutils jq \
         python3 util-linux </dev/null
 }
@@ -142,7 +178,8 @@ check_ports() {
         fi
     done
     systemctl is-active --quiet "$SERVICE" && WAS_ACTIVE=1
-    systemctl is-enabled --quiet "$SERVICE" && WAS_ENABLED=1
+    WAS_ENABLE_STATE=$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)
+    WAS_ENABLE_STATE=${WAS_ENABLE_STATE:-disabled}
     # An existing managed server may own these ports; preserve it during build.
     if (( ! WAS_ACTIVE )); then
         for port in 80 443; do
@@ -221,7 +258,7 @@ PY
 
 cleanup_swap() {
     [[ -n $SWAP ]] || return 0
-    if swapon --show=NAME --noheadings | grep -Fxq -- "$SWAP"; then
+    if swapon --show=NAME --noheadings | grep -Fx -- "$SWAP" >/dev/null; then
         if ! swapoff "$SWAP"; then
             printf 'Temporary swap remains at %s; remove it after reboot.\n' "$SWAP" >&2
             SWAP=
@@ -252,12 +289,24 @@ build_server() {
     go_sha=$(jq -r --arg file "$go_file" 'first(.[].files[] | select(.filename == $file) | .sha256) // empty' "$releases")
     [[ $go_sha =~ ^[0-9a-f]{64}$ ]] || die "missing official Go archive checksum"
     go_root="$GO_INSTALL_ROOT/$go_version-$ARCH"
-    if [[ ! -x $go_root/bin/go ]]; then
+    if [[ ! -x $go_root/bin/go || ! -x $go_root/pkg/tool/linux_$ARCH/compile || ! -f $go_root/src/runtime/runtime2.go ||
+        ! -f $go_root/.caddy-masque-toolchain.sha256 ]] ||
+        [[ $(cat "$go_root/.caddy-masque-toolchain.sha256" 2>/dev/null) != "$go_sha" ]] ||
+        ! "$go_root/bin/go" version >"$BUILD_DIR/go-version.txt" 2>&1 ||
+        ! grep -Fq -- "$go_version linux/$ARCH" "$BUILD_DIR/go-version.txt"; then
         curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 600 \
             "https://go.dev/dl/$go_file" -o "$BUILD_DIR/go.tar.gz"
         printf '%s  %s\n' "$go_sha" "$BUILD_DIR/go.tar.gz" | sha256sum -c --quiet - || die "Go archive checksum mismatch"
-        tar -xzf "$BUILD_DIR/go.tar.gz" -C "$BUILD_DIR"
-        mv -- "$BUILD_DIR/go" "$go_root"
+        # Publish the complete toolchain using a rename on its own filesystem.
+        GO_STAGE=$(mktemp -d "$GO_INSTALL_ROOT/.toolchain-XXXXXX")
+        tar -xzf "$BUILD_DIR/go.tar.gz" -C "$GO_STAGE"
+        "$GO_STAGE/go/bin/go" version >"$BUILD_DIR/go-version.txt"
+        grep -Fq -- "$go_version linux/$ARCH" "$BUILD_DIR/go-version.txt" || die "unexpected downloaded Go version"
+        printf '%s\n' "$go_sha" >"$GO_STAGE/go/.caddy-masque-toolchain.sha256"
+        if [[ -e $go_root ]]; then mv -- "$go_root" "$GO_STAGE/previous"; fi
+        mv -- "$GO_STAGE/go" "$go_root"
+        rm -rf -- "$GO_STAGE"
+        GO_STAGE=''
     fi
     "$go_root/bin/go" version
     mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
@@ -270,8 +319,10 @@ build_server() {
         mkswap -q "$SWAP"
         swapon "$SWAP" || die "cannot enable temporary swap; add memory/swap and run again"
     fi
+    mkdir -m 0700 -- "$BUILD_DIR/go-tmp"
     if ! (cd -- "$SRC" && env -u GOFLAGS -u GOOS -u GOARCH -u GOROOT -u GOWORK \
         GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 GOTOOLCHAIN=local GOWORK=off GOENV=off \
+        GOTMPDIR="$BUILD_DIR/go-tmp" \
         GOCACHE="$BUILD_CACHE/build" GOMODCACHE="$BUILD_CACHE/mod" \
         "$go_root/bin/go" build -p 1 -mod=readonly -trimpath -ldflags '-s -w' -o "$BUILD_DIR/caddy" ./cmd/caddy); then
         die "build failed; the installed binary was not replaced. Check disk/memory and access to proxy.golang.org"
@@ -408,19 +459,17 @@ PY
 }
 
 configure_firewall() {
+    local rules
     say "Checking the host firewall"
     if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
         die "firewalld is active; configure TCP/UDP 443 and bidirectional masque0 forwarding before a manual deployment"
     fi
-    if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
-        ufw allow 80/tcp
-        ufw allow 443/tcp
-        ufw allow 443/udp
-        ufw route allow in on masque0
-        ufw route allow out on masque0
-    elif command -v iptables >/dev/null && iptables -S FORWARD | grep -Fxq -- '-P FORWARD DROP'; then
-        # Do not silently bypass an existing Docker/host isolation policy.
-        die "iptables FORWARD defaults to DROP (often Docker); configure persistent masque0 forwarding before using this installer"
+    if command -v iptables >/dev/null; then
+        rules=$(iptables -S FORWARD) || die "cannot inspect the host's forwarding policy"
+        if grep -Fxq -- '-P FORWARD DROP' <<<"$rules"; then
+            # Do not silently bypass an existing Docker/host isolation policy.
+            die "iptables FORWARD defaults to DROP; configure persistent masque0 forwarding before using this installer"
+        fi
     fi
 }
 
@@ -428,10 +477,11 @@ configure_firewall() {
 install_server() {
     local path
     say "Installing the validated server (restarting disconnects existing clients)"
+    check_target_paths
     install -d -m 0700 "$BUILD_DIR/backup"
-    for path in "$BINARY" "$CONFIG" "$TOKEN_FILE" "$CLIENT_CONFIG" "$UNIT_DIR/$SERVICE"; do
+    while IFS= read -r path; do
         if [[ -e $path ]]; then cp -p -- "$path" "$BUILD_DIR/backup/$(basename -- "$path")"; fi
-    done
+    done < <(transaction_paths)
     INSTALLING=1
     install -d -m 0755 "$(dirname -- "$BINARY")" "$(dirname -- "$CONFIG")" "$SITE" "$UNIT_DIR"
     if [[ ! -e $SITE/index.html ]]; then
@@ -451,7 +501,6 @@ install_server() {
         chmod 0600 "$STATE/domain"
     fi
     systemctl daemon-reload
-    systemctl enable "$SERVICE"
     systemctl restart "$SERVICE"
 }
 
@@ -481,8 +530,9 @@ cleanup() {
     if [[ -n $INSTALLING && $result != 0 ]]; then
         printf '\nInstallation failed; restoring the previous binary, Caddyfile and service.\n' >&2
         systemctl stop "$SERVICE" || rollback_failed=1
+        if (( ENABLE_TOUCHED )); then systemctl disable "$SERVICE" || rollback_failed=1; fi
         rm -f -- "$CLIENT_CONFIG.new" || rollback_failed=1
-        for path in "$BINARY" "$CONFIG" "$TOKEN_FILE" "$CLIENT_CONFIG" "$UNIT_DIR/$SERVICE"; do
+        while IFS= read -r path; do
             backup="$BUILD_DIR/backup/$(basename -- "$path")"
             if [[ -e $backup ]]; then
                 if ! { cp -p -- "$backup" "$path.masque-restore" && mv -f -- "$path.masque-restore" "$path"; }; then
@@ -491,14 +541,21 @@ cleanup() {
             else
                 rm -f -- "$path" || rollback_failed=1
             fi
-        done
-        if (( ! HAD_CONFIG )); then rm -f -- "$CREDENTIALS" "$STATE/domain" || rollback_failed=1; fi
+        done < <(transaction_paths)
         systemctl daemon-reload || rollback_failed=1
-        if (( ! WAS_ENABLED )); then systemctl disable "$SERVICE" || rollback_failed=1; fi
+        if (( ENABLE_TOUCHED )); then
+            case "$WAS_ENABLE_STATE" in
+                enabled) systemctl enable "$SERVICE" || rollback_failed=1 ;;
+                enabled-runtime) systemctl enable --runtime "$SERVICE" || rollback_failed=1 ;;
+                disabled | not-found | static | indirect | generated | transient | alias | linked | linked-runtime | masked | masked-runtime) ;;
+                *) rollback_failed=1 ;;
+            esac
+        fi
         if (( WAS_ACTIVE )); then systemctl start "$SERVICE" || rollback_failed=1; fi
         printf 'Packages, Caddy certificate state and any firewall changes are retained for retry.\n' >&2
     fi
     cleanup_swap
+    [[ -z $GO_STAGE ]] || rm -rf -- "$GO_STAGE"
     if (( rollback_failed )); then
         printf 'Automatic recovery was incomplete. Private backups are retained in %s/backup.\n' "$BUILD_DIR" >&2
     else
@@ -540,6 +597,8 @@ main() {
     # Publish the client file only after the server passes its startup checks.
     install -m 0600 "$BUILD_DIR/masque-client.toml" "$CLIENT_CONFIG.new"
     mv -f -- "$CLIENT_CONFIG.new" "$CLIENT_CONFIG"
+    ENABLE_TOUCHED=1
+    systemctl enable "$SERVICE"
     INSTALLING=
     say "Server installed: https://$DOMAIN/"
     [[ ! -f $CREDENTIALS ]] || sed '/^Server password hash: /d' "$CREDENTIALS"
