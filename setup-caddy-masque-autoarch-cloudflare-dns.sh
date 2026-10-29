@@ -2,7 +2,7 @@
 # Interactive native-architecture Caddy MASQUE setup with Cloudflare DNS-01.
 # Run from an authenticated, complete checkout:
 #   sudo bash setup-caddy-masque-autoarch-cloudflare-dns.sh
-# Supports Debian 12/13 and Ubuntu 22.04/24.04 on Linux amd64/arm64.
+# Supports Debian 12+ and Ubuntu 24.04+ on Linux amd64/arm64.
 # Runtime files are installed outside the checkout.
 # Caddy obtains and renews its certificate using the bundled Cloudflare module.
 # Re-running preserves this installer's Caddyfile, users and certificate lineage.
@@ -30,7 +30,7 @@ with systemctl show caddy-masque; adjust them with systemctl edit if needed.
 Caddy still reads its server keys/token and retains host CAP_NET_ADMIN, which
 can change host networking. Abstract Unix sockets also remain in the host network.
 
-Required: Debian 12/13 or Ubuntu 22.04/24.04, root, systemd, TUN and Internet.
+Required: Debian 12+ or Ubuntu 24.04+, root, systemd, TUN and Internet.
 Have a DNS-only domain at Cloudflare and a CF_API_TOKEN scoped to that zone
 with Zone:DNS:Edit and Zone:Zone:Read. The token is entered without echo and
 stored root-owned and service-group-readable (0640) for renewal; it is never
@@ -63,6 +63,20 @@ detect_arch() {
         aarch64 | arm64) printf 'arm64\n' ;;
         *) return 1 ;;
     esac
+}
+
+# Gate on minimum releases, not a frozen list that rejects newer systems.
+# dpkg compares numeric components correctly, including 24.10 and future LTS
+# releases. Keep distro identity and runtime capability checks separate.
+supported_platform() {
+    local minimum version=${2:-}
+    case ${1:-} in
+        debian) minimum=12 ;;
+        ubuntu) minimum=24.04 ;;
+        *) return 1 ;;
+    esac
+    [[ $version =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+    dpkg --compare-versions "$version" ge "$minimum"
 }
 
 valid_domain() {
@@ -150,10 +164,8 @@ preflight() {
     ARCH=$(detect_arch "$(uname -m)") || die "unsupported architecture: $(uname -m); use amd64 or arm64"
     # shellcheck disable=SC1091
     . /etc/os-release
-    case "$ID:$VERSION_ID" in
-        debian:12 | debian:13 | ubuntu:22.04 | ubuntu:24.04) ;;
-        *) die "supported systems: Debian 12/13 and Ubuntu 22.04/24.04 (found $ID $VERSION_ID)" ;;
-    esac
+    supported_platform "${ID:-}" "${VERSION_ID:-}" ||
+        die "supported systems: Debian 12+ and Ubuntu 24.04+ (found ${ID:-unknown} ${VERSION_ID:-unknown})"
     [[ -f $SRC/go.mod && -d $SRC/third_party/xnet && -d $SRC/third_party/quic-go &&
         -f $SRC/deploy/caddy-masque.service && -f $SRC/deploy/prepare-service-user.sh ]] ||
         die "keep this script at the root of the complete caddy-masque checkout"
