@@ -7,6 +7,9 @@
 # - A running same-name service and existing/partial files are takeover/repair
 #   cases. The script prepares, stops, replaces, starts and enables the service;
 #   the operator must not have to disable it before running this installer.
+# - Inspect TCP/443 and UDP/443 separately, even while this service is active.
+#   Process names alone do not prove ownership. Report every conflicting PID,
+#   executable and unit; never stop an external owner to make the port free.
 # - Missing state files and installer markers must not force manual cleanup.
 #   Replace only owned paths; never follow destination links into other data.
 # - Preserve cached certificates/account state when replacing the executable.
@@ -234,24 +237,111 @@ install_packages() {
         python3 util-linux </dev/null
 }
 
+check_port_owners() {
+    local mode=${1:-allow-managed} expected_group tcp_status=0 udp_status=0
+    expected_group=$(systemctl show -p ControlGroup --value "$SERVICE" 2>/dev/null || true)
+    # Query both protocols before deciding. -a also catches connected UDP
+    # sockets bound to 443, which a listener-only UDP query would omit.
+    ss -H -O -ltnp 'sport = :443' >"$BUILD_DIR/port-tcp" 2>"$BUILD_DIR/port-tcp-error" || tcp_status=$?
+    ss -H -O -uanp 'sport = :443' >"$BUILD_DIR/port-udp" 2>"$BUILD_DIR/port-udp-error" || udp_status=$?
+    python3 - "$SERVICE" "$expected_group" "$mode" "$BUILD_DIR" "$tcp_status" "$udp_status" <<'PY'
+import json, os, re, sys
+from pathlib import Path
+
+service, expected, mode, directory, tcp_status, udp_status = sys.argv[1:]
+directory = Path(directory)
+proc = Path('/proc')
+expected = expected.rstrip('/')
+managed_group = bool(expected and expected.startswith('/'))
+rows = []
+errors = []
+
+def quote(value):
+    # Process names and paths are not trusted terminal text. Do not print
+    # command arguments, which may contain another service's credentials.
+    return json.dumps(value, ensure_ascii=True)
+
+def owner(pid):
+    base = proc / str(pid)
+    try:
+        name = (base / 'comm').read_text(errors='replace').rstrip('\n')
+    except OSError:
+        name = '(unavailable)'
+    try:
+        executable = os.readlink(base / 'exe')
+    except OSError:
+        executable = '(unavailable)'
+    group = ''
+    try:
+        entries = [line.split(':', 2) for line in (base / 'cgroup').read_text(errors='replace').splitlines()]
+        # On v1 use the systemd hierarchy, not a separately delegated CPU or
+        # memory hierarchy that happens to have a similar directory name.
+        group = next((p for n, c, p in entries if n == '0' and not c), '')
+        if not group:
+            group = next((p for _, c, p in entries if 'name=systemd' in c.split(',')), '')
+    except (OSError, ValueError):
+        pass
+    units = [part for part in group.split('/') if part.endswith(('.service', '.scope', '.socket'))]
+    unit = units[-1] if units else '(unavailable)'
+    ours = managed_group and (group == expected or group.startswith(expected + '/'))
+    return pid, name, executable, unit, group, ours
+
+if mode not in ('allow-managed', 'require-free'):
+    raise SystemExit('Invalid port-ownership inspection mode.')
+for protocol, filename, status in [('TCP', 'tcp', tcp_status), ('UDP', 'udp', udp_status)]:
+    try:
+        output = (directory / ('port-' + filename)).read_text(errors='replace')
+        if status != '0':
+            detail = (directory / ('port-' + filename + '-error')).read_text(errors='replace').strip()
+            errors.append(protocol + '/443 inspection failed: ' + quote(detail))
+    except OSError as exc:
+        errors.append(protocol + '/443 inspection failed: ' + quote(str(exc)))
+        continue
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if fields[0] in ('tcp', 'tcp6', 'udp', 'udp6'):
+            fields = fields[1:]
+        state = fields[0] if fields else '(unknown)'
+        address = fields[3] if len(fields) >= 5 else '(unavailable)'
+        owners = [owner(pid) for pid in sorted({int(p) for p in re.findall(r'\bpid=(\d+)', line)})]
+        conflict = mode == 'require-free' or not owners or not all(item[-1] for item in owners) or len(fields) < 5
+        rows.append((protocol, state, address, owners, line, conflict))
+
+if errors or any(row[-1] for row in rows):
+    print('Port 443 ownership check failed; no external owner was stopped:', file=sys.stderr)
+    for error in errors:
+        print('  ' + error, file=sys.stderr)
+    for protocol in ('TCP', 'UDP'):
+        entries = [row for row in rows if row[0] == protocol]
+        if not entries:
+            state = 'inspection unavailable' if any(e.startswith(protocol + '/') for e in errors) else 'free'
+            print('  ' + protocol + '/443: ' + state, file=sys.stderr)
+        for _, state, address, owners, raw, conflict in entries:
+            print('  ' + protocol + '/443 state=' + quote(state) + ' local=' + quote(address), file=sys.stderr)
+            if not owners:
+                print('    PID/name/unit unavailable; ownership cannot be verified. ss=' + quote(raw), file=sys.stderr)
+            for pid, name, executable, unit, group, ours in owners:
+                print(f'    PID={pid} name={quote(name)} executable={quote(executable)} unit={quote(unit)} '
+                      + 'cgroup=' + quote(group or '(unavailable)')
+                      + (' [managed service]' if ours else ' [external or unidentified]'), file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 check_ports() {
-    local unit own_id other_id
-    own_id=$(systemctl show -p Id --value "$SERVICE" 2>/dev/null || true)
-    for unit in masque-server caddy nginx apache2; do
-        if systemctl is-active --quiet "$unit.service"; then
-            other_id=$(systemctl show -p Id --value "$unit.service" 2>/dev/null || true)
-            [[ -n $own_id && $other_id == "$own_id" ]] && continue
-            die "$unit is running; stop the conflicting service before continuing"
-        fi
-    done
     systemctl is-active --quiet "$SERVICE" && WAS_ACTIVE=1
     WAS_ENABLE_STATE=$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)
     WAS_ENABLE_STATE=${WAS_ENABLE_STATE:-disabled}
     if (( WAS_ACTIVE )) || [[ -e $BINARY || -L $BINARY || -e $UNIT_DIR/$SERVICE || -L $UNIT_DIR/$SERVICE || -d $STATE ]]; then HAD_DEPLOYMENT=1; fi
-    # An existing managed server may own these ports; preserve it during build.
+    check_port_owners allow-managed || die 'TCP/UDP 443 is not exclusively free or owned by this caddy-masque service.'
+    # Another MASQUE service can share the default tunnel name even when it
+    # listens elsewhere. Protect that actual resource conflict separately.
+    if systemctl is-active --quiet masque-server.service && ip link show masque0 >/dev/null 2>&1; then
+        die 'masque0 is in use by masque-server.service; its tunnel was not deleted.'
+    fi
     if (( ! WAS_ACTIVE )); then
-        [[ -z $(ss -ltnH 'sport = :443') ]] || die "TCP port 443 is already in use"
-        [[ -z $(ss -lunH 'sport = :443') ]] || die "UDP port 443 is already in use"
         if ip link show masque0 >/dev/null 2>&1; then
             (( HAD_DEPLOYMENT )) || die "masque0 belongs to an unknown deployment; it was not deleted"
         fi
@@ -872,7 +962,10 @@ PY
 }
 
 install_server() {
-    local path index=0 tcp_listeners udp_listeners
+    local path index=0
+    # Recheck after a potentially long build, before replacing files or
+    # stopping the old service. An external owner may have appeared meanwhile.
+    check_port_owners allow-managed || die 'Port 443 ownership changed; replacement was not started.'
     say "Taking over caddy-masque: stopping the old service and replacing managed files"
     install -d -m 0700 "$BUILD_DIR/backup"
     mkdir -p "$(dirname -- "$BINARY")" "$UNIT_DIR"
@@ -898,10 +991,7 @@ install_server() {
     replace_file "$BUILD_DIR/$SERVICE" "$UNIT_DIR/$SERVICE" 0644 root root
     systemctl daemon-reload
     systemctl stop "$SERVICE"
-    tcp_listeners=$(ss -ltnH 'sport = :443') || die 'Cannot inspect TCP 443 listeners.'
-    udp_listeners=$(ss -lunH 'sport = :443') || die 'Cannot inspect UDP 443 listeners.'
-    [[ -z $tcp_listeners && -z $udp_listeners ]] ||
-        die 'Another process still owns TCP/UDP 443; unrelated processes were not stopped.'
+    check_port_owners require-free || die 'TCP/UDP 443 is still occupied after stopping the managed service.'
     if ip link show masque0 >/dev/null 2>&1; then
         (( HAD_DEPLOYMENT )) || die 'A tunnel with unknown ownership was not deleted.'
         ip link delete masque0
@@ -944,7 +1034,10 @@ install_server() {
     replace_file "$BUILD_DIR/modules.conf" /etc/modules-load.d/caddy-masque.conf 0644 root root
     systemctl daemon-reload
     if systemctl is-failed --quiet "$SERVICE"; then systemctl reset-failed "$SERVICE"; fi
-    systemctl restart "$SERVICE"
+    if ! systemctl restart "$SERVICE"; then
+        check_port_owners require-free || true
+        die 'caddy-masque failed to start; inspect the port-owner report and service journal.'
+    fi
 }
 
 verify_server() {
@@ -1033,8 +1126,15 @@ main() {
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    install_packages
-    check_ports
+    # Reject known conflicts before package work when the inspection tools are
+    # already installed. A fresh host first obtains those required tools.
+    if command -v ss >/dev/null && command -v python3 >/dev/null; then
+        check_ports
+        install_packages
+    else
+        install_packages
+        check_ports
+    fi
     collect_pool
     configure_firewall
     build_server
