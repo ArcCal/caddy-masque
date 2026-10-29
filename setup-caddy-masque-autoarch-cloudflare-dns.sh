@@ -1,12 +1,35 @@
 #!/usr/bin/env bash
+# Past installer mistakes and rules that must not be reintroduced:
+# - Use Debian >= 12 and Ubuntu >= 24.04, not a frozen release allowlist.
+# - DNS-01 validates TXT records. Do not require A/AAAA records, query them as
+#   an installation prerequisite, or compare them with an outbound-IP service.
+#   A domain without A/AAAA is valid for DNS-01 certificate issuance.
+# - A running same-name service and existing/partial files are takeover/repair
+#   cases. The script prepares, stops, replaces, starts and enables the service;
+#   the operator must not have to disable it before running this installer.
+# - Missing state files and installer markers must not force manual cleanup.
+#   Replace only owned paths; never follow destination links into other data.
+# - Preserve cached certificates/account state when replacing the executable.
+# - Remove stale same-name masks/drop-ins and verify running + boot enablement;
+#   copying a unit or calling enable alone does not prove the new process runs.
+# - Keep a dedicated non-root identity and only required capabilities. An
+#   existing unsafe account needs repair; a writable home allows key planting.
+# - Generate 22-character mixed-class passwords and export matching credentials.
+#   This installer uses laptop; a stale macbook login is a different account.
+# - CPUAccounting= is obsolete on newer systemd; CPUWeight controls scheduling.
+# - First certificate issuance is asynchronous. Retry trusted local HTTPS;
+#   an early TLS alert is not the final result. Check locally with explicit
+#   address + domain SNI instead of depending on public A/AAAA propagation.
+# - Stage and validate before replacement, retain private rollback copies,
+#   report recovery failures and leave unrelated services/firewall data alone.
 # Interactive native-architecture Caddy MASQUE setup with Cloudflare DNS-01.
 # Run from an authenticated, complete checkout:
 #   sudo bash setup-caddy-masque-autoarch-cloudflare-dns.sh
 # Supports Debian 12+ and Ubuntu 24.04+ on Linux amd64/arm64.
 # Runtime files are installed outside the checkout.
 # Caddy obtains and renews its certificate using the bundled Cloudflare module.
-# Re-running preserves this installer's Caddyfile, users and certificate lineage.
-# Existing unrelated Caddyfiles are refused; migrate those manually.
+# Re-running replaces managed configuration and credentials, and preserves
+# Caddy's certificate storage. The script stops and replaces its own service.
 # A private Rust masque-client TOML file is exported after successful startup.
 
 usage() {
@@ -31,7 +54,7 @@ Caddy still reads its server keys/token and retains host CAP_NET_ADMIN, which
 can change host networking. Abstract Unix sockets also remain in the host network.
 
 Required: Debian 12+ or Ubuntu 24.04+, root, systemd, TUN and Internet.
-Have a DNS-only domain at Cloudflare and a CF_API_TOKEN scoped to that zone
+Have a domain at Cloudflare and a CF_API_TOKEN scoped to that zone
 with Zone:DNS:Edit and Zone:Zone:Read. The token is entered without echo and
 stored root-owned and service-group-readable (0640) for renewal; it is never
 a command argument. Client passwords remain root-only (0600).
@@ -43,7 +66,9 @@ This installs packages and writes /usr/local/bin/caddy-masque, /etc/caddy-masque
 /var/lib/caddy-masque, /var/lib/caddy-masque-config, /var/log/caddy-masque,
 /var/www/caddy-masque, a systemd unit and private client credentials.
 The generated masque-client.toml uses Rust's Linux system mode (full VPN).
-Older installation layouts require manual migration before re-running.
+Reruns replace managed files and rotate the client password. Existing Caddy
+certificate state is retained. DNS-01 validates TXT records; no A/AAAA records
+or external public-IP lookup is required by this installer.
 It preserves the checkout. Run --help without root for this information.
 EOF
 }
@@ -113,8 +138,29 @@ init_paths() {
     WAS_ACTIVE=0
     WAS_ENABLE_STATE=disabled
     ENABLE_TOUCHED=0
-    HAD_CONFIG=0
     STATE_METADATA=''
+    STATE_ENTRY_SAVED=0
+    HAD_DEPLOYMENT=0
+}
+
+managed_directory() {
+    local path=$1 mode=$2 owner=$3 group=$4
+    if [[ -L $path || ( -e $path && ! -d $path ) ]]; then rm -f -- "$path"; fi
+    install -d -o "$owner" -g "$group" -m "$mode" -- "$path"
+}
+
+# Publish by rename, never truncate a running ELF or follow an old link.
+replace_file() {
+    local source=$1 destination=$2 mode=$3 owner=$4 group=$5 temporary
+    temporary=$(mktemp "${destination}.install.XXXXXXXX")
+    install -o "$owner" -g "$group" -m "$mode" -- "$source" "$temporary"
+    if [[ -d $destination && ! -L $destination ]]; then rm -rf --one-file-system -- "$destination"; fi
+    mv -fT -- "$temporary" "$destination"
+}
+
+service_override_paths() {
+    printf '%s\n' "$UNIT_DIR/$SERVICE.d" "/run/systemd/system/$SERVICE" "/run/systemd/system/$SERVICE.d" \
+        "$UNIT_DIR/multi-user.target.wants/$SERVICE" "/run/systemd/system/multi-user.target.wants/$SERVICE"
 }
 
 acquire_lock() {
@@ -139,23 +185,8 @@ acquire_lock() {
 
 transaction_paths() {
     printf '%s\n' "$BINARY" "$CONFIG" "$TOKEN_FILE" "$CLIENT_CONFIG" \
-        "$CREDENTIALS" "$STATE/domain" "$UNIT_DIR/$SERVICE"
-}
-
-check_target_paths() {
-    local path
-    [[ ! -L $STATE && ( ! -e $STATE || -d $STATE ) ]] ||
-        die "the configuration directory must be a directory, not a symlink: $STATE"
-    [[ ! -L $RUNTIME_VIEW && ( ! -e $RUNTIME_VIEW || -d $RUNTIME_VIEW ) ]] ||
-        die "the private runtime view must be a directory, not a symlink: $RUNTIME_VIEW"
-    if [[ -d $RUNTIME_VIEW ]]; then
-        [[ $(stat -c '%u:%g:%a' -- "$RUNTIME_VIEW") == 0:0:755 ]] ||
-            die "the private runtime view must remain root-owned and mode 0755: $RUNTIME_VIEW"
-    fi
-    while IFS= read -r path; do
-        [[ ! -L $path && ( ! -e $path || -f $path ) ]] ||
-            die "deployment files must be regular files, not symlinks: $path"
-    done < <(transaction_paths)
+        "$CREDENTIALS" "$STATE/domain" "$UNIT_DIR/$SERVICE" "$SITE"
+    printf '%s\n' /etc/modules-load.d/caddy-masque.conf
 }
 
 preflight() {
@@ -167,31 +198,23 @@ preflight() {
     supported_platform "${ID:-}" "${VERSION_ID:-}" ||
         die "supported systems: Debian 12+ and Ubuntu 24.04+ (found ${ID:-unknown} ${VERSION_ID:-unknown})"
     [[ -f $SRC/go.mod && -d $SRC/third_party/xnet && -d $SRC/third_party/quic-go &&
-        -f $SRC/deploy/caddy-masque.service && -f $SRC/deploy/prepare-service-user.sh ]] ||
+        -f $SRC/deploy/caddy-masque.service ]] ||
         die "keep this script at the root of the complete caddy-masque checkout"
     [[ -d /run/systemd/system ]] || die "systemd must be running as the system service manager"
     command -v flock >/dev/null || die "install util-linux (flock) first"
     acquire_lock
-    check_target_paths
-    if [[ ! -e $CONFIG && -e $STATE/domain ]]; then
-        die "saved installation state exists without $CONFIG; migrate the older Caddyfile, token and certificate state to the caddy-masque paths manually before retrying"
-    fi
     if [[ ! -c /dev/net/tun ]]; then modprobe tun 2>/dev/null || true; fi
     [[ -c /dev/net/tun ]] || die "enable TUN/TAP in your VPS provider's panel; /dev/net/tun is missing"
     [[ -w /proc/sys/net/ipv4/ip_forward ]] || die "the host must allow network sysctl changes (not a restricted container)"
-    if [[ -e $CONFIG ]]; then
-        HAD_CONFIG=1
-        [[ -f $STATE/domain && -f $CONFIG ]] &&
-            [[ $(head -n 1 "$CONFIG") == '# Managed by setup-caddy-masque-autoarch-cloudflare-dns.sh' ]] ||
-            die "an unrelated $CONFIG exists; back it up and migrate it manually before using this installer"
-    fi
 }
 
 collect_settings() {
     local value saved_domain=
-    if (( HAD_CONFIG )); then
+    # Saved state is only a prompt default. Missing metadata, an old marker or
+    # a new domain must not prevent authoritative replacement of this service.
+    if [[ -d $STATE && ! -L $STATE && -f $STATE/domain && ! -L $STATE/domain ]]; then
         saved_domain=$(cat "$STATE/domain")
-        valid_domain "$saved_domain" || die "invalid saved domain in $STATE/domain"
+        valid_domain "$saved_domain" || saved_domain=''
     fi
     while :; do
         ask value "Server domain${saved_domain:+ [$saved_domain]}: "
@@ -200,7 +223,6 @@ collect_settings() {
         valid_domain "$DOMAIN" && break
         printf 'Enter one DNS hostname, without a URL, port or wildcard.\n' >&2
     done
-    [[ -z $saved_domain || $DOMAIN == "$saved_domain" ]] || die "this installation uses $saved_domain; domain migration requires a manual configuration change"
     USER_NAME=laptop
 }
 
@@ -213,31 +235,33 @@ install_packages() {
 }
 
 check_ports() {
-    local unit port
+    local unit own_id other_id
+    own_id=$(systemctl show -p Id --value "$SERVICE" 2>/dev/null || true)
     for unit in masque-server caddy nginx apache2; do
         if systemctl is-active --quiet "$unit.service"; then
+            other_id=$(systemctl show -p Id --value "$unit.service" 2>/dev/null || true)
+            [[ -n $own_id && $other_id == "$own_id" ]] && continue
             die "$unit is running; stop the conflicting service before continuing"
         fi
     done
     systemctl is-active --quiet "$SERVICE" && WAS_ACTIVE=1
     WAS_ENABLE_STATE=$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)
     WAS_ENABLE_STATE=${WAS_ENABLE_STATE:-disabled}
+    if (( WAS_ACTIVE )) || [[ -e $BINARY || -L $BINARY || -e $UNIT_DIR/$SERVICE || -L $UNIT_DIR/$SERVICE || -d $STATE ]]; then HAD_DEPLOYMENT=1; fi
     # An existing managed server may own these ports; preserve it during build.
     if (( ! WAS_ACTIVE )); then
-        for port in 80 443; do
-            [[ -z $(ss -ltnH "sport = :$port") ]] || die "TCP port $port is already in use"
-        done
+        [[ -z $(ss -ltnH 'sport = :443') ]] || die "TCP port 443 is already in use"
         [[ -z $(ss -lunH 'sport = :443') ]] || die "UDP port 443 is already in use"
-        ! ip link show masque0 >/dev/null 2>&1 || die "masque0 already exists; resolve the existing tunnel before installing"
-    elif (( ! HAD_CONFIG )); then
-        die "an unmanaged caddy-masque service is already running"
+        if ip link show masque0 >/dev/null 2>&1; then
+            (( HAD_DEPLOYMENT )) || die "masque0 belongs to an unknown deployment; it was not deleted"
+        fi
     fi
     return 0
 }
 
 check_pool() {
     ip -j -4 route show table all >"$BUILD_DIR/routes.json"
-    python3 - "$1" "$BUILD_DIR/routes.json" <<'PY'
+    python3 - "$1" "$BUILD_DIR/routes.json" "$HAD_DEPLOYMENT" <<'PY'
 import ipaddress, json, sys
 try:
     pool = ipaddress.ip_interface(sys.argv[1])
@@ -247,6 +271,8 @@ try:
     if pool.ip in (pool.network.network_address, pool.network.broadcast_address):
         raise ValueError('the server address must be a usable host address')
     for route in json.load(open(sys.argv[2])):
+        if sys.argv[3] == '1' and route.get('dev') == 'masque0':
+            continue
         dst = route.get('dst', 'default')
         if dst == 'default':
             continue
@@ -260,7 +286,6 @@ PY
 }
 
 collect_pool() {
-    (( ! HAD_CONFIG )) || return 0
     # Prefer the documented pool, then try alternatives if the host uses it.
     # Remote client LANs cannot be discovered here; report the selected pool.
     local candidate
@@ -272,30 +297,6 @@ collect_pool() {
         fi
     done
     die "all default tunnel pools overlap host routes; use the documented manual deployment with a suitable pool"
-}
-
-check_dns() {
-    local resolved answer
-    say "Checking public DNS (use Cloudflare DNS-only, the grey cloud)"
-    PUBLIC_IP=$(curl -4 -fsS --retry 2 --connect-timeout 10 --max-time 20 https://api.ipify.org) ||
-        die "cannot check upstream IPv4 connectivity"
-    resolved=$(dig +short A "$DOMAIN" @1.1.1.1)
-    grep -Fxq -- "$PUBLIC_IP" <<<"$resolved" || die "$DOMAIN must have a DNS-only A record pointing to $PUBLIC_IP"
-    # Every advertised address must reach this host. A stray AAAA breaks clients.
-    while IFS= read -r answer; do
-        [[ $answer =~ ^[0-9.]+$ ]] || continue
-        [[ $answer == "$PUBLIC_IP" ]] || die "$DOMAIN also advertises another IPv4 address ($answer); correct its DNS first"
-    done <<<"$resolved"
-    resolved=$(dig +short AAAA "$DOMAIN" @1.1.1.1)
-    if [[ $resolved == *:* ]]; then
-        PUBLIC_IPV6=$(curl -6 -fsS --connect-timeout 10 --max-time 20 https://api6.ipify.org) ||
-            die "$DOMAIN has an AAAA record but this server cannot reach the IPv6 Internet; correct or remove that record"
-        python3 - "$resolved" "$PUBLIC_IPV6" <<'PY' || die "the AAAA records must point to this server's working public IPv6 address"
-import ipaddress, sys
-expected = ipaddress.ip_address(sys.argv[2])
-assert all(ipaddress.ip_address(v) == expected for v in sys.argv[1].splitlines() if ':' in v)
-PY
-    fi
 }
 
 cleanup_swap() {
@@ -380,14 +381,14 @@ build_server() {
 stage_token() {
     local token
     say "Configuring Caddy Cloudflare DNS-01 issuance and renewal"
-    if [[ -f $TOKEN_FILE ]]; then
+    if [[ -d $STATE && ! -L $STATE && -f $TOKEN_FILE && ! -L $TOKEN_FILE ]]; then
         printf 'CF_API_TOKEN (hidden; Enter keeps the saved token): ' >&2
     else
         printf 'CF_API_TOKEN (hidden; zone-scoped DNS Edit + Zone Read): ' >&2
     fi
     IFS= read -r -s token || die "no Cloudflare token supplied"
     printf '\n' >&2
-    if [[ -z $token && -f $TOKEN_FILE ]]; then token=$(cat "$TOKEN_FILE"); fi
+    if [[ -z $token && -d $STATE && ! -L $STATE && -f $TOKEN_FILE && ! -L $TOKEN_FILE ]]; then token=$(cat "$TOKEN_FILE"); fi
     valid_token "$token" || die "invalid Cloudflare API token format; use a token, not a global API key"
     printf '%s\n' "$token" >"$BUILD_DIR/cloudflare-token"
     chmod 0600 "$BUILD_DIR/cloudflare-token"
@@ -395,11 +396,9 @@ stage_token() {
 }
 
 stage_config() {
-    if (( HAD_CONFIG )); then
-        cp -- "$CONFIG" "$BUILD_DIR/Caddyfile"
-        say "Keeping existing users and Caddyfile"
-    else
-        local account hash password
+    # This installer is authoritative for its managed configuration. Regenerate
+    # the account/export together, even when prior metadata is incomplete.
+    local account hash password
         account=$("$BUILD_DIR/caddy-masque" masque-passwd --name "$USER_NAME")
         hash=$(awk '/^user / {print $3}' <<<"$account")
         password=$(awk '/^password = / {gsub(/"/, "", $3); print $3}' <<<"$account")
@@ -408,6 +407,8 @@ stage_config() {
 # Managed by setup-caddy-masque-autoarch-cloudflare-dns.sh
 # Caddy owns certificate issuance and renewal using Cloudflare DNS-01.
 {
+    # DNS-01 needs no HTTP listener; avoid taking over an unrelated port 80.
+    auto_https disable_redirects
     masque {
         ipv4 $IPV4
         user $USER_NAME $hash
@@ -426,15 +427,13 @@ $DOMAIN, :443 {
 EOF
         cat >"$BUILD_DIR/client-credentials.txt" <<EOF
 Server domain: $DOMAIN
-Server IPv4: $PUBLIC_IP
 User name: $USER_NAME
 Password: $password
 Server password hash: $hash
 URI template: https://$DOMAIN/.well-known/masque/ip/{target}/{ipproto}/
 Transport: auto (h3, h2 or http/1.1); IPv6 in tunnel: disabled
 EOF
-        unset account hash password
-    fi
+    unset account hash password
     # Validate with the staged token, leaving the live token/config untouched.
     # Caddy's file placeholder resolves to the API token when config is loaded.
     python3 - "$BUILD_DIR/Caddyfile" "$BUILD_DIR/validate.Caddyfile" "$TOKEN_FILE" "$BUILD_DIR/cloudflare-token" <<'PYCODE'
@@ -551,8 +550,7 @@ EOF
 }
 
 stage_client_config() {
-    local record="$CREDENTIALS"
-    if (( ! HAD_CONFIG )); then record="$BUILD_DIR/client-credentials.txt"; fi
+    local record="$BUILD_DIR/client-credentials.txt"
     [[ -f $record ]] || die "saved client credentials are missing; cannot reconstruct the client password"
     python3 - "$record" "$BUILD_DIR/Caddyfile" "$BUILD_DIR/masque-client.toml" "$DOMAIN" <<'PY'
 import json, pathlib, re, sys
@@ -608,42 +606,344 @@ configure_firewall() {
 }
 
 
+# Repair only the named local identity, under shadow-utils locking. Reuse safe
+# numeric IDs; never recursively chown an arbitrary previous home directory.
+provision_service_user() {
+    python3 - <<'PY'
+import contextlib
+import ctypes
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import tempfile
+import time
+
+NAME = 'caddy-masque'
+SERVICE_HOME = '/etc/caddy-masque/.home'
+SERVICE_SHELL = '/usr/sbin/nologin'
+ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'}
+DATABASES = ('passwd', 'group', 'shadow', 'gshadow')
+
+
+def rows(text):
+    return [line.split(':') for line in text.splitlines() if line and not line.startswith('#')]
+
+
+def number(value):
+    return int(value) if value.isascii() and value.isdecimal() else None
+
+
+def getent(database, key=None):
+    args = ['/usr/bin/getent', database]
+    if key is not None:
+        args.append(str(key))
+    result = subprocess.run(args, env=ENV, capture_output=True, text=True)
+    if result.returncode not in (0, 2):
+        raise RuntimeError('Cannot safely query NSS ' + database + '.')
+    return result.stdout
+
+
+def replace_named(text, replacement):
+    """Replace all duplicate own-name records, preserving every other raw line."""
+    output = []
+    inserted = False
+    for line in text.splitlines(keepends=True):
+        if line.rstrip('\r\n').split(':', 1)[0] == NAME:
+            if not inserted:
+                output.append(replacement + '\n')
+                inserted = True
+        else:
+            output.append(line)
+    if not inserted:
+        if output and not output[-1].endswith('\n'):
+            output[-1] += '\n'
+        output.append(replacement + '\n')
+    return ''.join(output)
+
+
+def strip_memberships(text, gshadow=False):
+    """Remove this one account from supplementary/admin lists, never other names."""
+    output = []
+    for line in text.splitlines(keepends=True):
+        raw = line.rstrip('\r\n')
+        fields = raw.split(':')
+        if fields[0] == NAME or raw.startswith('#') or len(fields) != 4:
+            output.append(line)
+            continue
+        old = fields.copy()
+        for index in ((2, 3) if gshadow else (3,)):
+            fields[index] = ','.join(member for member in fields[index].split(',') if member != NAME)
+        output.append((':'.join(fields) + ('\n' if line.endswith('\n') else '')) if fields != old else line)
+    return ''.join(output)
+
+
+def plan(databases, nss_passwd, nss_group, query):
+    """No filesystem or ownership changes: compute only this identity's repair."""
+    local_users = rows(databases['passwd'])
+    local_groups = rows(databases['group'])
+    users = local_users + rows(nss_passwd)
+    groups = local_groups + rows(nss_group)
+    own_users = [r for r in local_users if r[0] == NAME and len(r) == 7]
+    own_groups = [r for r in local_groups if r[0] == NAME and len(r) == 4]
+    current = own_users[0] if own_users else None
+
+    def unique_uid(uid):
+        return uid is not None and 0 < uid < 4294967295 and not any(
+            len(r) == 7 and r[0] != NAME and number(r[2]) == uid for r in users) and not any(
+            len(r) == 7 and r[0] != NAME for r in rows(query('passwd', uid)))
+
+    def unique_gid(gid):
+        return gid is not None and 0 < gid < 4294967295 and not any(
+            len(r) == 4 and r[0] != NAME and number(r[2]) == gid for r in groups) and not any(
+            len(r) == 7 and r[0] != NAME and number(r[3]) == gid for r in users) and not any(
+            len(r) == 4 and r[0] != NAME for r in rows(query('group', gid)))
+
+    def unused(database, extra):
+        # NSS enumeration can omit directory-service records. Query every
+        # candidate numerically too, instead of assuming enumeration is complete.
+        occupied = {number(r[2]) for r in (users if database == 'passwd' else groups) if len(r) >= 3}
+        for candidate in list(range(999, 99, -1)) + list(range(60000, 999, -1)):
+            if candidate not in occupied and candidate not in extra and not query(database, candidate):
+                return candidate
+        raise RuntimeError('No unused system ' + ('UID' if database == 'passwd' else 'GID') + ' is available.')
+
+    old_uid = number(current[2]) if current else None
+    uid = old_uid if unique_uid(old_uid) else unused('passwd', set())
+    old_gids = [number(own_groups[0][2])] if own_groups else []
+    if current:
+        old_gids.append(number(current[3]))
+    gid = next((candidate for candidate in old_gids if unique_gid(candidate)), None)
+    if gid is None:
+        # A GID used only as another account's primary GID is occupied even
+        # if the corresponding /etc/group entry is missing.
+        primary = {number(r[3]) for r in users if len(r) == 7 and r[0] != NAME}
+        gid = unused('group', primary)
+    shell = current[6] if current and current[6] in (SERVICE_SHELL, '/sbin/nologin', '/bin/false') else SERVICE_SHELL
+    gecos = current[4] if current else 'MASQUE VPN service'
+    output = dict(databases)
+    output['passwd'] = replace_named(databases['passwd'], f'{NAME}:x:{uid}:{gid}:{gecos}:{SERVICE_HOME}:{shell}')
+    output['group'] = replace_named(strip_memberships(databases['group']), f'{NAME}:x:{gid}:')
+    # This is an operating-system service account, not the VPN client's
+    # Argon2 account: disable login passwords entirely, including old hashes.
+    output['shadow'] = replace_named(databases['shadow'], f'{NAME}:!:{int(time.time()) // 86400}::::::')
+    output['gshadow'] = replace_named(strip_memberships(databases['gshadow'], True), f'{NAME}:!::')
+    return output, uid, gid
+
+
+@contextlib.contextmanager
+def account_lock():
+    # glibc lckpwdf is also used by Debian/Ubuntu shadow-utils. In
+    # particular it serializes with useradd/usermod's commonio locks.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.lckpwdf() != 0:
+        raise OSError(ctypes.get_errno(), 'Cannot lock the account databases')
+    try:
+        yield
+    finally:
+        libc.ulckpwdf()
+
+
+def read_databases(etc):
+    data, metadata, attributes = {}, {}, {}
+    for name in DATABASES:
+        path = etc / name
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            if name not in ('shadow', 'gshadow'):
+                raise RuntimeError('The local ' + name + ' database is missing.')
+            data[name], metadata[name], attributes[name] = '', None, {}
+            continue
+        with os.fdopen(descriptor, 'rb') as stream:
+            meta = os.fstat(stream.fileno())
+            if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1:
+                raise RuntimeError('The local ' + name + ' database must be a single-link regular file.')
+            if meta.st_uid != 0 or meta.st_mode & 0o022:
+                raise RuntimeError('The local ' + name + ' database must be root-owned and not writable by others.')
+            data[name] = stream.read().decode('utf-8', 'surrogateescape')
+            metadata[name] = meta
+            attributes[name] = {key: os.getxattr(stream.fileno(), key) for key in os.listxattr(stream.fileno())}
+    return data, metadata, attributes
+
+
+def write_private(path, text, meta, attributes):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(descriptor, 'wb', closefd=False) as stream:
+            stream.write(text.encode('utf-8', 'surrogateescape'))
+            stream.flush()
+            os.fchown(descriptor, meta.st_uid if meta else 0, meta.st_gid if meta else 0)
+            os.fchmod(descriptor, stat.S_IMODE(meta.st_mode) if meta else 0o600)
+            for key, value in attributes.items():
+                os.setxattr(descriptor, key, value)
+            os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextlib.contextmanager
+def publish(etc, original, replacement, metadata, attributes, replace=os.replace):
+    """Atomic per-file publication, private backups and ordinary-error rollback."""
+    private = Path(tempfile.mkdtemp(prefix='.masque-account-', dir=etc))
+    changed = [name for name in ('group', 'gshadow', 'shadow', 'passwd') if replacement[name] != original[name]]
+    published = []
+    rollback_failed = False
+    try:
+        for name in changed:
+            if metadata[name] is not None:
+                write_private(private / (name + '.old'), original[name], metadata[name], attributes[name])
+            write_private(private / (name + '.new'), replacement[name], metadata[name], attributes[name])
+        # Do not overwrite a non-cooperating writer that changed a database
+        # after it was read, even though the normal shadow lock is held.
+        for name in changed:
+            actual = (etc / name).lstat() if (etc / name).exists() else None
+            before = metadata[name]
+            if before is None:
+                if actual is not None:
+                    raise RuntimeError('The account database changed during preparation.')
+            elif actual is None or (actual.st_dev, actual.st_ino, actual.st_size, actual.st_mtime_ns) != (
+                    before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
+                raise RuntimeError('The account database changed during preparation.')
+        for name in changed:
+            replace(private / (name + '.new'), etc / name)
+            published.append(name)
+        descriptor = os.open(etc, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        yield
+    except BaseException:
+        for name in reversed(published):
+            try:
+                if metadata[name] is None:
+                    (etc / name).unlink()
+                else:
+                    os.replace(private / (name + '.old'), etc / name)
+            except OSError:
+                rollback_failed = True
+        if rollback_failed:
+            raise RuntimeError('Account rollback was incomplete; private recovery files remain at ' + str(private))
+        raise
+    finally:
+        if not rollback_failed:
+            shutil.rmtree(private)
+
+
+def flush_nss_cache():
+    # These invalidate caches, not identities or access configuration.
+    if Path('/usr/sbin/nscd').exists():
+        for database in ('passwd', 'group'):
+            subprocess.run(['/usr/sbin/nscd', '-i', database], env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if Path('/usr/sbin/sss_cache').exists():
+        subprocess.run(['/usr/sbin/sss_cache', '-u', NAME, '-g', NAME], env=ENV,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit('Service account preparation requires root.')
+    etc = Path('/etc')
+    with account_lock():
+        original, metadata, attributes = read_databases(etc)
+        nss_passwd, nss_group = getent('passwd'), getent('group')
+        replacement, uid, gid = plan(original, nss_passwd, nss_group, getent)
+        try:
+            with publish(etc, original, replacement, metadata, attributes):
+                flush_nss_cache()
+                if getent('passwd', NAME).strip() != next(r for r in replacement['passwd'].splitlines() if r.startswith(NAME + ':')):
+                    raise RuntimeError('External NSS overrides the local service account; its configuration cannot be safely rewritten here.')
+                if getent('group', NAME).strip() != f'{NAME}:x:{gid}:':
+                    raise RuntimeError('External NSS overrides the local service group; its configuration cannot be safely rewritten here.')
+                groups = subprocess.run(['/usr/bin/id', '-G', NAME], env=ENV, text=True, capture_output=True, check=True).stdout.split()
+                if groups != [str(gid)]:
+                    raise RuntimeError('An external NSS provider still grants supplementary groups to the service account.')
+        except BaseException:
+            flush_nss_cache()
+            raise
+    print(f'{uid} {gid}')
+
+
+if __name__ == '__main__':
+    main()
+PY
+}
+
 install_server() {
-    local path
-    say "Installing the validated server (restarting disconnects existing clients)"
-    check_target_paths
+    local path index=0 tcp_listeners udp_listeners
+    say "Taking over caddy-masque: stopping the old service and replacing managed files"
     install -d -m 0700 "$BUILD_DIR/backup"
+    mkdir -p "$(dirname -- "$BINARY")" "$UNIT_DIR"
+    # Preserve entries as entries, including dangling links or directories at
+    # file names. Do not follow a bad configuration-container symlink at all.
+    if [[ -L $STATE || ( -e $STATE && ! -d $STATE ) ]]; then
+        cp -a -- "$STATE" "$BUILD_DIR/backup/state-entry"
+        STATE_ENTRY_SAVED=1
+    elif [[ -d $STATE ]]; then
+        STATE_METADATA=$(stat -c '%u:%g:%a' -- "$STATE")
+    fi
     while IFS= read -r path; do
-        if [[ -e $path ]]; then cp -p -- "$path" "$BUILD_DIR/backup/$(basename -- "$path")"; fi
-    done < <(transaction_paths)
-    if [[ -d $STATE ]]; then STATE_METADATA=$(stat -c '%u:%g:%a' -- "$STATE"); fi
-    bash "$SRC/deploy/prepare-service-user.sh"
+        index=$((index + 1))
+        printf '%s\n' "$path" >"$BUILD_DIR/backup/entry-$index.path"
+        if (( STATE_ENTRY_SAVED )) && [[ $path == "$STATE/"* ]]; then continue; fi
+        if [[ -e $path || -L $path ]]; then cp -a -- "$path" "$BUILD_DIR/backup/entry-$index"; fi
+    done < <(transaction_paths; service_override_paths)
+
     INSTALLING=1
-    install -d -m 0755 "$(dirname -- "$BINARY")" "$SITE" "$UNIT_DIR"
-    if [[ ! -e $SITE/index.html ]]; then
-        printf '<!doctype html><html lang="en"><meta charset="utf-8"><title>Welcome</title><h1>Welcome</h1><p>This site is under construction.</p></html>\n' >"$SITE/index.html"
-        chmod 0644 "$SITE/index.html"
-    fi
-    # Rename within the destination filesystem, including while the old binary runs.
-    install -m 0755 "$BUILD_DIR/caddy-masque" "$BINARY.masque-new"
-    mv -f -- "$BINARY.masque-new" "$BINARY"
-    install -d -o root -g caddy-masque -m 0750 "$STATE"
-    # PID 1 may create empty mountpoint placeholders here. The service cannot
-    # alter this source: both this directory and its parent are root-controlled.
-    install -d -o root -g root -m 0755 "$RUNTIME_VIEW"
-    install -o root -g caddy-masque -m 0640 "$BUILD_DIR/cloudflare-token" "$TOKEN_FILE"
-    install -o root -g caddy-masque -m 0640 "$BUILD_DIR/Caddyfile" "$CONFIG"
-    install -m 0644 "$BUILD_DIR/$SERVICE" "$UNIT_DIR/$SERVICE"
-    if (( ! HAD_CONFIG )); then
-        install -m 0600 "$BUILD_DIR/client-credentials.txt" "$CREDENTIALS"
-        printf '%s\n' "$DOMAIN" >"$STATE/domain"
-        chmod 0600 "$STATE/domain"
-    fi
-    # Exported client files are never runtime input, including on upgrades.
-    for path in "$CREDENTIALS" "$CLIENT_CONFIG" "$STATE/domain"; do
-        if [[ -f $path ]]; then chown root:root "$path"; chmod 0600 "$path"; fi
-    done
+    # The canonical unit replaces a local mask/malformed unit before PID 1 is
+    # asked to stop it. Clear this service's overrides and enable links only.
+    while IFS= read -r path; do rm -rf --one-file-system -- "$path"; done < <(service_override_paths)
+    replace_file "$BUILD_DIR/$SERVICE" "$UNIT_DIR/$SERVICE" 0644 root root
     systemctl daemon-reload
+    systemctl stop "$SERVICE"
+    tcp_listeners=$(ss -ltnH 'sport = :443') || die 'Cannot inspect TCP 443 listeners.'
+    udp_listeners=$(ss -lunH 'sport = :443') || die 'Cannot inspect UDP 443 listeners.'
+    [[ -z $tcp_listeners && -z $udp_listeners ]] ||
+        die 'Another process still owns TCP/UDP 443; unrelated processes were not stopped.'
+    if ip link show masque0 >/dev/null 2>&1; then
+        (( HAD_DEPLOYMENT )) || die 'A tunnel with unknown ownership was not deleted.'
+        ip link delete masque0
+    fi
+    if nft list table inet caddy-masque >/dev/null 2>&1; then
+        (( HAD_DEPLOYMENT )) || die 'A firewall table with unknown ownership was not deleted.'
+        nft delete table inet caddy-masque
+    fi
+    provision_service_user
+    managed_directory "$STATE" 0750 root caddy-masque
+    # Both are installer-owned empty sources; remove stale content and planted
+    # keys. The non-root daemon cannot rewrite its own home or /run view.
+    rm -rf --one-file-system -- "$RUNTIME_VIEW" "$STATE/.home"
+    managed_directory "$RUNTIME_VIEW" 0755 root root
+    managed_directory "$STATE/.home" 0555 root root
+    # Force PID 1 to detect a top-level ownership change and recursively repair
+    # mixed old UID/root state. Preserve certificate/account/storage CONTENTS.
+    for path in /var/lib/caddy-masque /var/lib/caddy-masque-config /var/log/caddy-masque; do
+        managed_directory "$path" 0700 root root
+    done
+    managed_directory /run/caddy-masque 0700 root root
+    # The cover tree is owned by this installer too. Stale symlinks must not
+    # turn a public file server into a way to read the token or private keys.
+    rm -rf --one-file-system -- "$SITE"
+    managed_directory "$SITE" 0755 root root
+    printf '<!doctype html><html lang="en"><meta charset="utf-8"><title>Welcome</title><h1>Welcome</h1></html>\n' >"$BUILD_DIR/index.html"
+    replace_file "$BUILD_DIR/index.html" "$SITE/index.html" 0644 root root
+    # Persist plaintext before its new hash. A later failure either restores
+    # both or retains private rollback copies for an explicit recovery report.
+    replace_file "$BUILD_DIR/client-credentials.txt" "$CREDENTIALS" 0600 root root
+    printf '%s\n' "$DOMAIN" >"$BUILD_DIR/domain"
+    replace_file "$BUILD_DIR/domain" "$STATE/domain" 0600 root root
+    replace_file "$BUILD_DIR/cloudflare-token" "$TOKEN_FILE" 0640 root caddy-masque
+    replace_file "$BUILD_DIR/Caddyfile" "$CONFIG" 0640 root caddy-masque
+    replace_file "$BUILD_DIR/caddy-masque" "$BINARY" 0755 root root
+    # Drop an old plaintext export until the validated replacement is published.
+    rm -rf --one-file-system -- "$CLIENT_CONFIG"
+    mkdir -p /etc/modules-load.d
+    printf 'tun\n' >"$BUILD_DIR/modules.conf"
+    replace_file "$BUILD_DIR/modules.conf" /etc/modules-load.d/caddy-masque.conf 0644 root root
+    systemctl daemon-reload
+    if systemctl is-failed --quiet "$SERVICE"; then systemctl reset-failed "$SERVICE"; fi
     systemctl restart "$SERVICE"
 }
 
@@ -667,25 +967,27 @@ verify_server() {
 }
 
 cleanup() {
-    local result=$? path backup state_uid state_gid state_mode rollback_failed=0
+    local result=$? path backup index=0 state_uid state_gid state_mode rollback_failed=0
     trap - EXIT
     set +e
     if [[ -n $INSTALLING && $result != 0 ]]; then
-        printf '\nInstallation failed; restoring the previous binary, Caddyfile and service.\n' >&2
+        printf '\nInstallation failed; restoring the previous managed files and service.\n' >&2
         systemctl stop "$SERVICE" || rollback_failed=1
         if (( ENABLE_TOUCHED )); then systemctl disable "$SERVICE" || rollback_failed=1; fi
-        rm -f -- "$CLIENT_CONFIG.new" || rollback_failed=1
+        if (( ! STATE_ENTRY_SAVED )); then rm -f -- "$CLIENT_CONFIG.new" || rollback_failed=1; fi
         while IFS= read -r path; do
-            backup="$BUILD_DIR/backup/$(basename -- "$path")"
-            if [[ -e $backup ]]; then
-                if ! { cp -p -- "$backup" "$path.masque-restore" && mv -f -- "$path.masque-restore" "$path"; }; then
-                    rollback_failed=1
-                fi
-            else
-                rm -f -- "$path" || rollback_failed=1
+            index=$((index + 1))
+            if (( STATE_ENTRY_SAVED )) && [[ $path == "$STATE/"* ]]; then continue; fi
+            backup="$BUILD_DIR/backup/entry-$index"
+            rm -rf --one-file-system -- "$path" || rollback_failed=1
+            if [[ -e $backup || -L $backup ]]; then
+                cp -a -- "$backup" "$path" || rollback_failed=1
             fi
-        done < <(transaction_paths)
-        if [[ -n $STATE_METADATA ]]; then
+        done < <(transaction_paths; service_override_paths)
+        if (( STATE_ENTRY_SAVED )); then
+            rm -rf --one-file-system -- "$STATE" || rollback_failed=1
+            cp -a -- "$BUILD_DIR/backup/state-entry" "$STATE" || rollback_failed=1
+        elif [[ -n $STATE_METADATA ]]; then
             IFS=: read -r state_uid state_gid state_mode <<<"$STATE_METADATA"
             chown "$state_uid:$state_gid" "$STATE" || rollback_failed=1
             chmod "$state_mode" "$STATE" || rollback_failed=1
@@ -700,12 +1002,12 @@ cleanup() {
             esac
         fi
         if (( WAS_ACTIVE )); then systemctl start "$SERVICE" || rollback_failed=1; fi
-        printf 'Packages, Caddy certificate state and any firewall changes are retained for retry.\n' >&2
+        printf 'Packages and Caddy certificate state are retained for retry.\n' >&2
     fi
     cleanup_swap
     [[ -z $GO_STAGE ]] || rm -rf -- "$GO_STAGE"
     if (( rollback_failed )); then
-        printf 'Automatic recovery was incomplete. Private backups are retained in %s/backup.\n' "$BUILD_DIR" >&2
+        printf 'Automatic recovery was incomplete. Private backups remain in %s/backup.\n' "$BUILD_DIR" >&2
     else
         [[ -z $BUILD_DIR ]] || rm -rf -- "$BUILD_DIR"
     fi
@@ -734,7 +1036,6 @@ main() {
     install_packages
     check_ports
     collect_pool
-    check_dns
     configure_firewall
     build_server
     stage_token
@@ -747,7 +1048,9 @@ main() {
     install -m 0600 "$BUILD_DIR/masque-client.toml" "$CLIENT_CONFIG.new"
     mv -f -- "$CLIENT_CONFIG.new" "$CLIENT_CONFIG"
     ENABLE_TOUCHED=1
-    systemctl enable "$SERVICE"
+    systemctl enable --force "$SERVICE"
+    systemctl is-enabled --quiet "$SERVICE"
+    systemctl is-active --quiet "$SERVICE"
     INSTALLING=
     say "Server installed: https://$DOMAIN/"
     [[ ! -f $CREDENTIALS ]] || sed '/^Server password hash: /d' "$CREDENTIALS"
