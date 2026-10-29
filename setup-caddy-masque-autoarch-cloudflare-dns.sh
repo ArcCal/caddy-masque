@@ -25,6 +25,8 @@
 #   address + domain SNI instead of depending on public A/AAAA propagation.
 # - Stage and validate before replacement, retain private rollback copies,
 #   report recovery failures and leave unrelated services/firewall data alone.
+# - Set both TMPDIR and GOTMPDIR to private build staging. GOTMPDIR alone does
+#   not stop Go from ignoring go.mod when the checkout is directly in /tmp.
 # Interactive native-architecture Caddy MASQUE setup with Cloudflare DNS-01.
 # Run from an authenticated, complete checkout:
 #   sudo bash setup-caddy-masque-autoarch-cloudflare-dns.sh
@@ -453,9 +455,12 @@ build_server() {
         swapon "$SWAP" || die "cannot enable temporary swap; add memory/swap and run again"
     fi
     mkdir -m 0700 -- "$BUILD_DIR/go-tmp"
+    # Go uses TMPDIR to identify the system temp root and ignores go.mod there.
+    # GOTMPDIR only moves compiler scratch files; set both so /tmp checkouts
+    # remain valid modules without moving or changing the user's source tree.
     if ! (cd -- "$SRC" && env -u GOFLAGS -u GOOS -u GOARCH -u GOROOT -u GOWORK \
         GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 GOTOOLCHAIN=local GOWORK=off GOENV=off \
-        GOTMPDIR="$BUILD_DIR/go-tmp" \
+        TMPDIR="$BUILD_DIR/go-tmp" GOTMPDIR="$BUILD_DIR/go-tmp" \
         GOCACHE="$BUILD_CACHE/build" GOMODCACHE="$BUILD_CACHE/mod" \
         "$go_root/bin/go" build -p 1 -mod=readonly -trimpath -ldflags '-s -w' -o "$BUILD_DIR/caddy-masque" ./cmd/caddy); then
         die "build failed; the installed binary was not replaced. Check disk/memory and access to proxy.golang.org"
