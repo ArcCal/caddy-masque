@@ -29,7 +29,7 @@
 #   not stop Go from ignoring go.mod when the checkout is directly in /tmp.
 # Interactive native-architecture Caddy MASQUE setup with Cloudflare DNS-01.
 # Run from an authenticated, complete checkout:
-#   sudo bash setup-caddy-masque-autoarch-cloudflare-dns.sh
+#   sudo bash setup-interactive-caddy-masque-autoarch-cloudflare-dns.sh
 # Supports Debian 12+ and Ubuntu 24.04+ on Linux amd64/arm64.
 # Runtime files are installed outside the checkout.
 # Caddy obtains and renews its certificate using the bundled Cloudflare module.
@@ -39,7 +39,7 @@
 
 usage() {
     cat <<'EOF'
-Usage: sudo bash setup-caddy-masque-autoarch-cloudflare-dns.sh
+Usage: sudo bash setup-interactive-caddy-masque-autoarch-cloudflare-dns.sh
 
 Interactively build and install a native Linux amd64/arm64 MASQUE server
 with the bundled caddy-dns/cloudflare plugin, configure DNS-01 issuance
@@ -499,7 +499,7 @@ stage_config() {
         password=$(awk '/^password = / {gsub(/"/, "", $3); print $3}' <<<"$account")
         [[ $hash == "\$argon2id\$"* && -n $password ]] || die "account generation failed"
         cat >"$BUILD_DIR/Caddyfile" <<EOF
-# Managed by setup-caddy-masque-autoarch-cloudflare-dns.sh
+# Managed by setup-interactive-caddy-masque-autoarch-cloudflare-dns.sh
 # Caddy owns certificate issuance and renewal using Cloudflare DNS-01.
 {
     # DNS-01 needs no HTTP listener; avoid taking over an unrelated port 80.
