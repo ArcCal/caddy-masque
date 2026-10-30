@@ -27,6 +27,10 @@
 #   report recovery failures and leave unrelated services/firewall data alone.
 # - Set both TMPDIR and GOTMPDIR to private build staging. GOTMPDIR alone does
 #   not stop Go from ignoring go.mod when the checkout is directly in /tmp.
+# - Check shared parent ownership before following installation paths. Publish
+#   client exports through a unique temporary file; a fixed .new directory can
+#   make install/mv publish a directory instead of the promised client file.
+# - Respect the process's cgroup memory ancestry, not just the cgroup mount root.
 # Interactive native-architecture Caddy MASQUE setup with Cloudflare DNS-01.
 # Run from an authenticated, complete checkout:
 #   sudo bash setup-interactive-caddy-masque-autoarch-cloudflare-dns.sh
@@ -36,6 +40,13 @@
 # Re-running replaces managed configuration and credentials, and preserves
 # Caddy's certificate storage. The script stops and replaces its own service.
 # A private Rust masque-client TOML file is exported after successful startup.
+set +x
+set +v
+set +a
+# Caller-exported names keep their export attribute even with allexport off.
+# Keep the optional CF_API_TOKEN input until main consumes it, but never let
+# subsequent assignments of generated secrets inherit an export attribute.
+export -n account hash password token supplied_cf_token cf_token
 
 usage() {
     cat <<'EOF'
@@ -74,6 +85,8 @@ The generated masque-client.toml uses Rust's Linux system mode (full VPN).
 Reruns replace managed files and rotate the client password. Existing Caddy
 certificate state is retained. DNS-01 validates TXT records; no A/AAAA records
 or external public-IP lookup is required by this installer.
+Reuse preserves this installer's dedicated Caddy storage. Generic /var/lib/caddy
+state and arbitrary external PEM files are not automatically imported.
 It preserves the checkout. Run --help without root for this information.
 EOF
 }
@@ -150,6 +163,7 @@ init_paths() {
 
 managed_directory() {
     local path=$1 mode=$2 owner=$3 group=$4
+    check_parent_dirs "$path"
     if [[ -L $path || ( -e $path && ! -d $path ) ]]; then rm -f -- "$path"; fi
     install -d -o "$owner" -g "$group" -m "$mode" -- "$path"
 }
@@ -157,10 +171,80 @@ managed_directory() {
 # Publish by rename, never truncate a running ELF or follow an old link.
 replace_file() {
     local source=$1 destination=$2 mode=$3 owner=$4 group=$5 temporary
+    check_parent_dirs "$destination"
     temporary=$(mktemp "${destination}.install.XXXXXXXX")
     install -o "$owner" -g "$group" -m "$mode" -- "$source" "$temporary"
     if [[ -d $destination && ! -L $destination ]]; then rm -rf --one-file-system -- "$destination"; fi
     mv -fT -- "$temporary" "$destination"
+}
+
+# Root-owned leaves are not sufficient when a writable ancestor can rename
+# them. Inspect lexical and resolved ancestors; never chmod shared directories.
+# Dedicated bad leaves remain replaceable after the old service has stopped.
+check_parent_dirs() {
+    local path=$1 parent resolved owner mode
+    [[ $path == /* ]] || die 'installation paths must be absolute'
+    parent=${path%/*}; [[ -n $parent ]] || parent=/
+    resolved=$(readlink -m -- "$parent") || die "cannot resolve parent of $path"
+    for parent in "$parent" "$resolved"; do
+        while :; do
+            if [[ -e $parent || -L $parent ]]; then
+                [[ -d $parent ]] || die "installation parent is not a directory: $parent"
+                read -r owner mode < <(stat -Lc '%u %a' -- "$parent") || die "cannot inspect installation parent: $parent"
+                if [[ $owner != 0 || ! $mode =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 0022) != 0 )); then
+                    die "installation parent must be root-owned and not writable by other accounts: $parent"
+                fi
+            fi
+            [[ $parent != / ]] || break
+            parent=${parent%/*}; [[ -n $parent ]] || parent=/
+        done
+    done
+}
+
+prepare_build_directory() {
+    local path=$1 owner mode unsafe
+    check_parent_dirs "$path"
+    if [[ -L $path || ( -e $path && ! -d $path ) ]]; then
+        rm -rf --one-file-system -- "$path"
+    elif [[ -d $path ]]; then
+        read -r owner mode < <(stat -Lc '%u %a' -- "$path") || die "cannot inspect build directory: $path"
+        unsafe=$(find -P "$path" -xdev \( -type l -o ! -uid 0 -o -perm /022 \) -print -quit) ||
+            die "cannot inspect the existing build directory safely: $path"
+        if [[ $owner != 0 || ! $mode =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 0022) != 0 )) ||
+            [[ -n $unsafe ]]; then
+            # Never adopt compilers or caches previously writable by others.
+            rm -rf --one-file-system -- "$path"
+        fi
+    fi
+    install -d -o root -g root -m 0700 -- "$path"
+}
+
+# A complete checkout may itself live under an installer's normal build root,
+# or contain that root. Never purge or adopt any overlapping source directory.
+# Resolve links too; the fallback is freshly created inside this run's private
+# staging tree and disappears at cleanup, leaving the checkout unchanged.
+build_path_overlaps_source() {
+    local path source
+    path=$(readlink -m -- "$1") || die 'cannot resolve a build path'
+    source=$(readlink -m -- "$SRC") || die 'cannot resolve the source checkout'
+    [[ $path == "$source" || $path == "${source%/}/"* || $source == "${path%/}/"* ]]
+}
+
+# Cover/home/runtime-view trees and bad dedicated file-name collisions are
+# replaced destructively. A checkout stored inside one cannot be preserved by
+# installation; neither may a checkout containing such a reserved tree. Reject
+# that placement before locks, packages or replacement.
+# Resolve only parents: deleting a bad leaf symlink does not delete its target.
+check_source_placement() {
+    local path parent reserved source
+    source=$(readlink -m -- "$SRC") || die 'cannot resolve the source checkout'
+    while IFS= read -r path; do
+        parent=$(readlink -m -- "${path%/*}") || die 'cannot resolve a reserved installation path'
+        reserved="${parent%/}/${path##*/}"
+        if [[ $source == "$reserved" || $source == "$reserved/"* || $reserved == "${source%/}/"* ]]; then
+            die "source checkout overlaps a replaceable deployment path: $path"
+        fi
+    done < <(transaction_paths; service_override_paths; printf '%s\n' "$STATE/.home" "$RUNTIME_VIEW")
 }
 
 service_override_paths() {
@@ -195,6 +279,7 @@ transaction_paths() {
 }
 
 preflight() {
+    local path systemd_version
     [[ $(id -u) == 0 ]] || die "run with sudo bash $0"
     [[ $(uname -s) == Linux ]] || die "only Linux is supported"
     ARCH=$(detect_arch "$(uname -m)") || die "unsupported architecture: $(uname -m); use amd64 or arm64"
@@ -205,7 +290,16 @@ preflight() {
     [[ -f $SRC/go.mod && -d $SRC/third_party/xnet && -d $SRC/third_party/quic-go &&
         -f $SRC/deploy/caddy-masque.service ]] ||
         die "keep this script at the root of the complete caddy-masque checkout"
+    check_source_placement
     [[ -d /run/systemd/system ]] || die "systemd must be running as the system service manager"
+    systemd_version=$(systemctl --version | awk 'NR == 1 {print $2}')
+    if [[ ! $systemd_version =~ ^[0-9]+$ ]] || (( 10#$systemd_version < 249 )); then
+        die 'systemd 249+ is required for the generated service sandbox'
+    fi
+    for path in "$BINARY" "$STATE" "$SITE" "$UNIT_DIR/$SERVICE" "$LOCK_DIR" "$GO_INSTALL_ROOT" "$BUILD_CACHE" \
+        /var/lib/caddy-masque /var/lib/caddy-masque-config /var/log/caddy-masque /run/caddy-masque /etc/modules-load.d/caddy-masque.conf; do
+        check_parent_dirs "$path"
+    done
     command -v flock >/dev/null || die "install util-linux (flock) first"
     acquire_lock
     if [[ ! -c /dev/net/tun ]]; then modprobe tun 2>/dev/null || true; fi
@@ -239,8 +333,27 @@ install_packages() {
         python3 util-linux </dev/null
 }
 
+# A same-name symlink can resolve to an unrelated systemd unit. Never accept
+# that target's cgroup as ownership proof or stop it under this service's name.
+# An entirely inactive alias can be replaced as a dedicated pathname collision.
+check_service_identity() {
+    local canonical state group pid
+    canonical=$(systemctl show -p Id --value "$SERVICE" 2>/dev/null || true)
+    if [[ -n $canonical && $canonical != "$SERVICE" ]]; then
+        state=$(systemctl show -p ActiveState --value "$SERVICE" 2>/dev/null || true)
+        group=$(systemctl show -p ControlGroup --value "$SERVICE" 2>/dev/null || true)
+        pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || true)
+        if [[ ( $state != inactive && $state != failed ) || -n $group || ( -n $pid && $pid != 0 ) ]]; then
+            printf 'Refusing alias %q -> %q (state=%q PID=%q cgroup=%q); unrelated unit was not stopped.\n' \
+                "$SERVICE" "$canonical" "$state" "$pid" "$group" >&2
+            return 1
+        fi
+    fi
+}
+
 check_port_owners() {
     local mode=${1:-allow-managed} expected_group tcp_status=0 udp_status=0
+    check_service_identity || return 1
     expected_group=$(systemctl show -p ControlGroup --value "$SERVICE" 2>/dev/null || true)
     # Query both protocols before deciding. -a also catches connected UDP
     # sockets bound to 443, which a listener-only UDP query would omit.
@@ -333,11 +446,15 @@ PY
 }
 
 check_ports() {
+    check_service_identity || die 'the service name resolves to another live systemd unit'
     systemctl is-active --quiet "$SERVICE" && WAS_ACTIVE=1
     WAS_ENABLE_STATE=$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)
     WAS_ENABLE_STATE=${WAS_ENABLE_STATE:-disabled}
     if (( WAS_ACTIVE )) || [[ -e $BINARY || -L $BINARY || -e $UNIT_DIR/$SERVICE || -L $UNIT_DIR/$SERVICE || -d $STATE ]]; then HAD_DEPLOYMENT=1; fi
     check_port_owners allow-managed || die 'TCP/UDP 443 is not exclusively free or owned by this caddy-masque service.'
+    if ip link show masque0 >/dev/null 2>&1; then
+        check_tunnel_owners || die 'masque0 has a foreign or unverifiable process owner; its tunnel was not changed'
+    fi
     # Another MASQUE service can share the default tunnel name even when it
     # listens elsewhere. Protect that actual resource conflict separately.
     if systemctl is-active --quiet masque-server.service && ip link show masque0 >/dev/null 2>&1; then
@@ -349,6 +466,51 @@ check_ports() {
         fi
     fi
     return 0
+}
+
+# A leftover config/binary does not authorize deleting another workload's live
+# tunnel, even when that workload listens on a different port. Linux publishes
+# TUN interface names in fdinfo; compare holders with this unit's actual cgroup.
+# An unheld interface can still be this deployment's persistent crash leftover.
+check_tunnel_owners() {
+    local expected_group
+    expected_group=$(systemctl show -p ControlGroup --value "$SERVICE" 2>/dev/null || true)
+    python3 - "$expected_group" <<'PY'
+import json, os, pathlib, sys
+proc = pathlib.Path('/proc')
+expected = sys.argv[1].rstrip('/')
+conflicts = []
+for directory in proc.iterdir():
+    if not directory.name.isascii() or not directory.name.isdecimal():
+        continue
+    try:
+        for entry in (directory / 'fdinfo').iterdir():
+            try:
+                fields = entry.read_text(errors='replace').splitlines()
+            except FileNotFoundError:
+                continue
+            if not any(line.split() == ['iff:', 'masque0'] for line in fields):
+                continue
+            groups = [line.split(':', 2) for line in (directory / 'cgroup').read_text().splitlines()]
+            group = next((p for n, c, p in groups if n == '0' and not c), '')
+            if not group:
+                group = next((p for _, c, p in groups if 'name=systemd' in c.split(',')), '')
+            if expected and (group == expected or group.startswith(expected + '/')):
+                continue
+            try:
+                executable = os.readlink(directory / 'exe')
+            except OSError:
+                executable = '(unavailable)'
+            conflicts.append('PID=' + directory.name + ' executable=' + json.dumps(executable) + ' cgroup=' + json.dumps(group))
+    except FileNotFoundError:
+        continue  # A process exited, or this kernel task has no descriptor table.
+    except (OSError, ValueError):
+        conflicts.append('PID=' + directory.name + ': cannot verify TUN ownership')
+if conflicts:
+    print('masque0 ownership check failed; no foreign process was stopped:', file=sys.stderr)
+    print('\n'.join('  ' + item for item in conflicts), file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 check_pool() {
@@ -405,18 +567,47 @@ cleanup_swap() {
 }
 
 build_server() {
-    local releases go_line go_version go_file go_sha go_root mem_kb swap_kb free_kb
+    local releases go_line go_version go_file go_sha go_root mem_kb swap_kb free_kb info private_tools=0 private_cache=0
+    # Apply before even `go version`: inherited toolchain selectors and cache
+    # programs must not execute an unrelated helper as root. Proxy/CA settings
+    # remain inherited; the actual compile additionally fixes native CPU flags.
+    local -x GOTOOLCHAIN=local GOENV=off GOWORK=off GOROOT='' GO111MODULE=on GOAUTH=off
+    local -x GOFLAGS='' GOCACHEPROG='' GOEXPERIMENT='' GOFIPS140='' GODEBUG=''
     say "Building the native linux/$ARCH server from this checkout"
     go_line=$(sed -n 's/^go \([0-9]*\.[0-9]*\)\.[0-9]*$/\1/p' "$SRC/go.mod")
     [[ -n $go_line ]] || die "cannot read the Go release line from go.mod"
     # Keep a separate toolchain and caches; never replace the system's Go.
-    install -d -m 0755 "$GO_INSTALL_ROOT" "$BUILD_CACHE"
+    if build_path_overlaps_source "$GO_INSTALL_ROOT"; then
+        GO_INSTALL_ROOT="$BUILD_DIR/toolchains"
+        private_tools=1
+    fi
+    if build_path_overlaps_source "$BUILD_CACHE"; then
+        BUILD_CACHE="$BUILD_DIR/build-cache"
+        private_cache=1
+    fi
+    if (( private_tools || private_cache )); then
+        [[ -d $BUILD_DIR && ! -L $BUILD_DIR && $(stat -c '%u:%a' -- "$BUILD_DIR") == 0:700 ]] ||
+            die 'overlapping source paths require private root-owned build staging'
+        say 'Source overlaps persistent build storage; using private staging for the overlapping paths'
+    fi
+    if (( private_tools )); then
+        [[ ! -e $GO_INSTALL_ROOT && ! -L $GO_INSTALL_ROOT ]] || die 'private toolchain staging already exists'
+        install -d -o root -g root -m 0700 -- "$GO_INSTALL_ROOT"
+    else
+        prepare_build_directory "$GO_INSTALL_ROOT"
+    fi
+    if (( private_cache )); then
+        [[ ! -e $BUILD_CACHE && ! -L $BUILD_CACHE ]] || die 'private cache staging already exists'
+        install -d -o root -g root -m 0700 -- "$BUILD_CACHE"
+    else
+        prepare_build_directory "$BUILD_CACHE"
+    fi
     free_kb=$(df -Pk "$BUILD_CACHE" | awk 'NR==2 {print $4}')
     [[ $free_kb -ge 5242880 ]] || die "free at least 5 GiB for the toolchain and build caches"
     free_kb=$(df -Pk "$BUILD_DIR" | awk 'NR==2 {print $4}')
     [[ $free_kb -ge 3145728 ]] || die "free at least 3 GiB in /var/tmp for build staging and possible swap"
     releases="$BUILD_DIR/go-releases.json"
-    curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 90 \
+    curl --disable --proto '=https' --proto-redir '=https' -fsSL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 90 \
         'https://go.dev/dl/?mode=json&include=all' -o "$releases"
     go_version=$(jq -r --arg line "go$go_line." 'first(.[] | select(.stable and (.version | startswith($line))) | .version) // empty' "$releases")
     [[ $go_version =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "no stable Go $go_line patch release was found"
@@ -424,12 +615,12 @@ build_server() {
     go_sha=$(jq -r --arg file "$go_file" 'first(.[].files[] | select(.filename == $file) | .sha256) // empty' "$releases")
     [[ $go_sha =~ ^[0-9a-f]{64}$ ]] || die "missing official Go archive checksum"
     go_root="$GO_INSTALL_ROOT/$go_version-$ARCH"
-    if [[ ! -x $go_root/bin/go || ! -x $go_root/pkg/tool/linux_$ARCH/compile || ! -f $go_root/src/runtime/runtime2.go ||
+    if [[ -L $go_root || ! -x $go_root/bin/go || ! -x $go_root/pkg/tool/linux_$ARCH/compile || ! -f $go_root/src/runtime/runtime2.go ||
         ! -f $go_root/.caddy-masque-toolchain.sha256 ]] ||
         [[ $(cat "$go_root/.caddy-masque-toolchain.sha256" 2>/dev/null) != "$go_sha" ]] ||
         ! "$go_root/bin/go" version >"$BUILD_DIR/go-version.txt" 2>&1 ||
         ! grep -Fq -- "$go_version linux/$ARCH" "$BUILD_DIR/go-version.txt"; then
-        curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 600 \
+        curl --disable --proto '=https' --proto-redir '=https' -fsSL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 600 \
             "https://go.dev/dl/$go_file" -o "$BUILD_DIR/go.tar.gz"
         printf '%s  %s\n' "$go_sha" "$BUILD_DIR/go.tar.gz" | sha256sum -c --quiet - || die "Go archive checksum mismatch"
         # Publish the complete toolchain using a rename on its own filesystem.
@@ -438,7 +629,7 @@ build_server() {
         "$GO_STAGE/go/bin/go" version >"$BUILD_DIR/go-version.txt"
         grep -Fq -- "$go_version linux/$ARCH" "$BUILD_DIR/go-version.txt" || die "unexpected downloaded Go version"
         printf '%s\n' "$go_sha" >"$GO_STAGE/go/.caddy-masque-toolchain.sha256"
-        if [[ -e $go_root ]]; then mv -- "$go_root" "$GO_STAGE/previous"; fi
+        if [[ -e $go_root || -L $go_root ]]; then mv -T -- "$go_root" "$GO_STAGE/previous"; fi
         mv -- "$GO_STAGE/go" "$go_root"
         rm -rf -- "$GO_STAGE"
         GO_STAGE=''
@@ -459,7 +650,9 @@ build_server() {
     # GOTMPDIR only moves compiler scratch files; set both so /tmp checkouts
     # remain valid modules without moving or changing the user's source tree.
     if ! (cd -- "$SRC" && env -u GOFLAGS -u GOOS -u GOARCH -u GOROOT -u GOWORK \
-        GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 GOTOOLCHAIN=local GOWORK=off GOENV=off \
+        -u GOCACHEPROG -u GOEXPERIMENT -u GOFIPS140 -u GODEBUG \
+        GOOS=linux GOARCH="$ARCH" GOAMD64=v1 GOARM64=v8.0 GO111MODULE=on \
+        CGO_ENABLED=0 GOTOOLCHAIN=local GOWORK=off GOENV=off \
         TMPDIR="$BUILD_DIR/go-tmp" GOTMPDIR="$BUILD_DIR/go-tmp" \
         GOCACHE="$BUILD_CACHE/build" GOMODCACHE="$BUILD_CACHE/mod" \
         "$go_root/bin/go" build -p 1 -mod=readonly -trimpath -ldflags '-s -w' -o "$BUILD_DIR/caddy-masque" ./cmd/caddy); then
@@ -471,18 +664,35 @@ build_server() {
     for module in masque http.handlers.masque dns.providers.cloudflare; do
         grep -Fxq -- "$module" "$BUILD_DIR/modules.txt" || die "built server is missing $module; installation stopped"
     done
+    info=$("$go_root/bin/go" version -m "$BUILD_DIR/caddy-masque")
+    check_build_replacement "$info" golang.org/x/net ./third_party/xnet || die 'built server is missing its patched HTTP/2 replacement'
+    check_build_replacement "$info" github.com/quic-go/quic-go ./third_party/quic-go || die 'built server is missing its patched QUIC replacement'
+    grep -Eq "^[[:space:]]*build[[:space:]]+GOARCH=$ARCH$" <<<"$info" || die 'built server has the wrong architecture'
+    grep -Eq '^[[:space:]]*build[[:space:]]+CGO_ENABLED=0$' <<<"$info" || die 'built server unexpectedly requires CGO'
+}
+
+check_build_replacement() {
+    awk -F '\t' -v module="$2" -v replacement="$3" '
+        ($2 == "dep" || $2 == "mod") && $3 == module {pending=1; next}
+        pending {if ($2 == "=>" && $3 == replacement) found=1; pending=0}
+        END {exit !found}
+    ' <<<"$1"
 }
 
 stage_token() {
-    local token
+    local token=${CF_API_TOKEN:-}
     say "Configuring Caddy Cloudflare DNS-01 issuance and renewal"
-    if [[ -d $STATE && ! -L $STATE && -f $TOKEN_FILE && ! -L $TOKEN_FILE ]]; then
+    if [[ -n $token ]]; then
+        : # The shell-local inherited token skips the only token prompt.
+    elif [[ -d $STATE && ! -L $STATE && -f $TOKEN_FILE && ! -L $TOKEN_FILE ]]; then
         printf 'CF_API_TOKEN (hidden; Enter keeps the saved token): ' >&2
     else
         printf 'CF_API_TOKEN (hidden; zone-scoped DNS Edit + Zone Read): ' >&2
     fi
-    IFS= read -r -s token || die "no Cloudflare token supplied"
-    printf '\n' >&2
+    if [[ -z $token ]]; then
+        IFS= read -r -s token || die "no Cloudflare token supplied"
+        printf '\n' >&2
+    fi
     if [[ -z $token && -d $STATE && ! -L $STATE && -f $TOKEN_FILE && ! -L $TOKEN_FILE ]]; then token=$(cat "$TOKEN_FILE"); fi
     valid_token "$token" || die "invalid Cloudflare API token format; use a token, not a global API key"
     printf '%s\n' "$token" >"$BUILD_DIR/cloudflare-token"
@@ -553,27 +763,41 @@ PYCODE
 }
 
 runtime_memory_limits() {
-    local total_kb budget_mib limit_mib path bytes candidate ceiling
-    total_kb=$(awk '$1 == "MemTotal:" {print $2; exit}' /proc/meminfo)
-    [[ $total_kb =~ ^[0-9]+$ ]] || die "cannot determine the service memory budget"
-    budget_mib=$((total_kb / 1024))
-    # Respect a visible container limit as well as physical RAM.
-    for path in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
-        if [[ -r $path ]]; then
-            IFS= read -r bytes <"$path" || die "cannot read memory limit: $path"
-            if [[ $bytes =~ ^[0-9]+$ ]]; then
-                candidate=$((bytes / 1048576))
-                if (( candidate < budget_mib )); then budget_mib=$candidate; fi
-            fi
-        fi
-    done
-    limit_mib=$((budget_mib / 2))
-    if (( limit_mib < 256 )); then limit_mib=256; fi
-    ceiling=$((budget_mib * 3 / 4))
-    if (( limit_mib > ceiling )); then limit_mib=$ceiling; fi
-    if (( limit_mib > 1024 )); then limit_mib=1024; fi
-    (( limit_mib >= 64 )) || die "insufficient memory for the confined Caddy service"
-    printf '%s %s %s\n' "$limit_mib" "$((limit_mib * 3 / 4))" "$((limit_mib * 7 / 10))"
+    # Normally allow half visible RAM, at most 1 GiB. On small VPSs a 256 MiB
+    # floor may use up to 75%; refuse a cap below 64 MiB instead of no limit.
+    # Python integers avoid overflow on cgroup-v1's huge unlimited sentinel.
+    python3 - <<'PY'
+import pathlib
+total = next(int(line.split()[1]) * 1024 for line in pathlib.Path('/proc/meminfo').read_text().splitlines()
+             if line.startswith('MemTotal:'))
+paths = [pathlib.Path('/sys/fs/cgroup/memory.max'),
+         pathlib.Path('/sys/fs/cgroup/memory/memory.limit_in_bytes')]
+for line in pathlib.Path('/proc/self/cgroup').read_text().splitlines():
+    _, controllers, relative = line.split(':', 2)
+    if not controllers or 'memory' in controllers.split(','):
+        base = pathlib.Path('/sys/fs/cgroup') if not controllers else pathlib.Path('/sys/fs/cgroup/memory')
+        directory = base / relative.lstrip('/')
+        if '..' in directory.parts:
+            continue
+        filename = 'memory.max' if not controllers else 'memory.limit_in_bytes'
+        while directory == base or base in directory.parents:
+            paths.append(directory / filename)
+            if directory == base:
+                break
+            directory = directory.parent
+for path in set(paths):
+    if path.exists():
+        value = path.read_text().strip()
+        if value != 'max':
+            if not value.isascii() or not value.isdecimal():
+                raise SystemExit('Cannot determine a safe cgroup memory limit.')
+            total = min(total, int(value))
+budget = total // (1024 * 1024)
+maximum = min(1024, max(256, budget // 2), budget * 3 // 4)
+if maximum < 64:
+    raise SystemExit('Insufficient memory for the confined Caddy service.')
+print(maximum, maximum * 3 // 4, maximum * 7 // 10)
+PY
 }
 
 stage_service() {
@@ -971,6 +1195,15 @@ install_server() {
     # Recheck after a potentially long build, before replacing files or
     # stopping the old service. An external owner may have appeared meanwhile.
     check_port_owners allow-managed || die 'Port 443 ownership changed; replacement was not started.'
+    if ip link show masque0 >/dev/null 2>&1; then
+        check_tunnel_owners || die 'masque0 ownership changed; replacement was not started'
+    fi
+    # Capture the state at cutover, not before a long build. Preserve any
+    # administrator start/stop/enable change made while compilation was running.
+    WAS_ACTIVE=0
+    systemctl is-active --quiet "$SERVICE" && WAS_ACTIVE=1
+    WAS_ENABLE_STATE=$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)
+    WAS_ENABLE_STATE=${WAS_ENABLE_STATE:-disabled}
     say "Taking over caddy-masque: stopping the old service and replacing managed files"
     install -d -m 0700 "$BUILD_DIR/backup"
     mkdir -p "$(dirname -- "$BINARY")" "$UNIT_DIR"
@@ -989,7 +1222,22 @@ install_server() {
         if [[ -e $path || -L $path ]]; then cp -a -- "$path" "$BUILD_DIR/backup/entry-$index"; fi
     done < <(transaction_paths; service_override_paths)
 
+    # Copying a large cover tree can take time too. Reject a new foreign owner
+    # before entering the transaction: no old-service stop or rollback is then
+    # needed when ownership changed while the private backup was being copied.
+    check_port_owners allow-managed || die 'Port 443 ownership changed during backup; replacement was not started.'
+    if ip link show masque0 >/dev/null 2>&1; then
+        check_tunnel_owners || die 'masque0 ownership changed during backup; replacement was not started'
+    fi
     INSTALLING=1
+    # Preserve the old unit's stop behavior while it is still available. A
+    # stale/missing/masked inactive unit is repaired below without a fresh-only
+    # gate; an active old daemon must stop before its unit is rewritten.
+    if systemctl is-active --quiet "$SERVICE"; then
+        check_service_identity || die 'the service name changed before the old daemon could be stopped'
+        systemctl stop "$SERVICE"
+        check_port_owners require-free || die 'TCP/UDP 443 was not released by the old service'
+    fi
     # The canonical unit replaces a local mask/malformed unit before PID 1 is
     # asked to stop it. Clear this service's overrides and enable links only.
     while IFS= read -r path; do rm -rf --one-file-system -- "$path"; done < <(service_override_paths)
@@ -998,6 +1246,7 @@ install_server() {
     systemctl stop "$SERVICE"
     check_port_owners require-free || die 'TCP/UDP 443 is still occupied after stopping the managed service.'
     if ip link show masque0 >/dev/null 2>&1; then
+        check_tunnel_owners || die 'masque0 still has a process owner after stopping this service'
         (( HAD_DEPLOYMENT )) || die 'A tunnel with unknown ownership was not deleted.'
         ip link delete masque0
     fi
@@ -1051,7 +1300,7 @@ verify_server() {
     # DNS propagation and initial ACME issuance can take several minutes.
     for _ in {1..60}; do
         if systemctl is-active --quiet "$SERVICE" &&
-            curl --noproxy '*' -fsS --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" >/dev/null; then
+            curl --disable --noproxy '*' -fsS --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" >/dev/null; then
             ready=1
             break
         fi
@@ -1070,9 +1319,12 @@ cleanup() {
     set +e
     if [[ -n $INSTALLING && $result != 0 ]]; then
         printf '\nInstallation failed; restoring the previous managed files and service.\n' >&2
-        systemctl stop "$SERVICE" || rollback_failed=1
-        if (( ENABLE_TOUCHED )); then systemctl disable "$SERVICE" || rollback_failed=1; fi
-        if (( ! STATE_ENTRY_SAVED )); then rm -f -- "$CLIENT_CONFIG.new" || rollback_failed=1; fi
+        if [[ $(systemctl show -p Id --value "$SERVICE" 2>/dev/null || true) == "$SERVICE" ]]; then
+            systemctl stop "$SERVICE" || rollback_failed=1
+            if (( ENABLE_TOUCHED )); then systemctl disable "$SERVICE" || rollback_failed=1; fi
+        else
+            rollback_failed=1
+        fi
         while IFS= read -r path; do
             index=$((index + 1))
             if (( STATE_ENTRY_SAVED )) && [[ $path == "$STATE/"* ]]; then continue; fi
@@ -1091,15 +1343,23 @@ cleanup() {
             chmod "$state_mode" "$STATE" || rollback_failed=1
         fi
         systemctl daemon-reload || rollback_failed=1
-        if (( ENABLE_TOUCHED )); then
-            case "$WAS_ENABLE_STATE" in
-                enabled) systemctl enable "$SERVICE" || rollback_failed=1 ;;
-                enabled-runtime) systemctl enable --runtime "$SERVICE" || rollback_failed=1 ;;
-                disabled | not-found | static | indirect | generated | transient | alias | linked | linked-runtime | masked | masked-runtime) ;;
-                *) rollback_failed=1 ;;
-            esac
+        # The saved wants links already restore persistent/runtime enablement.
+        # Re-enabling could act on a vendor alias revealed by restoring an old
+        # missing unit. Recheck the canonical identity after daemon-reload before
+        # restarting; an unrestartable old deployment requires private recovery.
+        if (( WAS_ACTIVE )); then
+            if [[ $(systemctl show -p Id --value "$SERVICE" 2>/dev/null || true) == "$SERVICE" ]]; then
+                systemctl start "$SERVICE" || rollback_failed=1
+            else
+                rollback_failed=1
+            fi
         fi
-        if (( WAS_ACTIVE )); then systemctl start "$SERVICE" || rollback_failed=1; fi
+        if (( WAS_ACTIVE )); then
+            systemctl is-active --quiet "$SERVICE" || rollback_failed=1
+        elif systemctl is-active --quiet "$SERVICE"; then
+            rollback_failed=1
+        fi
+        [[ $(systemctl is-enabled "$SERVICE" 2>/dev/null || true) == "$WAS_ENABLE_STATE" ]] || rollback_failed=1
         printf 'Packages and Caddy certificate state are retained for retry.\n' >&2
     fi
     cleanup_swap
@@ -1115,8 +1375,17 @@ cleanup() {
 main() {
     # Prevent a caller's bash -x from disclosing the token or generated password.
     set +x
+    set +v
+    set +a
     set -euo pipefail
-    export LC_ALL=C
+    export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+    unset CDPATH
+    # Keep an explicitly supplied token shell-local throughout package/build
+    # commands; it is consumed by stage_token without entering child environments.
+    local supplied_cf_token=${CF_API_TOKEN:-}
+    unset CF_API_TOKEN
+    local CF_API_TOKEN=$supplied_cf_token
+    export -n CF_API_TOKEN supplied_cf_token
     umask 077
     case "${1:-}" in
         -h | --help) usage; return 0 ;;
@@ -1150,11 +1419,10 @@ main() {
     install_server
     verify_server
     # Publish the client file only after the server passes its startup checks.
-    install -m 0600 "$BUILD_DIR/masque-client.toml" "$CLIENT_CONFIG.new"
-    mv -f -- "$CLIENT_CONFIG.new" "$CLIENT_CONFIG"
+    replace_file "$BUILD_DIR/masque-client.toml" "$CLIENT_CONFIG" 0600 root root
     ENABLE_TOUCHED=1
     systemctl enable --force "$SERVICE"
-    systemctl is-enabled --quiet "$SERVICE"
+    [[ $(systemctl is-enabled "$SERVICE") == enabled ]] || die 'persistent boot enablement was not established'
     systemctl is-active --quiet "$SERVICE"
     INSTALLING=
     say "Server installed: https://$DOMAIN/"
