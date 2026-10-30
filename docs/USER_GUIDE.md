@@ -436,7 +436,8 @@ An explicit Caddyfile `admin` option overrides that choice. Do not expose an
 unauthenticated network admin address. Caddy's ordinary localhost default
 is still reachable by other local users/processes.
 
-For the native Cloudflare installer, the executable is `/usr/local/bin/caddy-masque`,
+For the [interactive native Cloudflare installer](../setup-interactive-caddy-masque-autoarch-cloudflare-dns.sh),
+the executable is `/usr/local/bin/caddy-masque`,
 configuration/token files are under `/etc/caddy-masque`, and state/log roots use
 `/var/lib/caddy-masque`, `/var/lib/caddy-masque-config` and `/var/log/caddy-masque`.
 Caddy appends `/caddy` to each XDG base. Both installers keep server configuration

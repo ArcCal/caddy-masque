@@ -38,6 +38,23 @@ The separate [client IETF conformance audit](docs/client-ietf-conformance-2026-1
 The [independent IETF reassessment](docs/ietf-reassessment-2026-10-18.md) checks those interpretations against original RFCs, verified errata and other implementations, and records corrections and narrowly scoped follow-up repairs.
 The [comprehensive follow-up review](docs/comprehensive-recheck-2026-10-18.md) expands the protocol, forwarding and interoperability checks, with additional reproductions, targeted repairs and explicit validation limits.
 
+## Interactive Cloudflare DNS install
+
+On Debian 12+ or Ubuntu 24.04+ (amd64/arm64), run the
+[interactive installer](setup-interactive-caddy-masque-autoarch-cloudflare-dns.sh)
+from a complete source checkout:
+
+```sh
+sudo bash setup-interactive-caddy-masque-autoarch-cloudflare-dns.sh
+```
+
+It prompts for the domain and Cloudflare API token, installs
+`/usr/local/bin/caddy-masque`, and writes configuration and client credentials
+under `/etc/caddy-masque`. Reruns replace managed configuration, rotate the
+client password, preserve Caddy certificate state, and start and enable the service.
+DNS-01 does not require A/AAAA records or an address match during installation;
+clients still need a reachable server address and TCP/UDP 443 access.
+
 ## One-step install
 
 On Debian 12/13 or Ubuntu 22.04/24.04, with the domain already pointing at the server:

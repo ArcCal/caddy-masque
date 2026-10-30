@@ -30,6 +30,10 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.tag || github.event.pull_request.head.sha || github.sha }}
+      - name: Check interactive installer entry point
+        run: |
+          bash -n setup-interactive-caddy-masque-autoarch-cloudflare-dns.sh
+          bash setup-interactive-caddy-masque-autoarch-cloudflare-dns.sh --help
       - uses: actions/setup-go@v7
         with:
           # Exercise both supported toolchains without additional build tags.
