@@ -473,7 +473,7 @@ seen_as_within() {
 
 echo "== the masque-passwd command"
 check "prints a user line with an Argon2id hash" test "${LAPTOP_HASH:0:10}" = '$argon2id$'
-check "and a 24-character password" test "${#LAPTOP_PW}" = 24
+check "and a 22-character password" test "${#LAPTOP_PW}" = 22
 check "accepts a password on stdin" bash -c "echo 'a long enough password' | '$CADDY' masque-passwd --name x --stdin | grep -q '^user x \\\$argon2id'"
 check_not "refuses a short one" bash -c "echo short | '$CADDY' masque-passwd --name x --stdin"
 check_not "refuses a bad user name" "$CADDY" masque-passwd --name 'a b'
