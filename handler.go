@@ -365,6 +365,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		log.Info("rejected request", zap.Int("status", rej.status), zap.String("error", rej.proxyError))
 		return h.reject(w, r, rej)
 	}
+	if req.http1 && expectsContinue(r) {
+		// RFC 9110 Section 7.8 requires 100 (Continue) before 101. Like
+		// masque-vpn, whose HTTP library cannot send it, refuse with 417
+		// before reserving addresses; the client may repeat the request
+		// without the expectation (RFC 9110 Section 10.1.1).
+		return rejectLogged(rejection{status: http.StatusExpectationFailed})
+	}
 	// Omitted optional variables mean wildcard scope (§4.6). Empty or
 	// invalidly encoded values remain present and fail parsing below.
 	value := func(name string) string {
@@ -473,11 +480,11 @@ func (h *Handler) resolveScope(ctx context.Context, target proto.Target, ipproto
 		defer cancel()
 		addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", target.Host)
 		if err != nil {
-			e := "dns_error"
+			// RFC 9209 Section 2.3: 504 for dns_timeout, 502 for dns_error.
 			if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
-				e = "dns_timeout"
+				return scope{}, &rejection{status: http.StatusGatewayTimeout, proxyError: "dns_timeout"}
 			}
-			return scope{}, &rejection{status: http.StatusBadGateway, proxyError: e}
+			return scope{}, &rejection{status: http.StatusBadGateway, proxyError: "dns_error"}
 		}
 		for _, a := range addrs {
 			a = a.Unmap()
@@ -516,10 +523,6 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request, ha
 		}
 		_ = conn.SetDeadline(time.Time{})
 		h.tuneConn(conn)
-		if expectsContinue(r) {
-			// RFC 9110 Section 7.8: 100 (Continue) before 101.
-			_, _ = brw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
-		}
 		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\nCapsule-Protocol: ?1\r\n\r\n")
 		if err := brw.Flush(); err != nil {
 			conn.Close()
