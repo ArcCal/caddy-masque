@@ -364,6 +364,12 @@ Caddy obtains by itself need nothing.
   This module therefore takes over the UDP port of HTTPS sites and serves HTTP/3 (with Datagrams) with the same
   certificates and the same site routes, and sends `Alt-Svc` headers the way Caddy does. Ordinary web requests over
   HTTP/3 are still handled by Caddy's routes. `http3 off` gives HTTP/3 back to Caddy.
+- **QUIC v1 only**: this module's HTTP/3 listener sets its QUIC versions explicitly to QUIC v1 (`0x00000001`,
+  RFC 9000). Initials of at least 1200 bytes for any other version, including QUIC v2 (RFC 9369), which quic-go would
+  otherwise accept, and the obsolete drafts 29 to 34, which quic-go does not implement, get a Version Negotiation
+  packet that offers only v1 (plus one reserved greasing version, RFC 9000 section 15); smaller ones are dropped
+  (RFC 9000 section 14.1). With `http3 off`, Caddy's own HTTP/3 server and its default QUIC versions (v1 and v2) are
+  used instead; Caddy does not expose that setting.
 - **HTTP/2**: Go's HTTP/2 does not accept extended CONNECT by default; it needs `GODEBUG=http2xconnect=1`.
   This module sets it automatically at program start (whether built with this project's `cmd/caddy` or with xcaddy);
   if the environment explicitly says `http2xconnect=0`, that is respected, HTTP/2 tunnels are then unavailable, and the

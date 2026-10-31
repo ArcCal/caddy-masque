@@ -483,6 +483,11 @@ func listenUDP(network, hostport string) (net.PacketConn, error) {
 	return lc.ListenPacket(context.Background(), network, hostport)
 }
 
+// quicVersions are the QUIC versions the HTTP/3 listener negotiates: exactly
+// QUIC v1 (0x00000001), set explicitly instead of relying on quic-go's
+// default list.
+var quicVersions = []quic.Version{quic.Version1}
+
 func (a *App) serveHTTP3(network, hostport string, srv *caddyhttp.Server, tlsCfg *tls.Config) error {
 	key := "masque-h3/" + network + "/" + hostport
 	owner := h3Owner{app: a, handler: srv, tls: tlsCfg, config: http3.ConnectionConfig{
@@ -544,6 +549,11 @@ func (a *App) serveHTTP3(network, hostport string, srv *caddyhttp.Server, tlsCfg
 			// servers close idle keep-alive connections.
 			IdleTimeout: time.Duration(srv.IdleTimeout),
 			QUICConfig: &quic.Config{
+				// QUIC v1 (RFC 9000) only. quic-go would otherwise also
+				// accept QUIC v2 (RFC 9369); it implements no drafts. Initials
+				// for any other version get a Version Negotiation packet
+				// listing only v1.
+				Versions:          quicVersions,
 				EnableDatagrams:   true,
 				InitialPacketSize: uint16(min(max(a.cfg.mtu+quicOverhead, 1200), 1452)),
 				MaxIdleTimeout:    60 * time.Second,
