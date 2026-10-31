@@ -5,9 +5,11 @@ Only shell functions are sourced. apt-get is a recording mock and a compiled
 sleeper stands in for the server, so nothing is installed, stopped or bound.
 Requires a C compiler (cc) for the process-identification checks.
 """
+import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'setup-interactive-caddy-masque-autoarch-cloudflare-dns.sh'
 TEXT = SCRIPT.read_text()
@@ -77,3 +79,78 @@ with tempfile.TemporaryDirectory() as directory:
         for process in processes:
             process.kill()
             process.wait()
+
+# apt: only list/archive lock failures are retried (DPkg::Lock::Timeout does
+# not cover them); other failures return at once.
+for script, expected, retried in (
+        ('if (( attempts < 3 )); then echo "E: Could not get lock /var/lib/apt/lists/lock." >&2; return 100; fi',
+         'status=0 attempts=3', True),
+        ('echo "E: Unable to locate package nonexistent" >&2; return 100', 'status=100 attempts=1', False)):
+    result = shell('sleep() { echo slept >&2; }; attempts=0; apt-get() { attempts=$((attempts+1)); ' + script +
+                   '; }; apt_get update; echo "status=$? attempts=$attempts"')
+    assert expected in result.stdout, result.stdout + result.stderr
+    assert ('slept' in result.stderr) == retried, result.stderr
+print('PASS: apt lock errors are retried for a bounded time and other apt errors are not')
+
+if os.geteuid() == 0:
+    with tempfile.TemporaryDirectory() as directory:
+        base = Path(directory)
+        (base / 'stubborn.c').write_text('#include <signal.h>\n#include <unistd.h>\n'
+                                         'int main(void) { signal(SIGTERM, SIG_IGN); for (;;) pause(); }\n')
+        (base / 'bind.c').write_text(
+            '#include <netinet/in.h>\n#include <sys/socket.h>\n#include <unistd.h>\n'
+            'int main(void){int t=socket(AF_INET,SOCK_STREAM,0),u=socket(AF_INET,SOCK_DGRAM,0),o=1;'
+            'setsockopt(t,SOL_SOCKET,SO_REUSEADDR,&o,sizeof o);struct sockaddr_in a={0};a.sin_family=AF_INET;'
+            'a.sin_port=htons(443);if(bind(t,(void*)&a,sizeof a)||listen(t,1)||bind(u,(void*)&a,sizeof a))return 1;'
+            'for(;;)pause();}\n')
+        binary = base / 'caddy-masque'
+        subprocess.run(['cc', '-o', str(binary), str(base / 'stubborn.c')], check=True)
+        config = str(base / 'Caddyfile')
+        args = [str(binary), 'run', '--config', config]
+
+        def owned(command, *extra):
+            return shell('BINARY="$1"; CONFIG="$2"; shift 2; ' + command, str(binary), config, *extra)
+
+        # A container's copy shows the same path and argv in /proc.
+        contained = subprocess.Popen(['unshare', '-m', '--propagation', 'private', *args])
+        stubborn = subprocess.Popen(args)
+        try:
+            time.sleep(0.3)
+            assert owned('is_standalone_server "$1"', str(contained.pid)).returncode != 0
+            assert owned('is_standalone_server "$1"', str(stubborn.pid)).returncode == 0
+            result = owned('stop_standalone_servers && echo "stopped=$STANDALONE_STOPPED"')
+            assert 'Sent KILL' in result.stdout and 'stopped=1' in result.stdout, result.stdout + result.stderr
+            assert stubborn.wait(timeout=5) is not None
+            assert contained.poll() is None, 'a process in another mount namespace must never be signalled'
+        finally:
+            for process in (contained, stubborn):
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+        print('PASS: a namespaced copy is never signalled; a TERM-ignoring instance is KILLed after the grace period')
+
+        # The real port checker accepts an identified instance's TCP and UDP
+        # 443 sockets as takeover targets and labels them in its report. The
+        # binary is then replaced, so its /proc exe shows "(deleted)".
+        subprocess.run(['cc', '-o', str(binary), str(base / 'bind.c')], check=True)
+        server = subprocess.Popen(args)
+        try:
+            time.sleep(0.3)
+            assert server.poll() is None, 'port 443 must be free for this test'
+            replacement = base / 'replacement'
+            replacement.write_bytes(binary.read_bytes())
+            binary.unlink()
+            replacement.rename(binary)
+            assert os.readlink(f'/proc/{server.pid}/exe').endswith(' (deleted)')
+            command = ('init_paths; BINARY="$1"; CONFIG="$2"; BUILD_DIR="$3"; '
+                       'systemctl() { case "$*" in *ControlGroup*|*" Id "*) echo;; *) return 3;; esac; }; ')
+            result = shell(command + 'check_port_owners allow-managed && echo accepted', str(binary), config, directory)
+            assert 'accepted' in result.stdout, result.stdout + result.stderr
+            result = shell(command + 'check_port_owners require-free', str(binary), config, directory)
+            assert result.returncode != 0 and result.stderr.count('[takeover target]') == 2, result.stderr
+        finally:
+            server.kill()
+            server.wait()
+        print('PASS: identified instances (also with a replaced binary) are takeover targets in the real port check')
+else:
+    raise SystemExit('these process and port checks require root in a disposable environment')

@@ -31,13 +31,16 @@
 #   client exports through a unique temporary file; a fixed .new directory can
 #   make install/mv publish a directory instead of the promised client file.
 # - Respect the process's cgroup memory ancestry, not just the cgroup mount root.
-# - Wait (bounded) for the dpkg lock: boot-time apt jobs otherwise fail apt-get.
+# - Wait (bounded) for the dpkg lock and retry apt's list/archive lock errors:
+#   DPkg::Lock::Timeout alone does not cover `apt-get update`.
 # - Recheck 443 immediately before startup as well as before the stop; never
 #   let a local HTTPS check succeed against a program that bound it meanwhile.
 # - Ask for the token right after the domain, before packages and the build;
 #   the operator must not wait through compilation for the second prompt.
 # - Take over a manually started caddy-masque only on positive evidence: the
-#   /proc exe (also when deleted) and exact `run --config` with this Caddyfile.
+#   /proc exe (also when deleted) and exact `run --config` with this Caddyfile,
+#   in this installer's namespaces and root (a container can show identical
+#   path and argv), and not supervised by another systemd service unit.
 #   File rollback restarts the old unit, not a terminated manual command.
 # Interactive native-architecture Caddy MASQUE setup with Cloudflare DNS-01.
 # Run from an authenticated, complete checkout:
@@ -167,6 +170,8 @@ init_paths() {
     STATE_METADATA=''
     STATE_ENTRY_SAVED=0
     HAD_DEPLOYMENT=0
+    STANDALONE_STOPPED=0
+    NETWORK_REMOVED=0
 }
 
 managed_directory() {
@@ -333,11 +338,31 @@ collect_settings() {
     USER_NAME=laptop
 }
 
+# DPkg::Lock::Timeout makes apt-get wait only for the dpkg locks. The package
+# list and archive locks (held by apt-daily's own update at boot) still fail at
+# once, so retry exactly that failure for up to 30 minutes. Other errors are
+# returned immediately; apt's output is shown after each attempt.
+apt_get() {
+    local attempt status errors
+    errors=$(mktemp) || return
+    for ((attempt=1; ; attempt++)); do
+        status=0
+        apt-get "$@" 2>"$errors" || status=$?
+        cat -- "$errors" >&2
+        if (( status == 0 )) || (( attempt >= 180 )) || ! grep -Eq '^E: (Could not get lock|Unable to lock)' "$errors"; then
+            rm -f -- "$errors"
+            return "$status"
+        fi
+        printf 'Another package manager holds an apt lock; retrying in 10 seconds...\n' >&2
+        sleep 10
+    done
+}
+
 install_packages() {
     say "Installing build and network dependencies"
     # A fresh VPS often runs apt-daily/unattended-upgrades at boot. apt-get's
-    # default lock timeout is zero, so wait (bounded) instead of failing.
-    local -a apt=(apt-get -o DPkg::Lock::Timeout=1800 -o Acquire::Retries=3)
+    # default dpkg lock timeout is zero; apt_get also retries list/cache locks.
+    local -a apt=(apt_get -o DPkg::Lock::Timeout=1800 -o Acquire::Retries=3)
     DEBIAN_FRONTEND=noninteractive "${apt[@]}" update -q </dev/null
     DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "${apt[@]}" install -y -q --no-install-recommends \
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold curl ca-certificates nftables iproute2 dnsutils jq \
@@ -373,6 +398,7 @@ is_standalone_server() {
     [[ $pid =~ ^[1-9][0-9]*$ && $pid != 1 && $pid != "$$" && $pid != "$BASHPID" ]] || return 1
     executable=$(readlink -- "/proc/$pid/exe" 2>/dev/null) || return 1
     [[ ${executable% (deleted)} == "$BINARY" ]] || return 1
+    same_host_process "$pid" || return 1
     {
         while IFS= read -r -d '' argument; do arguments+=("$argument"); done <"/proc/$pid/cmdline"
     } 2>/dev/null || return 1
@@ -394,6 +420,33 @@ is_standalone_server() {
     [[ $configurations == 1 && $selected == "$CONFIG" ]]
 }
 
+# /proc/PID/exe shows a path inside the process's own mount namespace, so a
+# server in a container can look identical to this deployment's. Require this
+# installer's mount, PID and network namespaces and root directory. A process
+# supervised by another systemd service unit belongs to that unit: it is
+# reported as a port/tunnel owner, never signalled.
+same_host_process() {
+    local pid=$1 namespace line group='' part unit=''
+    local -a parts=()
+    for namespace in mnt pid net; do
+        [[ $(readlink -- "/proc/$pid/ns/$namespace" 2>/dev/null) == "$(readlink -- "/proc/self/ns/$namespace")" ]] || return 1
+    done
+    [[ $(readlink -- "/proc/$pid/root" 2>/dev/null) == / ]] || return 1
+    {
+        while IFS= read -r line; do
+            case $line in
+                0::*) group=${line#0::}; break ;;
+                *:name=systemd:*) group=${line#*:name=systemd:} ;;
+            esac
+        done <"/proc/$pid/cgroup"
+    } 2>/dev/null || return 1
+    IFS=/ read -r -a parts <<<"$group"
+    for part in "${parts[@]}"; do
+        if [[ $part == *.service || $part == *.scope ]]; then unit=$part; fi
+    done
+    [[ $unit != *.service || $unit == "$SERVICE" ]]
+}
+
 standalone_servers() {
     local directory
     for directory in /proc/[0-9]*; do
@@ -401,8 +454,9 @@ standalone_servers() {
     done
 }
 
-# TERM, then KILL after a bounded grace; identity is rechecked before every
-# signal so a reused numeric PID is never signalled. PID 1 stops unit members.
+# TERM, then KILL after a bounded grace. Identity is rechecked before every
+# signal, which narrows but cannot close (Bash has no pidfd) the window for a
+# reused numeric PID. PID 1 stops unit members.
 stop_standalone_servers() {
     local attempt pid signal=TERM
     for ((attempt=0; attempt<15; attempt++)); do
@@ -411,6 +465,7 @@ stop_standalone_servers() {
             (( attempt == 0 )) || signal=KILL
             while IFS= read -r pid; do
                 if is_standalone_server "$pid" && kill -s "$signal" -- "$pid" 2>/dev/null; then
+                    STANDALONE_STOPPED=1
                     printf 'Sent %s to manually started previous caddy-masque process %s.\n' "$signal" "$pid"
                 fi
             done < <(standalone_servers)
@@ -513,7 +568,8 @@ if errors or any(row[-1] for row in rows):
             for pid, name, executable, unit, group, ours in owners:
                 print(f'    PID={pid} name={quote(name)} executable={quote(executable)} unit={quote(unit)} '
                       + 'cgroup=' + quote(group or '(unavailable)')
-                      + (' [managed service]' if ours else ' [external or unidentified]'), file=sys.stderr)
+                      + ((' [takeover target]' if pid in standalone else ' [managed service]') if ours
+                         else ' [external or unidentified]'), file=sys.stderr)
     raise SystemExit(1)
 PY
 }
@@ -1325,10 +1381,12 @@ install_server() {
         check_tunnel_owners || die 'masque0 still has a process owner after stopping this service'
         (( HAD_DEPLOYMENT )) || die 'A tunnel with unknown ownership was not deleted.'
         ip link delete masque0
+        NETWORK_REMOVED=1
     fi
     if nft list table inet caddy-masque >/dev/null 2>&1; then
         (( HAD_DEPLOYMENT )) || die 'A firewall table with unknown ownership was not deleted.'
         nft delete table inet caddy-masque
+        NETWORK_REMOVED=1
     fi
     provision_service_user
     managed_directory "$STATE" 0750 root caddy-masque
@@ -1440,9 +1498,15 @@ cleanup() {
         fi
         [[ $(systemctl is-enabled "$SERVICE" 2>/dev/null || true) == "$WAS_ENABLE_STATE" ]] || rollback_failed=1
         printf 'Packages and Caddy certificate state are retained for retry.\n' >&2
-        # File rollback does not reverse these effects; the old service, when
-        # restarted, recreates its own tunnel and nftables table.
-        printf 'Service-account repairs, the removed masque0/nftables state and package changes are outside file rollback.\n' >&2
+        # File rollback does not reverse these effects; report only those that
+        # happened. The old unit, when restarted, recreates its own networking.
+        printf 'Service-account repairs and package changes are outside file rollback.\n' >&2
+        if (( NETWORK_REMOVED )); then
+            printf 'The removed masque0/nftables state returns only when the previous service runs again.\n' >&2
+        fi
+        if (( STANDALONE_STOPPED )); then
+            printf 'Manually started caddy-masque processes were stopped and are not restarted by rollback.\n' >&2
+        fi
     fi
     cleanup_swap
     [[ -z $GO_STAGE ]] || rm -rf -- "$GO_STAGE"
