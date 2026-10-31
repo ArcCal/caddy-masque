@@ -79,9 +79,11 @@ def main():
         # These are distinct source snapshots from the main client. Do not
         # replace them with the main workspace's transport patches.
         cf_vendor = vpn / "masque-vpn-cf-masque" / "vendor"
-        for name in ("masque-frontend", "masque-proto", "h3", "h3-quinn", "h3-datagram"):
+        # The CF frontend shares the maintained wire-format crate.
+        expected_manifests = {name: cf_vendor / name / "Cargo.toml" for name in ("masque-frontend", "h3", "h3-quinn", "h3-datagram")}
+        expected_manifests["masque-proto"] = vpn / "crates" / "masque-proto" / "Cargo.toml"
+        for name, expected_manifest in expected_manifests.items():
             selected = [package for package in packages if package["name"] == name]
-            expected_manifest = cf_vendor / name / "Cargo.toml"
             if len(selected) != 1 or selected[0]["source"] is not None or Path(selected[0]["manifest_path"]).resolve() != expected_manifest.resolve():
                 raise SystemExit(f"Current client transport patch was not selected: {name} ({expected_manifest})")
 
