@@ -7,6 +7,8 @@
 # - A running same-name service and existing/partial files are takeover/repair
 #   cases. The script prepares, stops, replaces, starts and enables the service;
 #   the operator must not have to disable it before running this installer.
+# - An unverified masque0 tunnel is deleted and rebuilt by the installer;
+#   unknown tunnel ownership is not a fatal case.
 # - Inspect TCP/443 and UDP/443 separately, even while this service is active.
 #   Process names alone do not prove ownership. Report every conflicting PID,
 #   executable and unit; never stop an external owner to make the port free.
@@ -452,26 +454,29 @@ check_ports() {
     WAS_ENABLE_STATE=${WAS_ENABLE_STATE:-disabled}
     if (( WAS_ACTIVE )) || [[ -e $BINARY || -L $BINARY || -e $UNIT_DIR/$SERVICE || -L $UNIT_DIR/$SERVICE || -d $STATE ]]; then HAD_DEPLOYMENT=1; fi
     check_port_owners allow-managed || die 'TCP/UDP 443 is not exclusively free or owned by this caddy-masque service.'
-    if ip link show masque0 >/dev/null 2>&1; then
-        check_tunnel_owners || die 'masque0 has a foreign or unverifiable process owner; its tunnel was not changed'
-    fi
     # Another MASQUE service can share the default tunnel name even when it
-    # listens elsewhere. Protect that actual resource conflict separately.
+    # listens elsewhere. Protect that actual resource conflict separately,
+    # before any unknown tunnel is removed.
     if systemctl is-active --quiet masque-server.service && ip link show masque0 >/dev/null 2>&1; then
         die 'masque0 is in use by masque-server.service; its tunnel was not deleted.'
     fi
+    if ip link show masque0 >/dev/null 2>&1; then
+        check_tunnel_owners || remove_unknown_tunnel
+    fi
     if (( ! WAS_ACTIVE )); then
         if ip link show masque0 >/dev/null 2>&1; then
-            (( HAD_DEPLOYMENT )) || die "masque0 belongs to an unknown deployment; it was not deleted"
+            (( HAD_DEPLOYMENT )) || remove_unknown_tunnel
         fi
     fi
     return 0
 }
 
-# A leftover config/binary does not authorize deleting another workload's live
-# tunnel, even when that workload listens on a different port. Linux publishes
-# TUN interface names in fdinfo; compare holders with this unit's actual cgroup.
-# An unheld interface can still be this deployment's persistent crash leftover.
+# Linux publishes TUN interface names in fdinfo; compare holders with this
+# unit's actual cgroup. An unheld interface can still be this deployment's
+# persistent crash leftover. masque0 is this installer's canonical tunnel
+# name: a tunnel whose owner cannot be verified as the managed service is
+# removed and rebuilt by the installer instead of aborting the installation.
+# A live masque-server.service holding masque0 is handled separately above.
 check_tunnel_owners() {
     local expected_group
     expected_group=$(systemctl show -p ControlGroup --value "$SERVICE" 2>/dev/null || true)
@@ -507,10 +512,15 @@ for directory in proc.iterdir():
     except (OSError, ValueError):
         conflicts.append('PID=' + directory.name + ': cannot verify TUN ownership')
 if conflicts:
-    print('masque0 ownership check failed; no foreign process was stopped:', file=sys.stderr)
+    print('masque0 ownership check failed:', file=sys.stderr)
     print('\n'.join('  ' + item for item in conflicts), file=sys.stderr)
     sys.exit(1)
 PY
+}
+
+remove_unknown_tunnel() {
+    say 'Removing unverified masque0 tunnel for rebuild'
+    ip link delete masque0 || die 'could not delete masque0'
 }
 
 check_pool() {
@@ -1196,7 +1206,7 @@ install_server() {
     # stopping the old service. An external owner may have appeared meanwhile.
     check_port_owners allow-managed || die 'Port 443 ownership changed; replacement was not started.'
     if ip link show masque0 >/dev/null 2>&1; then
-        check_tunnel_owners || die 'masque0 ownership changed; replacement was not started'
+        check_tunnel_owners || remove_unknown_tunnel
     fi
     # Capture the state at cutover, not before a long build. Preserve any
     # administrator start/stop/enable change made while compilation was running.
@@ -1227,7 +1237,7 @@ install_server() {
     # needed when ownership changed while the private backup was being copied.
     check_port_owners allow-managed || die 'Port 443 ownership changed during backup; replacement was not started.'
     if ip link show masque0 >/dev/null 2>&1; then
-        check_tunnel_owners || die 'masque0 ownership changed during backup; replacement was not started'
+        check_tunnel_owners || remove_unknown_tunnel
     fi
     INSTALLING=1
     # Preserve the old unit's stop behavior while it is still available. A
@@ -1246,9 +1256,7 @@ install_server() {
     systemctl stop "$SERVICE"
     check_port_owners require-free || die 'TCP/UDP 443 is still occupied after stopping the managed service.'
     if ip link show masque0 >/dev/null 2>&1; then
-        check_tunnel_owners || die 'masque0 still has a process owner after stopping this service'
-        (( HAD_DEPLOYMENT )) || die 'A tunnel with unknown ownership was not deleted.'
-        ip link delete masque0
+        remove_unknown_tunnel
     fi
     if nft list table inet caddy-masque >/dev/null 2>&1; then
         (( HAD_DEPLOYMENT )) || die 'A firewall table with unknown ownership was not deleted.'
