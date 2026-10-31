@@ -130,6 +130,35 @@ func connectIPRequest(r *http.Request) (request, bool) {
 	}
 }
 
+// classicConnect recognizes CONNECT without an upgrade token (RFC 9110
+// Section 9.3.6), as opposed to extended CONNECT for another protocol.
+func classicConnect(r *http.Request) bool {
+	if r.Method != http.MethodConnect {
+		return false
+	}
+	switch r.ProtoMajor {
+	case 3:
+		return r.Proto == "HTTP/3.0"
+	case 2:
+		return r.Header.Get(":protocol") == ""
+	default:
+		return true
+	}
+}
+
+// expectsContinue reports a 100-continue expectation (RFC 9110 Section
+// 10.1.1).
+func expectsContinue(r *http.Request) bool {
+	for _, v := range r.Header.Values("Expect") {
+		for _, e := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(e), "100-continue") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // carriesContent reports header fields for content, which RFC 9297 §3.2
 // forbids on messages that use the Capsule Protocol.
 func carriesContent(r *http.Request) bool {
@@ -160,6 +189,10 @@ func (h *Handler) reject(w http.ResponseWriter, r *http.Request, rej rejection) 
 	if rej.proxyError != "" {
 		w.Header().Set("Proxy-Status", "caddy-masque; error="+rej.proxyError)
 	}
+	if r.ProtoMajor < 2 && r.Method == http.MethodConnect {
+		// A CONNECT with "Upgrade: connect-ip" (RFC 9931 Section 8).
+		w.Header().Set("Connection", "close")
+	}
 	w.WriteHeader(rej.status)
 	if rej.malformed && r.ProtoMajor == 2 {
 		// Flush the optional 400 before the mandatory stream error.
@@ -186,6 +219,22 @@ func serveRefusal(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler
 	if r.ProtoMajor < 2 {
 		return next.ServeHTTP(w, r)
 	}
+	return serveWithoutSuccess(w, r, next)
+}
+
+// refuseConnect answers a classic CONNECT request, which this module never
+// serves, as serveRefusal does for every HTTP version: any 2xx response
+// would announce a tunnel (RFC 9110 Section 9.3.6). An HTTP/1.x connection
+// then closes, so no further request is read from it (RFC 9112 as updated
+// by RFC 9931 Section 8).
+func refuseConnect(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if r.ProtoMajor < 2 {
+		w.Header().Set("Connection", "close")
+	}
+	return serveWithoutSuccess(w, r, next)
+}
+
+func serveWithoutSuccess(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	rw := &refusalResponseWriter{ResponseWriter: w}
 	err := next.ServeHTTP(rw, r)
 	if !rw.wroteHeader {
@@ -246,6 +295,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	h.advertiseHTTP3(w, r)
 	req, ok := connectIPRequest(r)
 	if !ok {
+		if classicConnect(r) {
+			return refuseConnect(w, r, next)
+		}
 		return next.ServeHTTP(w, r)
 	}
 	// These requirements apply even when the proxy will refuse the
@@ -464,6 +516,10 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request, ha
 		}
 		_ = conn.SetDeadline(time.Time{})
 		h.tuneConn(conn)
+		if expectsContinue(r) {
+			// RFC 9110 Section 7.8: 100 (Continue) before 101.
+			_, _ = brw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
+		}
 		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\nCapsule-Protocol: ?1\r\n\r\n")
 		if err := brw.Flush(); err != nil {
 			conn.Close()

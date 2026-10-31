@@ -149,7 +149,7 @@ vpn.example.com, :443 {
 ```
 
 The `masque` directive in the site takes the VPN requests; other requests continue to the site (here, `file_server`).
-Refused extended CONNECT uses a non-2xx status even when the site would normally return 200. It is ordered automatically before `file_server`, `reverse_proxy` and the like.
+Refused extended CONNECT and classic CONNECT, which the module never serves, use a non-2xx status even when the site would normally return 200; over HTTP/1.x the connection then closes (RFC 9931 Section 8). It is ordered automatically before `file_server`, `reverse_proxy` and the like.
 
 ### Global option `masque { ... }`
 
