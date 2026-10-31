@@ -31,6 +31,14 @@
 #   client exports through a unique temporary file; a fixed .new directory can
 #   make install/mv publish a directory instead of the promised client file.
 # - Respect the process's cgroup memory ancestry, not just the cgroup mount root.
+# - Wait (bounded) for the dpkg lock: boot-time apt jobs otherwise fail apt-get.
+# - Recheck 443 immediately before startup as well as before the stop; never
+#   let a local HTTPS check succeed against a program that bound it meanwhile.
+# - Ask for the token right after the domain, before packages and the build;
+#   the operator must not wait through compilation for the second prompt.
+# - Take over a manually started caddy-masque only on positive evidence: the
+#   /proc exe (also when deleted) and exact `run --config` with this Caddyfile.
+#   File rollback restarts the old unit, not a terminated manual command.
 # Interactive native-architecture Caddy MASQUE setup with Cloudflare DNS-01.
 # Run from an authenticated, complete checkout:
 #   sudo bash setup-interactive-caddy-masque-autoarch-cloudflare-dns.sh
@@ -327,8 +335,11 @@ collect_settings() {
 
 install_packages() {
     say "Installing build and network dependencies"
-    DEBIAN_FRONTEND=noninteractive apt-get update -q </dev/null
-    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -q --no-install-recommends \
+    # A fresh VPS often runs apt-daily/unattended-upgrades at boot. apt-get's
+    # default lock timeout is zero, so wait (bounded) instead of failing.
+    local -a apt=(apt-get -o DPkg::Lock::Timeout=1800 -o Acquire::Retries=3)
+    DEBIAN_FRONTEND=noninteractive "${apt[@]}" update -q </dev/null
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "${apt[@]}" install -y -q --no-install-recommends \
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold curl ca-certificates nftables iproute2 dnsutils jq \
         python3 util-linux </dev/null
 }
@@ -351,6 +362,64 @@ check_service_identity() {
     fi
 }
 
+# A manually started old server may hold 443/masque0 outside any unit. comm
+# names are truncated, so identify it by the actual executable (including an
+# unlinked old copy of BINARY) and exact Cobra argv: `run` with exactly one
+# --config naming the managed Caddyfile. Repeated/ambiguous options, --resume
+# or another config are not ownership evidence. Generic Caddy is never matched.
+is_standalone_server() {
+    local pid=$1 executable argument index configurations=0 selected=
+    local -a arguments=()
+    [[ $pid =~ ^[1-9][0-9]*$ && $pid != 1 && $pid != "$$" && $pid != "$BASHPID" ]] || return 1
+    executable=$(readlink -- "/proc/$pid/exe" 2>/dev/null) || return 1
+    [[ ${executable% (deleted)} == "$BINARY" ]] || return 1
+    {
+        while IFS= read -r -d '' argument; do arguments+=("$argument"); done <"/proc/$pid/cmdline"
+    } 2>/dev/null || return 1
+    [[ ${arguments[1]:-} == run ]] || return 1
+    for ((index=2; index<${#arguments[@]}; index++)); do
+        case ${arguments[index]} in
+            --resume|--resume=*|--|-r|-r=*) return 1 ;;
+            --config=*) configurations=$((configurations + 1)); selected=${arguments[index]#--config=} ;;
+            --config|-c)
+                index=$((index + 1))
+                (( index < ${#arguments[@]} )) || return 1
+                configurations=$((configurations + 1)); selected=${arguments[index]} ;;
+            --adapter|--envfile|--pidfile|--pingback|-a)
+                index=$((index + 1)); (( index < ${#arguments[@]} )) || return 1 ;;
+            --adapter=*|--envfile=*|--pidfile=*|--pingback=*|--environ|--environ=*|--watch|--watch=*|-e|-w) ;;
+            *) return 1 ;;
+        esac
+    done
+    [[ $configurations == 1 && $selected == "$CONFIG" ]]
+}
+
+standalone_servers() {
+    local directory
+    for directory in /proc/[0-9]*; do
+        if is_standalone_server "${directory##*/}"; then printf '%s\n' "${directory##*/}"; fi
+    done
+}
+
+# TERM, then KILL after a bounded grace; identity is rechecked before every
+# signal so a reused numeric PID is never signalled. PID 1 stops unit members.
+stop_standalone_servers() {
+    local attempt pid signal=TERM
+    for ((attempt=0; attempt<15; attempt++)); do
+        [[ -n $(standalone_servers) ]] || return 0
+        if (( attempt == 0 || attempt == 10 )); then
+            (( attempt == 0 )) || signal=KILL
+            while IFS= read -r pid; do
+                if is_standalone_server "$pid" && kill -s "$signal" -- "$pid" 2>/dev/null; then
+                    printf 'Sent %s to manually started previous caddy-masque process %s.\n' "$signal" "$pid"
+                fi
+            done < <(standalone_servers)
+        fi
+        sleep 1
+    done
+    die 'a manually started previous caddy-masque process did not exit'
+}
+
 check_port_owners() {
     local mode=${1:-allow-managed} expected_group tcp_status=0 udp_status=0
     check_service_identity || return 1
@@ -359,11 +428,13 @@ check_port_owners() {
     # sockets bound to 443, which a listener-only UDP query would omit.
     ss -H -O -ltnp 'sport = :443' >"$BUILD_DIR/port-tcp" 2>"$BUILD_DIR/port-tcp-error" || tcp_status=$?
     ss -H -O -uanp 'sport = :443' >"$BUILD_DIR/port-udp" 2>"$BUILD_DIR/port-udp-error" || udp_status=$?
-    python3 - "$SERVICE" "$expected_group" "$mode" "$BUILD_DIR" "$tcp_status" "$udp_status" <<'PY'
+    python3 - "$SERVICE" "$expected_group" "$mode" "$BUILD_DIR" "$tcp_status" "$udp_status" \
+        "$(standalone_servers | paste -sd, -)" <<'PY'
 import json, os, re, sys
 from pathlib import Path
 
-service, expected, mode, directory, tcp_status, udp_status = sys.argv[1:]
+service, expected, mode, directory, tcp_status, udp_status, standalone = sys.argv[1:]
+standalone = {int(pid) for pid in standalone.split(',') if pid}
 directory = Path(directory)
 proc = Path('/proc')
 expected = expected.rstrip('/')
@@ -399,6 +470,8 @@ def owner(pid):
     units = [part for part in group.split('/') if part.endswith(('.service', '.scope', '.socket'))]
     unit = units[-1] if units else '(unavailable)'
     ours = managed_group and (group == expected or group.startswith(expected + '/'))
+    # A positively identified manual instance is a takeover target too.
+    ours = ours or pid in standalone
     return pid, name, executable, unit, group, ours
 
 if mode not in ('allow-managed', 'require-free'):
@@ -475,13 +548,14 @@ check_ports() {
 check_tunnel_owners() {
     local expected_group
     expected_group=$(systemctl show -p ControlGroup --value "$SERVICE" 2>/dev/null || true)
-    python3 - "$expected_group" <<'PY'
+    python3 - "$expected_group" "$(standalone_servers | paste -sd, -)" <<'PY'
 import json, os, pathlib, sys
 proc = pathlib.Path('/proc')
 expected = sys.argv[1].rstrip('/')
+standalone = {pid for pid in sys.argv[2].split(',') if pid}
 conflicts = []
 for directory in proc.iterdir():
-    if not directory.name.isascii() or not directory.name.isdecimal():
+    if not directory.name.isascii() or not directory.name.isdecimal() or directory.name in standalone:
         continue
     try:
         for entry in (directory / 'fdinfo').iterdir():
@@ -681,7 +755,7 @@ check_build_replacement() {
 
 stage_token() {
     local token=${CF_API_TOKEN:-}
-    say "Configuring Caddy Cloudflare DNS-01 issuance and renewal"
+    say "Cloudflare DNS-01 token (Caddy issues and renews certificates after startup)"
     if [[ -n $token ]]; then
         : # The shell-local inherited token skips the only token prompt.
     elif [[ -d $STATE && ! -L $STATE && -f $TOKEN_FILE && ! -L $TOKEN_FILE ]]; then
@@ -1236,6 +1310,7 @@ install_server() {
     if systemctl is-active --quiet "$SERVICE"; then
         check_service_identity || die 'the service name changed before the old daemon could be stopped'
         systemctl stop "$SERVICE"
+        stop_standalone_servers
         check_port_owners require-free || die 'TCP/UDP 443 was not released by the old service'
     fi
     # The canonical unit replaces a local mask/malformed unit before PID 1 is
@@ -1244,6 +1319,7 @@ install_server() {
     replace_file "$BUILD_DIR/$SERVICE" "$UNIT_DIR/$SERVICE" 0644 root root
     systemctl daemon-reload
     systemctl stop "$SERVICE"
+    stop_standalone_servers
     check_port_owners require-free || die 'TCP/UDP 443 is still occupied after stopping the managed service.'
     if ip link show masque0 >/dev/null 2>&1; then
         check_tunnel_owners || die 'masque0 still has a process owner after stopping this service'
@@ -1288,6 +1364,9 @@ install_server() {
     replace_file "$BUILD_DIR/modules.conf" /etc/modules-load.d/caddy-masque.conf 0644 root root
     systemctl daemon-reload
     if systemctl is-failed --quiet "$SERVICE"; then systemctl reset-failed "$SERVICE"; fi
+    # Another program may bind the released port while accounts/files change.
+    # Report it before startup; a local HTTPS check could otherwise reach it.
+    check_port_owners require-free || die 'TCP/UDP 443 became occupied before startup; no external owner was stopped.'
     if ! systemctl restart "$SERVICE"; then
         check_port_owners require-free || true
         die 'caddy-masque failed to start; inspect the port-owner report and service journal.'
@@ -1361,11 +1440,15 @@ cleanup() {
         fi
         [[ $(systemctl is-enabled "$SERVICE" 2>/dev/null || true) == "$WAS_ENABLE_STATE" ]] || rollback_failed=1
         printf 'Packages and Caddy certificate state are retained for retry.\n' >&2
+        # File rollback does not reverse these effects; the old service, when
+        # restarted, recreates its own tunnel and nftables table.
+        printf 'Service-account repairs, the removed masque0/nftables state and package changes are outside file rollback.\n' >&2
     fi
     cleanup_swap
     [[ -z $GO_STAGE ]] || rm -rf -- "$GO_STAGE"
     if (( rollback_failed )); then
         printf 'Automatic recovery was incomplete. Private backups remain in %s/backup.\n' "$BUILD_DIR" >&2
+        printf 'Copy them to persistent root-only storage: systemd-tmpfiles ages old /var/tmp entries.\n' >&2
     else
         [[ -z $BUILD_DIR ]] || rm -rf -- "$BUILD_DIR"
     fi
@@ -1400,6 +1483,9 @@ main() {
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    # Both answers are collected before packages and the long build, so the
+    # rest of the run is unattended. The token is staged privately here.
+    stage_token
     # Reject known conflicts before package work when the inspection tools are
     # already installed. A fresh host first obtains those required tools.
     if command -v ss >/dev/null && command -v python3 >/dev/null; then
@@ -1412,7 +1498,6 @@ main() {
     collect_pool
     configure_firewall
     build_server
-    stage_token
     stage_config
     stage_service
     stage_client_config
