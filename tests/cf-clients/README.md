@@ -9,10 +9,11 @@ python3 tests/run-cf-client-interop.py --masque-vpn-root ../masque-vpn
 
 This is a separate temporary Cargo workspace. The server-owned lockfile was
 seeded from the CF workspace at client revision
-`e10a6ec9fcf0e005d36572830539802df36f6638`. Builds use `cargo build --locked`.
-Cargo metadata must select that checkout's CF-local `masque-frontend`,
-`masque-proto`, `h3`, `h3-quinn`, and `h3-datagram` snapshots, and every selected
-registry package/version must appear in the upstream CF lockfile. The main
+`02ff38c2f0206863f895f609f2b9bf8f6bbec549`. Builds use `cargo build --locked`.
+Cargo metadata must select that checkout's CF-local `masque-frontend`, `h3`,
+`h3-quinn`, and `h3-datagram` snapshots and the shared `crates/masque-proto`
+wire-format crate the CF frontend depends on, and every selected registry
+package/version must appear in the upstream CF lockfile. The main
 client's H3 patches are not substituted. When upstream dependencies change,
 review and refresh only this server-owned harness lockfile. The client checkout
 is read-only throughout the run. `CARGO_TARGET_DIR` selects an optional build
