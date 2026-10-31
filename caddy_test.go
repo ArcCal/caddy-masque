@@ -554,13 +554,19 @@ func TestCaddyRefusalsUseSiteBodyWithoutTunnelSuccess(t *testing.T) {
 			{"/.well-known/masque/ip/name.invalid/*/", http.StatusBadGateway, noError},
 		} {
 			got := tr.dial(e, t, testPassword, c.path)
-			if got.status != c.status {
+			// A resolver that times out gives 504 instead (RFC 9209 Section 2.3).
+			dnsTimeout := c.status == http.StatusBadGateway && got.status == http.StatusGatewayTimeout
+			if got.status != c.status && !dnsTimeout {
 				t.Errorf("%s %s: %d, want %d", tr.name, c.path, got.status, c.status)
 			}
 			if tr.name == "HTTP/3" && got.stopSending != c.stop {
 				t.Errorf("HTTP/3 %s: STOP_SENDING %#x, want %#x", c.path, got.stopSending, c.stop)
 			}
-			if c.status == http.StatusBadGateway && !strings.Contains(got.header.Get("Proxy-Status"), "error=dns_") {
+			want := "error=dns_error"
+			if dnsTimeout {
+				want = "error=dns_timeout"
+			}
+			if c.status == http.StatusBadGateway && !strings.Contains(got.header.Get("Proxy-Status"), want) {
 				t.Errorf("%s: Proxy-Status %q", tr.name, got.header.Get("Proxy-Status"))
 			}
 		}

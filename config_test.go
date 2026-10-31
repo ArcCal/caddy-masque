@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -326,8 +327,18 @@ func TestResolveScope(t *testing.T) {
 	if _, rej = parse("*", "0"); rej == nil || rej.status != http.StatusBadRequest {
 		t.Errorf("hop-by-hop options as ipproto: %+v", rej)
 	}
-	if _, rej = parse("does-not-exist.invalid", "*"); rej == nil || rej.status != http.StatusBadGateway || rej.proxyError == "" {
+	// RFC 9209 Section 2.3: 502 for dns_error, 504 for dns_timeout.
+	_, rej = parse("does-not-exist.invalid", "*")
+	if rej == nil || !(rej.status == http.StatusBadGateway && rej.proxyError == "dns_error" ||
+		rej.status == http.StatusGatewayTimeout && rej.proxyError == "dns_timeout") {
 		t.Errorf("unresolvable name: %+v", rej)
+	}
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	tg, _ := proto.ParseTarget("does-not-exist.invalid")
+	if _, rej = h.resolveScope(expired, tg, proto.IPProtocol{Any: true}); rej == nil ||
+		rej.status != http.StatusGatewayTimeout || rej.proxyError != "dns_timeout" {
+		t.Errorf("name not resolved in time: %+v", rej)
 	}
 	if sc, rej = parse("localhost", "*"); rej == nil || rej.status != http.StatusForbidden {
 		// localhost resolves to loopback addresses, which are blocked.

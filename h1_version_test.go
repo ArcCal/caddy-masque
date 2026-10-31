@@ -59,37 +59,51 @@ func TestCaddyHTTP10IgnoresUpgrade(t *testing.T) {
 
 // RFC 9110 Section 7.8: a server that receives Upgrade with a 100-continue
 // expectation must send 100 (Continue) before 101 (Switching Protocols).
+// Like masque-vpn, whose HTTP library cannot send it, the authenticated
+// request gets 417 instead, and the client may repeat it without the
+// expectation (Section 10.1.1). Others still get the site.
 func TestCaddyUpgradeWithExpectContinue(t *testing.T) {
 	e := newCaddyEnv(t)
 	if err := e.load(masqueConfig("alice")); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	conn, err := e.dialTCP(ctx, e.tlsConfig("http/1.1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: vpn.test:%d\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\n"+
-		"Capsule-Protocol: ?1\r\nExpect: 100-Continue\r\nAuthorization: %s\r\n\r\n", anyTarget, e.port, authorization(testPassword)); err != nil {
-		t.Fatal(err)
-	}
-	br := bufio.NewReader(conn)
-	for _, want := range []int{http.StatusContinue, http.StatusSwitchingProtocols} {
-		resp, err := http.ReadResponse(br, nil)
+	for _, tc := range []struct {
+		password string
+		status   int
+		body     string
+	}{
+		{testPassword, http.StatusExpectationFailed, ""},
+		{"wrong password!!", http.StatusOK, "cover page"},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		conn, err := e.dialTCP(ctx, e.tlsConfig("http/1.1"))
+		cancel()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if resp.StatusCode != want {
-			t.Fatalf("status %d, want %d", resp.StatusCode, want)
+		if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: vpn.test:%d\r\nConnection: Upgrade\r\nUpgrade: connect-ip\r\n"+
+			"Capsule-Protocol: ?1\r\nExpect: 100-Continue\r\nAuthorization: %s\r\n\r\n", anyTarget, e.port, authorization(tc.password)); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		conn.Close()
+		if resp.StatusCode != tc.status || string(body) != tc.body || resp.Header.Get("Upgrade") != "" {
+			t.Errorf("status %d body %q Upgrade %q, want %d %q and no Upgrade",
+				resp.StatusCode, body, resp.Header.Get("Upgrade"), tc.status, tc.body)
 		}
 	}
-	c := &tunnelClient{status: http.StatusSwitchingProtocols, close: func() { conn.Close() }}
-	streamClient(c, br, conn)
+	waitNoSessions(t)
+	c := e.dialH1(t, testPassword, anyTarget)
+	if c.status != http.StatusSwitchingProtocols {
+		t.Fatalf("without the expectation: status %d", c.status)
+	}
 	opening(t, c)
 	c.close()
 	waitNoSessions(t)
