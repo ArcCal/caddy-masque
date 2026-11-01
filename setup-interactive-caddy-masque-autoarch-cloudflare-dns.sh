@@ -1454,6 +1454,9 @@ cleanup() {
     local result=$? path backup index=0 state_uid state_gid state_mode rollback_failed=0
     trap - EXIT
     set +e
+    # A second Ctrl+C or TERM would otherwise run 'exit 130/143' mid-rollback,
+    # leaving files half-restored and the old service stopped; ignore them.
+    trap '' INT TERM HUP
     if [[ -n $INSTALLING && $result != 0 ]]; then
         printf '\nInstallation failed; restoring the previous managed files and service.\n' >&2
         if [[ $(systemctl show -p Id --value "$SERVICE" 2>/dev/null || true) == "$SERVICE" ]]; then
