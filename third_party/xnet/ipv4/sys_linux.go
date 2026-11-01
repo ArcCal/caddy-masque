@@ -13,7 +13,7 @@ import (
 
 var (
 	ctlOpts = [ctlMax]ctlOpt{
-		ctlTTL:        {unix.IP_TTL, 1, marshalTTL, parseTTL},
+		ctlTTL:        {unix.IP_TTL, 4, marshalTTL, parseTTL},
 		ctlPacketInfo: {unix.IP_PKTINFO, sizeofInetPktinfo, marshalPacketInfo, parsePacketInfo},
 	}
 

@@ -6,7 +6,7 @@ import tempfile
 from fork_verification import apply_patch, apply_fixture_patches, compare_tree, download_verified_module, prepare_upstream, summarize_notices
 
 root = Path(__file__).resolve().parents[1]
-version = "v0.60.0"
+version = "v0.62.0"
 if f"golang.org/x/net {version}" not in (root / "go.mod").read_text():
     raise SystemExit("Update the pinned HTTP/2 fork when updating x/net")
 module = download_verified_module(root, "golang.org/x/net", version)
@@ -17,4 +17,4 @@ with tempfile.TemporaryDirectory(prefix="masque-http2-") as temp:
     apply_patch(upstream, root / "third_party/http2-conformance.patch")
     apply_fixture_patches(upstream, root / "third_party/fixture-patches.json")
     compare_tree(upstream, root / "third_party/xnet", "HTTP/2")
-print("HTTP/2 fork matches verified upstream v0.60.0 plus documented protocol and fixture patches; " + summarize_notices(notices))
+print("HTTP/2 fork matches verified upstream v0.62.0 plus documented protocol and fixture patches; " + summarize_notices(notices))

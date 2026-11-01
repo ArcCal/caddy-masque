@@ -194,8 +194,8 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     version = re.search(r"^\s*(?:require\s+)?golang\.org/x/net\s+(\S+)", (root / "go.mod").read_text(), re.MULTILINE)
-    if not version or version.group(1) != "v0.60.0":
-        raise SystemExit("Security fixture baseline requires the verified x/net v0.60.0 fork; review this gate with future upgrades")
+    if not version or version.group(1) != "v0.62.0":
+        raise SystemExit("Security fixture baseline requires the verified x/net v0.62.0 fork; review this gate with future upgrades")
 
     # This binds the complete fork, including every upstream fixture, to the
     # checksum-verified security release plus the documented MASQUE patch.

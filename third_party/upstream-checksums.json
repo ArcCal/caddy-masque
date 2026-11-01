@@ -8,6 +8,6 @@
     "sum.golang.org when recorded.",
     "Update an entry only together with the fork it pins and its patches."
   ],
-  "golang.org/x/net v0.60.0": "h1:79p50tfZlm0J9YfoDsSi639qSXNGVwEzOPLCxM2FsYU=",
+  "golang.org/x/net v0.62.0": "h1:18ELalfM5+XNRwzM2nYqXsZQ9ByS1uhj2O/U7+5jqRY=",
   "github.com/quic-go/quic-go v0.63.0": "h1:LIFGHI4PFUhhw2dDD1ARHdCff143ffMHwZtbnbuJ78A="
 }

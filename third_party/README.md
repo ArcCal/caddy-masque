@@ -2,7 +2,7 @@
 
 ## HTTP/2 stream reset
 
-`xnet` is the pinned `golang.org/x/net v0.60.0` source. It adds an explicit
+`xnet` is the pinned `golang.org/x/net v0.62.0` source. It adds an explicit
 stream reset API to `http2.ResponseWriter`; `http2/reset.go` unwraps middleware.
 `http2-reset.patch` records the protocol and build-selection changes.
 Verification checks the pinned upstream checksum, reconstructs the documented
@@ -17,12 +17,17 @@ and the verification scripts read their pinned `h1:` value here instead. The
 values are Go's dirhash sums as published by the checksum database. Change an
 entry only together with the fork it pins and that fork's patches.
 
-The v0.60.0 baseline includes the upstream HTTP/2 security fixes for trailer
+The v0.62.0 baseline includes the upstream HTTP/2 security fixes for trailer
 allocation limits (GO-2026-6603), response-header normalization
 (GO-2026-6610), lazy flow-window accounting (GO-2026-6611), closed-stream
 receive-credit accounting (GO-2026-6612), and synchronized HPACK table-size
 updates (GO-2026-6617). These fixes and their upstream regression tests
 are retained; the MASQUE reset API adds no independent credit refund.
+
+The v0.62.0 baseline also fixes quadratic HTML text-node coalescing
+(GO-2026-6860) and nested foreign-namespace HTML rendering
+(GO-2026-6866). Both upstream regression tests are retained. The HTTP/2
+reset and conformance patches and fixture records are unchanged.
 
 The fork selects that server and transport on both Go 1.26 and Go 1.27.
 The upstream Go 1.27 wrappers delegate to `net/http`, which does not expose
