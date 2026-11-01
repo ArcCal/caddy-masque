@@ -40,4 +40,3 @@ specifications, no known performance or security issues, and no regressions.
 - Test changes before committing. Commit only after the tests appropriate to
   the change pass and no new issues are found.
 - Failed, skipped, unavailable or interrupted tests do not count as passes.
-  Do not commit changes whose required validation is incomplete.
