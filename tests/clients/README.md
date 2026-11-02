@@ -12,7 +12,7 @@ lockfile, and builds with `cargo build --locked`. It honors `CARGO_TARGET_DIR` f
 a shared cache. Its top-level Cargo patches select the current client's vendored
 `h3` and `h3-quinn`; locked Cargo metadata must confirm both paths before building.
 The lockfile was refreshed against client commit
-`e10a6ec9fcf0e005d36572830539802df36f6638`. When client dependencies change, review
+`dadfefd3dba056436a19d396999685f5622b23c0`. When client dependencies change, review
 and refresh this harness lockfile without modifying the client repository.
 `--release` selects an optimized Rust build; the default uses the
 debug profile. Go runs the test through an overlay so normal `go test ./...` does
