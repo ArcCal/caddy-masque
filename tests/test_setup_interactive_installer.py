@@ -152,5 +152,35 @@ if os.geteuid() == 0:
             server.kill()
             server.wait()
         print('PASS: identified instances (also with a replaced binary) are takeover targets in the real port check')
+
+    # A second Ctrl+C/TERM while cleanup() restores files must not run the
+    # main 'exit 143' trap and abandon the rollback halfway. systemctl is a
+    # mock whose stop blocks briefly, so the signals arrive mid-rollback.
+    with tempfile.TemporaryDirectory() as directory:
+        base = Path(directory)
+        build, log, managed = base / 'build', base / 'log', base / 'managed'
+        (build / 'backup').mkdir(parents=True)
+        (build / 'backup' / 'entry-1').write_text('previous\n')
+        managed.write_text('candidate\n')
+        command = ('init_paths; BUILD_DIR="$1"; LOG="$2"; MANAGED="$3"; INSTALLING=1; WAS_ACTIVE=0; '
+                   'WAS_ENABLE_STATE=disabled; transaction_paths() { printf "%s\\n" "$MANAGED"; }; '
+                   'service_override_paths() { :; }; '
+                   'systemctl() { case $1 in show) echo caddy-masque.service ;; '
+                   'stop) echo stopping >>"$LOG"; sleep 1 ;; is-enabled) echo disabled ;; '
+                   'is-active) return 3 ;; daemon-reload) echo reloaded >>"$LOG" ;; esac; }; '
+                   'trap cleanup EXIT; trap "exit 130" INT; trap "exit 143" TERM; exit 1')
+        process = subprocess.Popen(['bash', '-c', 'source "$1"; shift; ' + command, 'test', str(SCRIPT),
+                                    str(build), str(log), str(managed)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 10
+        while 'stopping' not in (log.read_text() if log.exists() else '') and time.monotonic() < deadline:
+            time.sleep(0.05)
+        process.send_signal(15)
+        time.sleep(0.2)
+        process.send_signal(15)
+        output, errors = process.communicate(timeout=30)
+        assert 'reloaded' in log.read_text(), 'a second signal aborted the rollback: ' + output + errors
+        assert managed.read_text() == 'previous\n' and process.returncode == 1, (process.returncode, errors)
+    print('PASS: repeated INT/TERM signals cannot abort an in-progress rollback')
 else:
     raise SystemExit('these process and port checks require root in a disposable environment')
