@@ -2,6 +2,8 @@ module github.com/ArcCal/caddy-masque
 
 go 1.26.0
 
+toolchain go1.26.10
+
 // The pinned fork adds an explicit HTTP/2 stream reset API for RFC 9113.
 replace golang.org/x/net => ./third_party/xnet
 
