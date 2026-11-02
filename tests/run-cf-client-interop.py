@@ -36,8 +36,11 @@ def main():
     repo = Path(__file__).resolve().parents[1]
     assets = repo / "tests" / "cf-clients"
     vpn = (args.masque_vpn_root or repo.parent / "masque-vpn").resolve()
+    cf = vpn / "masque-vpn-cf-masque"
     paths = {
-        "__CF_FRONTEND_PATH__": vpn / "masque-vpn-cf-masque" / "vendor" / "masque-frontend",
+        "__CF_FRONTEND_PATH__": cf / "crates" / "frontend",
+        "__CF_H3_PATH__": cf / "vendor" / "h3",
+        "__CF_H3_QUINN_PATH__": cf / "vendor" / "h3-quinn",
     }
     for dependency in paths.values():
         if not (dependency / "Cargo.toml").is_file():
@@ -56,8 +59,18 @@ def main():
         for marker, dependency in paths.items():
             template = template.replace(marker, json.dumps(str(dependency)))
         (workspace / "Cargo.toml").write_text(template, encoding="utf-8")
-        shutil.copyfile(assets / "Cargo.lock", workspace / "Cargo.lock")
+        # Seed from the CF workspace's own lockfile; adding this harness package
+        # needs one resolution, and the drift check below rejects any version
+        # that the CF lockfile does not already contain.
+        shutil.copyfile(cf / "Cargo.lock", workspace / "Cargo.lock")
         shutil.copyfile(assets / "main.rs", workspace / "src" / "main.rs")
+        seeded = subprocess.run(
+            ["cargo", "metadata", "--format-version=1", "--manifest-path", str(workspace / "Cargo.toml")],
+            cwd=workspace, env=environment, capture_output=True, text=True,
+        )
+        if seeded.returncode:
+            sys.stderr.write(seeded.stderr)
+            return seeded.returncode
         metadata = subprocess.run(
             ["cargo", "metadata", "--locked", "--format-version=1", "--manifest-path", str(workspace / "Cargo.toml")],
             cwd=workspace, env=environment, capture_output=True, text=True,
@@ -68,7 +81,7 @@ def main():
         packages = json.loads(metadata.stdout)["packages"]
         # Preserve the registry dependency versions of the upstream CF snapshot,
         # as well as its distinct local protocol/transport forks.
-        upstream_lock = tomllib.loads((vpn / "masque-vpn-cf-masque" / "Cargo.lock").read_text(encoding="utf-8"))
+        upstream_lock = tomllib.loads((cf / "Cargo.lock").read_text(encoding="utf-8"))
         upstream_versions = {(package["name"], package["version"], package.get("source"))
                              for package in upstream_lock["package"]}
         drift = [(package["name"], package["version"]) for package in packages
@@ -76,12 +89,16 @@ def main():
                  (package["name"], package["version"], package["source"]) not in upstream_versions]
         if drift:
             raise SystemExit(f"Harness dependencies differ from the current CF lockfile; review/refresh the server-owned lock: {drift}")
-        # These are distinct source snapshots from the main client. Do not
-        # replace them with the main workspace's transport patches.
-        cf_vendor = vpn / "masque-vpn-cf-masque" / "vendor"
-        # The CF frontend shares the maintained wire-format crate.
-        expected_manifests = {name: cf_vendor / name / "Cargo.toml" for name in ("masque-frontend", "h3", "h3-quinn", "h3-datagram")}
-        expected_manifests["masque-proto"] = vpn / "crates" / "masque-proto" / "Cargo.toml"
+        # The CF workspace's own HTTP/3 snapshots, not the main workspace's
+        # transport patches; the frontend reuses the parent client library and
+        # wire-format crate. h3-datagram is the git revision in the CF lockfile.
+        expected_manifests = {
+            "masque-frontend": cf / "crates" / "frontend" / "Cargo.toml",
+            "h3": cf / "vendor" / "h3" / "Cargo.toml",
+            "h3-quinn": cf / "vendor" / "h3-quinn" / "Cargo.toml",
+            "masque-vpn": vpn / "crates" / "masque-vpn" / "Cargo.toml",
+            "masque-proto": vpn / "crates" / "masque-proto" / "Cargo.toml",
+        }
         for name, expected_manifest in expected_manifests.items():
             selected = [package for package in packages if package["name"] == name]
             if len(selected) != 1 or selected[0]["source"] is not None or Path(selected[0]["manifest_path"]).resolve() != expected_manifest.resolve():

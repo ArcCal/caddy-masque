@@ -17,3 +17,9 @@ tracing-subscriber = "0.3"
 [profile.dev]
 debug = 0
 incremental = false
+
+# Cargo only applies patches declared by the top-level workspace. Use the CF
+# workspace's own HTTP/3 snapshots, as its Cargo.toml does.
+[patch."https://github.com/hyperium/h3"]
+h3 = { path = __CF_H3_PATH__ }
+h3-quinn = { path = __CF_H3_QUINN_PATH__ }

@@ -7,16 +7,16 @@ Run the unchanged generic client library retained inside the current
 python3 tests/run-cf-client-interop.py --masque-vpn-root ../masque-vpn
 ```
 
-This is a separate temporary Cargo workspace. The server-owned lockfile was
-seeded from the CF workspace at client revision
-`02ff38c2f0206863f895f609f2b9bf8f6bbec549`. Builds use `cargo build --locked`.
-Cargo metadata must select that checkout's CF-local `masque-frontend`, `h3`,
-`h3-quinn`, and `h3-datagram` snapshots and the shared `crates/masque-proto`
-wire-format crate the CF frontend depends on, and every selected registry
-package/version must appear in the upstream CF lockfile. The main
-client's H3 patches are not substituted. When upstream dependencies change,
-review and refresh only this server-owned harness lockfile. The client checkout
-is read-only throughout the run. `CARGO_TARGET_DIR` selects an optional build
+This is a separate temporary Cargo workspace. Its lockfile is seeded from the
+current CF workspace's `Cargo.lock` on every run; builds then use
+`cargo build --locked`, and every selected registry or git package/version must
+appear in that CF lockfile. Cargo metadata must select the CF frontend crate
+(`masque-vpn-cf-masque/crates/frontend`, package `masque-frontend`), the CF
+workspace's own `vendor/h3` and `vendor/h3-quinn` snapshots (patched in as the CF
+workspace patches them), and the parent `crates/masque-vpn` client library and
+`crates/masque-proto` wire-format crate that the frontend reuses. The main
+client's H3 patches are not substituted. The client checkout is read-only
+throughout the run. `CARGO_TARGET_DIR` selects an optional build
 cache; `--release` selects optimized builds. `--compile-only` checks compilation
 and the Go overlay while running zero interoperability cases.
 
