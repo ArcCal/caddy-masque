@@ -41,6 +41,7 @@ def main():
         "__CF_FRONTEND_PATH__": cf / "crates" / "frontend",
         "__CF_H3_PATH__": cf / "vendor" / "h3",
         "__CF_H3_QUINN_PATH__": cf / "vendor" / "h3-quinn",
+        "__CF_SMOLTCP_PATH__": vpn / "vendor" / "smoltcp",
     }
     for dependency in paths.values():
         if not (dependency / "Cargo.toml").is_file():
@@ -98,6 +99,7 @@ def main():
             "h3-quinn": cf / "vendor" / "h3-quinn" / "Cargo.toml",
             "masque-vpn": vpn / "crates" / "masque-vpn" / "Cargo.toml",
             "masque-proto": vpn / "crates" / "masque-proto" / "Cargo.toml",
+            "smoltcp": vpn / "vendor" / "smoltcp" / "Cargo.toml",
         }
         for name, expected_manifest in expected_manifests.items():
             selected = [package for package in packages if package["name"] == name]

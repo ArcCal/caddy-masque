@@ -23,3 +23,7 @@ incremental = false
 [patch."https://github.com/hyperium/h3"]
 h3 = { path = __CF_H3_PATH__ }
 h3-quinn = { path = __CF_H3_QUINN_PATH__ }
+
+# The parent's patched smoltcp, as the CF workspace patches it.
+[patch.crates-io]
+smoltcp = { path = __CF_SMOLTCP_PATH__ }

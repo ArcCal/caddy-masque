@@ -98,6 +98,7 @@ def main():
         "__MASQUE_KILLSWITCH_PATH__": vpn / "masque-vpn-killswitch",
         "__MASQUE_H3_PATH__": vpn / "vendor" / "h3",
         "__MASQUE_H3_QUINN_PATH__": vpn / "vendor" / "h3-quinn",
+        "__MASQUE_SMOLTCP_PATH__": vpn / "vendor" / "smoltcp",
         "__MASQUE_NF_PATH__": vpn / "masque-nf" / "Core",
     }
     for dependency in paths.values():
@@ -139,7 +140,8 @@ def main():
             sys.stderr.write(metadata.stderr)
             return metadata.returncode
         packages = json.loads(metadata.stdout)["packages"]
-        for name, marker in (("h3", "__MASQUE_H3_PATH__"), ("h3-quinn", "__MASQUE_H3_QUINN_PATH__")):
+        for name, marker in (("h3", "__MASQUE_H3_PATH__"), ("h3-quinn", "__MASQUE_H3_QUINN_PATH__"),
+                             ("smoltcp", "__MASQUE_SMOLTCP_PATH__")):
             selected = [package for package in packages if package["name"] == name]
             expected_manifest = paths[marker] / "Cargo.toml"
             if len(selected) != 1 or selected[0]["source"] is not None or Path(selected[0]["manifest_path"]).resolve() != expected_manifest.resolve():

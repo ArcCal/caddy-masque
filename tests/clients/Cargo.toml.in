@@ -35,3 +35,7 @@ path = "src/nf.rs"
 [patch."https://github.com/hyperium/h3"]
 h3 = { path = __MASQUE_H3_PATH__ }
 h3-quinn = { path = __MASQUE_H3_QUINN_PATH__ }
+
+# The clients' patched smoltcp (masque-vpn vendor/smoltcp/PATCH.md).
+[patch.crates-io]
+smoltcp = { path = __MASQUE_SMOLTCP_PATH__ }
