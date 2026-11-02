@@ -11,9 +11,11 @@ The runner creates a temporary Rust workspace from these assets, uses the tested
 lockfile, and builds with `cargo build --locked`. It honors `CARGO_TARGET_DIR` for
 a shared cache. Its top-level Cargo patches select the current client's vendored
 `h3` and `h3-quinn`; locked Cargo metadata must confirm both paths before building.
-The lockfile was refreshed against client commit
-`dadfefd3dba056436a19d396999685f5622b23c0`. When client dependencies change, review
-and refresh this harness lockfile without modifying the client repository.
+Before building, the runner pins every registry crate shared with the Mac,
+Killswitch and NF lockfiles to the version those clients lock, so the harness tests
+the dependencies the clients ship; it stops if the client lockfiles disagree. The
+committed lockfile only seeds the harness's own crates and is never written back, and
+the client repository is not modified. Python 3.11 or newer is required.
 `--release` selects an optimized Rust build; the default uses the
 debug profile. Go runs the test through an overlay so normal `go test ./...` does
 not depend on a Rust checkout or run this longer matrix. Go build tags are not

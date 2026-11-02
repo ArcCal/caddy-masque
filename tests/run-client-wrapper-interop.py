@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 
 TEST_NAME = "TestInteropCurrentMacAndKillswitch"
@@ -29,6 +30,61 @@ def parse_args():
         help="Compile the Rust harness and Go overlay without running interoperability cases.",
     )
     return parser.parse_args()
+
+
+def registry_versions(lockfile):
+    versions = {}
+    for package in tomllib.loads(lockfile.read_text(encoding="utf-8")).get("package", []):
+        if package.get("source", "").startswith("registry+"):
+            versions.setdefault(package["name"], set()).add(package["version"])
+    return versions
+
+
+def compatible(version):
+    """Cargo's semver-compatible line: major, 0.minor, or 0.0.patch."""
+    parts = version.split("+")[0].split("-")[0].split(".")
+    if parts[0] != "0":
+        return parts[:1]
+    return parts[:2] if parts[1] != "0" else parts[:3]
+
+
+def client_versions(lockfiles):
+    targets = {}
+    for lockfile in lockfiles:
+        for name, versions in registry_versions(lockfile).items():
+            for version in versions:
+                key = (name, *compatible(version))
+                if targets.setdefault(key, version) != version:
+                    raise SystemExit(f"Client lockfiles disagree on {name}: {targets[key]} and {version}; align them first.")
+    return targets
+
+
+def align_lock(workspace, environment, lockfiles):
+    """Pin every registry crate shared with the clients to the clients' locked version.
+
+    The committed lock only seeds crates that the clients do not lock themselves,
+    so the harness always tests the dependency versions the clients ship.
+    """
+    targets = client_versions(lockfiles)
+    attempted = set()
+    while True:
+        stale = sorted(
+            (name, version, targets[(name, *compatible(version))])
+            for name, versions in registry_versions(workspace / "Cargo.lock").items()
+            for version in versions
+            if targets.get((name, *compatible(version)), version) != version
+        )
+        if not stale:
+            return
+        if stale[0] in attempted:
+            raise SystemExit(f"Cannot align {stale[0][0]} {stale[0][1]} with the clients' {stale[0][2]}.")
+        attempted.add(stale[0])
+        name, old, new = stale[0]
+        subprocess.run(
+            ["cargo", "update", "--quiet", "--manifest-path", str(workspace / "Cargo.toml"),
+             "-p", f"{name}@{old}", "--precise", new],
+            cwd=workspace, env=environment, check=True,
+        )
 
 
 def main():
@@ -69,6 +125,11 @@ def main():
             support.read_text(encoding="utf-8") + (assets / "nf_support-extension.rs").read_text(encoding="utf-8"),
             encoding="utf-8",
         )
+
+        align_lock(workspace, environment, [
+            paths[marker].joinpath("Cargo.lock")
+            for marker in ("__MASQUE_MAC_PATH__", "__MASQUE_KILLSWITCH_PATH__", "__MASQUE_NF_PATH__")
+        ])
 
         metadata = subprocess.run(
             ["cargo", "metadata", "--locked", "--format-version=1", "--manifest-path", str(workspace / "Cargo.toml")],
