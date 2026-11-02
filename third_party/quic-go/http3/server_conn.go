@@ -266,7 +266,8 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
 
 	// If the EOF was read by the handler, CancelRead() is a no-op.
 	str.CancelRead(quic.StreamErrorCode(ErrCodeNoError))
-	str.Close()
+	// Through the HTTP/3 stream: it resets instead after a failed write.
+	hstr.Close()
 }
 
 func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *frameParser) {

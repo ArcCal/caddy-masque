@@ -773,7 +773,13 @@ func TestHTTPDeadlines(t *testing.T) {
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
 		body, err := io.ReadAll(&readerWithTimeout{Reader: resp.Body, Timeout: 2 * deadlineDelay})
-		require.NoError(t, err)
+		// The deadline can stop a DATA frame part way, so the server resets
+		// the stream instead of ending it after a truncated frame, which the
+		// client would have to treat as a connection error (RFC 9114 Section 7.1).
+		var h3Err *http3.Error
+		require.ErrorAs(t, err, &h3Err)
+		require.Equal(t, http3.ErrCodeRequestCanceled, h3Err.ErrorCode)
+		require.True(t, h3Err.Remote)
 		require.Greater(t, time.Now(), expectedEnd)
 		require.Contains(t, string(body), "aa")
 

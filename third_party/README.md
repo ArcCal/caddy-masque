@@ -129,6 +129,30 @@ upstream parser test that required push frames to be skipped is replaced by one
 for this behavior; `h3_push_frames_test.go` checks the wire errors against the
 server and the fork's client.
 
+## HTTP/3 streams after a failed write
+
+`http3-truncated-frames.patch`, applied after the conformance patches, resets a
+stream instead of ending it cleanly once a write to it has failed. A write cut
+short, for example by a write deadline (`http.ResponseController`'s
+`SetWriteDeadline`, or the tunnel's forced shutdown of a client that stopped
+reading), can end inside a DATA frame. Upstream still closed the stream with a
+FIN, and RFC 9114 Section 7.1 requires the peer to treat a cleanly ended stream
+whose last frame was truncated as a connection error of type H3_FRAME_ERROR,
+which ends every other request on that connection. Now the first failed write
+is remembered, later writes return it, and `Stream.Close` (used by the server
+after a handler returns, by hijacked streams such as CONNECT-IP tunnels and by
+`RequestStream.Close`) resets the send direction with H3_REQUEST_CANCELLED
+(RFC 9114 Section 8.1). Complete writes still end with a FIN.
+
+`http3/truncated_write_test.go` checks both cases: on the unpatched fork the
+failed-write case failed 20 of 20 runs (the stream kept writing and was never
+reset) while the complete-write control passed 20 of 20; with the patch both
+pass 20 of 20. The upstream integration
+test `TestHTTPDeadlines/write_deadline` expected the truncated stream to end
+cleanly; it now expects that reset, while still requiring the partial body.
+It failed 6 of 30 runs on the fork before (the connection error) and passes
+30 of 30 after.
+
 ## HTTP/3 and QUIC conformance repairs
 
 The [independent reassessment](../docs/ietf-reassessment-2026-10-18.md) checks

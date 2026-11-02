@@ -17,5 +17,6 @@ with tempfile.TemporaryDirectory(prefix="masque-http3-") as temp:
     apply_patch(upstream, root / "third_party/http3-push-frames.patch")
     apply_patch(upstream, root / "third_party/quic-conformance.patch")
     apply_patch(upstream, root / "third_party/http3-conformance.patch")
+    apply_patch(upstream, root / "third_party/http3-truncated-frames.patch")
     compare_tree(upstream, root / "third_party/quic-go", "HTTP/3")
 print("HTTP/3 fork matches verified upstream v0.63.0 plus documented patches; " + summarize_notices(notices))

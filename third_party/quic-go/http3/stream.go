@@ -46,6 +46,13 @@ type Stream struct {
 
 	bytesRemainingInFrame uint64
 
+	// The first failed write, such as one cut short by a write deadline. It
+	// can end inside a DATA frame, so later writes would continue a frame the
+	// peer cannot delimit, and a clean end of the stream would leave the peer
+	// a truncated frame, a connection error (RFC 9114 Section 7.1).
+	writeErr    error
+	writeFailed atomic.Bool
+
 	qlogger qlogwriter.Recorder
 
 	isConnect bool
@@ -201,8 +208,27 @@ func (s *Stream) TryWriteAll(b []byte) error {
 }
 
 func (s *Stream) writeUnframed(b []byte) (int, error) {
+	if s.writeFailed.Load() {
+		return 0, s.writeErr
+	}
 	n, err := s.datagramStream.Write(b)
-	return n, maybeReplaceError(err)
+	err = maybeReplaceError(err)
+	if err != nil {
+		s.writeErr = err
+		s.writeFailed.Store(true)
+	}
+	return n, err
+}
+
+// Close closes the send direction of the stream with a FIN. After a failed
+// write the frame boundary is unknown, so it resets the send direction with
+// H3_REQUEST_CANCELLED instead (RFC 9114 Sections 7.1 and 8.1).
+func (s *Stream) Close() error {
+	if s.writeFailed.Load() {
+		s.datagramStream.CancelWrite(quic.StreamErrorCode(ErrCodeRequestCanceled))
+		return nil
+	}
+	return s.datagramStream.Close()
 }
 
 func (s *Stream) StreamID() quic.StreamID {

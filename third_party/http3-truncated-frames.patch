@@ -1,0 +1,139 @@
+diff --git a/http3/server_conn.go b/http3/server_conn.go
+index cf88c43..f0f63e6 100644
+--- a/http3/server_conn.go
++++ b/http3/server_conn.go
+@@ -266,7 +266,8 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
+ 
+ 	// If the EOF was read by the handler, CancelRead() is a no-op.
+ 	str.CancelRead(quic.StreamErrorCode(ErrCodeNoError))
+-	str.Close()
++	// Through the HTTP/3 stream: it resets instead after a failed write.
++	hstr.Close()
+ }
+ 
+ func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *frameParser) {
+diff --git a/http3/stream.go b/http3/stream.go
+index 176a0ee..36b8bea 100644
+--- a/http3/stream.go
++++ b/http3/stream.go
+@@ -46,6 +46,13 @@ type Stream struct {
+ 
+ 	bytesRemainingInFrame uint64
+ 
++	// The first failed write, such as one cut short by a write deadline. It
++	// can end inside a DATA frame, so later writes would continue a frame the
++	// peer cannot delimit, and a clean end of the stream would leave the peer
++	// a truncated frame, a connection error (RFC 9114 Section 7.1).
++	writeErr    error
++	writeFailed atomic.Bool
++
+ 	qlogger qlogwriter.Recorder
+ 
+ 	isConnect bool
+@@ -201,8 +208,27 @@ func (s *Stream) TryWriteAll(b []byte) error {
+ }
+ 
+ func (s *Stream) writeUnframed(b []byte) (int, error) {
++	if s.writeFailed.Load() {
++		return 0, s.writeErr
++	}
+ 	n, err := s.datagramStream.Write(b)
+-	return n, maybeReplaceError(err)
++	err = maybeReplaceError(err)
++	if err != nil {
++		s.writeErr = err
++		s.writeFailed.Store(true)
++	}
++	return n, err
++}
++
++// Close closes the send direction of the stream with a FIN. After a failed
++// write the frame boundary is unknown, so it resets the send direction with
++// H3_REQUEST_CANCELLED instead (RFC 9114 Sections 7.1 and 8.1).
++func (s *Stream) Close() error {
++	if s.writeFailed.Load() {
++		s.datagramStream.CancelWrite(quic.StreamErrorCode(ErrCodeRequestCanceled))
++		return nil
++	}
++	return s.datagramStream.Close()
+ }
+ 
+ func (s *Stream) StreamID() quic.StreamID {
+diff --git a/http3/truncated_write_test.go b/http3/truncated_write_test.go
+new file mode 100644
+index 0000000..76368c6
+--- /dev/null
++++ b/http3/truncated_write_test.go
+@@ -0,0 +1,53 @@
++package http3
++
++import (
++	"os"
++	"testing"
++
++	"github.com/quic-go/quic-go"
++
++	"github.com/stretchr/testify/require"
++	"go.uber.org/mock/gomock"
++)
++
++// A write that fails, for example at a write deadline, can stop inside a DATA
++// frame. Ending the stream cleanly after that would make the peer close the
++// whole connection (RFC 9114 Section 7.1), so the stream must be reset.
++func TestFailedWriteResetsInsteadOfClosing(t *testing.T) {
++	mockCtrl := gomock.NewController(t)
++	qstr := NewMockDatagramStream(mockCtrl)
++	qstr.EXPECT().StreamID().Return(quic.StreamID(4)).AnyTimes()
++	str := newStream(qstr, nil, nil, nil, nil)
++
++	payload := make([]byte, 1000)
++	gomock.InOrder(
++		qstr.EXPECT().Write(gomock.Any()).DoAndReturn(func(b []byte) (int, error) { return len(b), nil }),
++		// Part of the payload is queued, then the deadline expires.
++		qstr.EXPECT().Write(gomock.Any()).Return(300, os.ErrDeadlineExceeded),
++		qstr.EXPECT().CancelWrite(quic.StreamErrorCode(ErrCodeRequestCanceled)),
++	)
++	qstr.EXPECT().Close().Times(0)
++
++	n, err := str.Write(payload)
++	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
++	require.Equal(t, 300, n)
++	// Later writes would continue a frame the peer cannot delimit.
++	_, err = str.Write([]byte("more"))
++	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
++	require.NoError(t, str.Close())
++}
++
++func TestCompleteWritesStillCloseCleanly(t *testing.T) {
++	mockCtrl := gomock.NewController(t)
++	qstr := NewMockDatagramStream(mockCtrl)
++	qstr.EXPECT().StreamID().Return(quic.StreamID(4)).AnyTimes()
++	str := newStream(qstr, nil, nil, nil, nil)
++
++	qstr.EXPECT().Write(gomock.Any()).DoAndReturn(func(b []byte) (int, error) { return len(b), nil }).Times(2)
++	qstr.EXPECT().Close()
++	qstr.EXPECT().CancelWrite(gomock.Any()).Times(0)
++
++	_, err := str.Write([]byte("complete"))
++	require.NoError(t, err)
++	require.NoError(t, str.Close())
++}
+diff --git a/integrationtests/self/http_test.go b/integrationtests/self/http_test.go
+index 000f47f..87d137c 100644
+--- a/integrationtests/self/http_test.go
++++ b/integrationtests/self/http_test.go
+@@ -773,7 +773,13 @@ func TestHTTPDeadlines(t *testing.T) {
+ 		require.Equal(t, http.StatusOK, resp.StatusCode)
+ 
+ 		body, err := io.ReadAll(&readerWithTimeout{Reader: resp.Body, Timeout: 2 * deadlineDelay})
+-		require.NoError(t, err)
++		// The deadline can stop a DATA frame part way, so the server resets
++		// the stream instead of ending it after a truncated frame, which the
++		// client would have to treat as a connection error (RFC 9114 Section 7.1).
++		var h3Err *http3.Error
++		require.ErrorAs(t, err, &h3Err)
++		require.Equal(t, http3.ErrCodeRequestCanceled, h3Err.ErrorCode)
++		require.True(t, h3Err.Remote)
+ 		require.Greater(t, time.Now(), expectedEnd)
+ 		require.Contains(t, string(body), "aa")
+ 
