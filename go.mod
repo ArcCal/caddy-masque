@@ -14,9 +14,9 @@ require (
 	github.com/caddy-dns/cloudflare v0.2.4
 	github.com/caddyserver/caddy/v2 v2.11.7
 	github.com/prometheus/client_golang v1.25.0
-	github.com/quic-go/connect-ip-go v0.7.0
+	github.com/quic-go/connect-ip-go v0.6.0
 	github.com/quic-go/qpack v0.6.0
-	github.com/quic-go/quic-go v0.65.0
+	github.com/quic-go/quic-go v0.63.0
 	github.com/spf13/cobra v1.10.2
 	github.com/vishvananda/netlink v1.3.1
 	github.com/yosida95/uritemplate/v3 v3.0.2
