@@ -55,6 +55,14 @@ client password, preserve Caddy certificate state, and start and enable the serv
 DNS-01 does not require A/AAAA records or an address match during installation;
 clients still need a reachable server address and TCP/UDP 443 access.
 
+Both installers download complete latest `main` sources into a private
+`/tmp/caddy-masque-source-YYYYMMDD-HHMMSS.RANDOM` directory before compiling.
+Download failure stops installation instead of building local code. Source and
+Go build/module caches are removed on exit. Small or tmpfs `/tmp` uses private
+disk-backed `/var/tmp` compiler storage; per-run boot-only tmpfiles rules remove
+interrupted source/cache work and temporary swap after reboot, then remove
+themselves. Installed executables, configuration and certificate state remain.
+
 ## One-step install
 
 On Debian 12/13 or Ubuntu 22.04/24.04, with the domain already pointing at the server:

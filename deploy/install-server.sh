@@ -50,7 +50,12 @@ say "Checking the system"
 say "Installing system packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q curl ca-certificates nftables iproute2 dnsutils jq
+apt-get install -y -q curl ca-certificates git nftables iproute2 dnsutils jq
+source "$SRC/deploy/build-source.sh"
+caddy_build_source
+SRC=$CADDY_BUILD_SOURCE
+GO_MOD_VERSION=$(sed -n 's/^go \([0-9.]*\)$/\1/p' "$SRC/go.mod")
+GO_LINE=${GO_MOD_VERSION%.*}
 
 say "Checking that $DOMAIN points at this server"
 PUBLIC_IP=$(curl -4 -fsS --max-time 10 https://api.ipify.org || curl -4 -fsS --max-time 10 https://ip.sb || true)
@@ -79,7 +84,7 @@ if ! go version 2>/dev/null | grep -q "go$GO_VERSION "; then
     esac
     GO_FILE="go$GO_VERSION.linux-$GOARCH.tar.gz"
     # A directory of our own: nobody else can put a file in its place.
-    GO_TMP=$(mktemp -d)
+    GO_TMP=$(mktemp -d "$CADDY_BUILD_WORK/go-download.XXXXXX")
     curl -fsSL --retry 3 --retry-delay 5 "https://go.dev/dl/$GO_FILE" -o "$GO_TMP/$GO_FILE" ||
         die "downloading Go failed; check that this server can reach https://go.dev, then run this again"
     GO_SHA256=$(jq -r --arg f "$GO_FILE" 'first(.[].files[] | select(.filename == $f) | .sha256) // empty' <<<"$GO_RELEASES")
@@ -98,7 +103,8 @@ SWAP=""
 cleanup_swap() {
     [ -n "$SWAP" ] || return 0
     if swapon --show=NAME --noheadings | grep -qxF "$SWAP" && ! swapoff "$SWAP"; then
-        printf 'Note: turning off the temporary swap file %s failed, so it was not removed; you can remove it by hand after a reboot\n' "$SWAP"
+        CADDY_BUILD_SWAP_RETAINED=1
+        printf 'Temporary swap remains at %s; its boot-only rule removes it after reboot.\n' "$SWAP"
         SWAP=""
         return 0
     fi
@@ -107,10 +113,10 @@ cleanup_swap() {
 }
 # The build goes to a directory of our own (mode 700): in a shared /tmp, another
 # user could replace the file between the build and its installation as root.
-BUILD_DIR=$(mktemp -d)
+BUILD_DIR=$CADDY_BUILD_WORK
 cleanup() {
     cleanup_swap
-    rm -rf "$BUILD_DIR"
+    caddy_build_cleanup
 }
 trap cleanup EXIT
 mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
@@ -118,12 +124,12 @@ swap_kb=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
 # The build and Go's caches need about 3 GB, and a temporary swap file 2 GB more.
 need_gb=3
 [ $((mem_kb + swap_kb)) -ge 2500000 ] || need_gb=$((need_gb + 2))
-free_gb=$(df -Pk "$SRC" | awk 'NR == 2 { print int($4 / 1048576) }')
+free_gb=$(df -Pk "$CADDY_BUILD_WORK" | awk 'NR == 2 { print int($4 / 1048576) }')
 [ "${free_gb:-$need_gb}" -ge "$need_gb" ] ||
     die "only $free_gb GB of disk space is free, and the build needs about $need_gb GB; free up space (for example: apt-get clean), then run this again"
 if [ $((mem_kb + swap_kb)) -lt 2500000 ]; then
     echo "Little memory: adding 2 GB of temporary swap space for the build"
-    SWAP=$(mktemp /caddy-build-XXXXXX.swap) # a new file, mode 600
+    SWAP=$(mktemp "$CADDY_BUILD_WORK/swap.XXXXXX") # a new file, mode 600
     fallocate -l 2G "$SWAP" 2>/dev/null || dd if=/dev/zero of="$SWAP" bs=1M count=2048 status=none
     mkswap -q "$SWAP"
     swapon "$SWAP"

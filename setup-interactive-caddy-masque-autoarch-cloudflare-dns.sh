@@ -365,7 +365,7 @@ install_packages() {
     local -a apt=(apt_get -o DPkg::Lock::Timeout=1800 -o Acquire::Retries=3)
     DEBIAN_FRONTEND=noninteractive "${apt[@]}" update -q </dev/null
     DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "${apt[@]}" install -y -q --no-install-recommends \
-        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold curl ca-certificates nftables iproute2 dnsutils jq \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold curl ca-certificates git nftables iproute2 dnsutils jq \
         python3 util-linux </dev/null
 }
 
@@ -687,7 +687,8 @@ cleanup_swap() {
     [[ -n $SWAP ]] || return 0
     if swapon --show=NAME --noheadings | grep -Fx -- "$SWAP" >/dev/null; then
         if ! swapoff "$SWAP"; then
-            printf 'Temporary swap remains at %s; remove it after reboot.\n' "$SWAP" >&2
+            CADDY_BUILD_SWAP_RETAINED=1
+            printf 'Temporary swap remains at %s; its boot-only rule removes it after reboot.\n' "$SWAP" >&2
             SWAP=
             return 0
         fi
@@ -697,46 +698,30 @@ cleanup_swap() {
 }
 
 build_server() {
-    local releases go_line go_version go_file go_sha go_root mem_kb swap_kb free_kb info private_tools=0 private_cache=0
+    local releases go_line go_version go_file go_sha go_root mem_kb swap_kb free_kb info
+    source "$SRC/deploy/build-source.sh"
+    caddy_build_source
+    SRC=$CADDY_BUILD_SOURCE
+    GO_INSTALL_ROOT="$CADDY_BUILD_WORK/toolchains"
+    BUILD_CACHE="$CADDY_BUILD_WORK/cache"
     # Apply before even `go version`: inherited toolchain selectors and cache
     # programs must not execute an unrelated helper as root. Proxy/CA settings
     # remain inherited; the actual compile additionally fixes native CPU flags.
     local -x GOTOOLCHAIN=local GOENV=off GOWORK=off GOROOT='' GO111MODULE=on GOAUTH=off
     local -x GOFLAGS='' GOCACHEPROG='' GOEXPERIMENT='' GOFIPS140='' GODEBUG=''
-    say "Building the native linux/$ARCH server from this checkout"
+    say "Building the native linux/$ARCH server from downloaded main"
     go_line=$(sed -n 's/^go \([0-9]*\.[0-9]*\)\.[0-9]*$/\1/p' "$SRC/go.mod")
     [[ -n $go_line ]] || die "cannot read the Go release line from go.mod"
-    # Keep a separate toolchain and caches; never replace the system's Go.
-    if build_path_overlaps_source "$GO_INSTALL_ROOT"; then
-        GO_INSTALL_ROOT="$BUILD_DIR/toolchains"
-        private_tools=1
-    fi
-    if build_path_overlaps_source "$BUILD_CACHE"; then
-        BUILD_CACHE="$BUILD_DIR/build-cache"
-        private_cache=1
-    fi
-    if (( private_tools || private_cache )); then
-        [[ -d $BUILD_DIR && ! -L $BUILD_DIR && $(stat -c '%u:%a' -- "$BUILD_DIR") == 0:700 ]] ||
-            die 'overlapping source paths require private root-owned build staging'
-        say 'Source overlaps persistent build storage; using private staging for the overlapping paths'
-    fi
-    if (( private_tools )); then
-        [[ ! -e $GO_INSTALL_ROOT && ! -L $GO_INSTALL_ROOT ]] || die 'private toolchain staging already exists'
-        install -d -o root -g root -m 0700 -- "$GO_INSTALL_ROOT"
-    else
-        prepare_build_directory "$GO_INSTALL_ROOT"
-    fi
-    if (( private_cache )); then
-        [[ ! -e $BUILD_CACHE && ! -L $BUILD_CACHE ]] || die 'private cache staging already exists'
-        install -d -o root -g root -m 0700 -- "$BUILD_CACHE"
-    else
-        prepare_build_directory "$BUILD_CACHE"
-    fi
+    # The root-owned private workspace is fresh on every invocation. Its
+    # sticky /var/tmp parent is allowed; no persistent toolchain is adopted.
+    [[ -d $CADDY_BUILD_WORK && ! -L $CADDY_BUILD_WORK &&
+       $(stat -c '%u:%a' -- "$CADDY_BUILD_WORK") == 0:700 ]] || die 'unsafe private compiler workspace'
+    install -d -o root -g root -m 0700 -- "$GO_INSTALL_ROOT" "$BUILD_CACHE"
     free_kb=$(df -Pk "$BUILD_CACHE" | awk 'NR==2 {print $4}')
     [[ $free_kb -ge 5242880 ]] || die "free at least 5 GiB for the toolchain and build caches"
     free_kb=$(df -Pk "$BUILD_DIR" | awk 'NR==2 {print $4}')
     [[ $free_kb -ge 3145728 ]] || die "free at least 3 GiB in /var/tmp for build staging and possible swap"
-    releases="$BUILD_DIR/go-releases.json"
+    releases="$CADDY_BUILD_WORK/go-releases.json"
     curl --disable --proto '=https' --proto-redir '=https' -fsSL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 90 \
         'https://go.dev/dl/?mode=json&include=all' -o "$releases"
     go_version=$(jq -r --arg line "go$go_line." 'first(.[] | select(.stable and (.version | startswith($line))) | .version) // empty' "$releases")
@@ -751,11 +736,11 @@ build_server() {
         ! "$go_root/bin/go" version >"$BUILD_DIR/go-version.txt" 2>&1 ||
         ! grep -Fq -- "$go_version linux/$ARCH" "$BUILD_DIR/go-version.txt"; then
         curl --disable --proto '=https' --proto-redir '=https' -fsSL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 600 \
-            "https://go.dev/dl/$go_file" -o "$BUILD_DIR/go.tar.gz"
-        printf '%s  %s\n' "$go_sha" "$BUILD_DIR/go.tar.gz" | sha256sum -c --quiet - || die "Go archive checksum mismatch"
+            "https://go.dev/dl/$go_file" -o "$CADDY_BUILD_WORK/go.tar.gz"
+        printf '%s  %s\n' "$go_sha" "$CADDY_BUILD_WORK/go.tar.gz" | sha256sum -c --quiet - || die "Go archive checksum mismatch"
         # Publish the complete toolchain using a rename on its own filesystem.
         GO_STAGE=$(mktemp -d "$GO_INSTALL_ROOT/.toolchain-XXXXXX")
-        tar -xzf "$BUILD_DIR/go.tar.gz" -C "$GO_STAGE"
+        tar -xzf "$CADDY_BUILD_WORK/go.tar.gz" -C "$GO_STAGE"
         "$GO_STAGE/go/bin/go" version >"$BUILD_DIR/go-version.txt"
         grep -Fq -- "$go_version linux/$ARCH" "$BUILD_DIR/go-version.txt" || die "unexpected downloaded Go version"
         printf '%s\n' "$go_sha" >"$GO_STAGE/go/.caddy-masque-toolchain.sha256"
@@ -769,13 +754,13 @@ build_server() {
     swap_kb=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
     if (( mem_kb + swap_kb < 2500000 )); then
         say "Adding 2 GiB of temporary swap for compilation"
-        SWAP=$(mktemp /var/tmp/caddy-masque-build-XXXXXX.swap)
+        SWAP=$(mktemp "$CADDY_BUILD_WORK/swap.XXXXXX")
         chmod 600 "$SWAP"
         fallocate -l 2G "$SWAP" || dd if=/dev/zero of="$SWAP" bs=1M count=2048 status=none
         mkswap -q "$SWAP"
         swapon "$SWAP" || die "cannot enable temporary swap; add memory/swap and run again"
     fi
-    mkdir -m 0700 -- "$BUILD_DIR/go-tmp"
+    mkdir -m 0700 -- "$CADDY_BUILD_WORK/go-tmp"
     # Go uses TMPDIR to identify the system temp root and ignores go.mod there.
     # GOTMPDIR only moves compiler scratch files; set both so /tmp checkouts
     # remain valid modules without moving or changing the user's source tree.
@@ -783,7 +768,7 @@ build_server() {
         -u GOCACHEPROG -u GOEXPERIMENT -u GOFIPS140 -u GODEBUG \
         GOOS=linux GOARCH="$ARCH" GOAMD64=v1 GOARM64=v8.0 GO111MODULE=on \
         CGO_ENABLED=0 GOTOOLCHAIN=local GOWORK=off GOENV=off \
-        TMPDIR="$BUILD_DIR/go-tmp" GOTMPDIR="$BUILD_DIR/go-tmp" \
+        TMPDIR="$CADDY_BUILD_WORK/go-tmp" GOTMPDIR="$CADDY_BUILD_WORK/go-tmp" \
         GOCACHE="$BUILD_CACHE/build" GOMODCACHE="$BUILD_CACHE/mod" \
         "$go_root/bin/go" build -p 1 -mod=readonly -trimpath -ldflags '-s -w' -o "$BUILD_DIR/caddy-masque" ./cmd/caddy); then
         die "build failed; the installed binary was not replaced. Check disk/memory and access to proxy.golang.org"
@@ -1513,6 +1498,7 @@ cleanup() {
     fi
     cleanup_swap
     [[ -z $GO_STAGE ]] || rm -rf -- "$GO_STAGE"
+    if declare -F caddy_build_cleanup >/dev/null; then caddy_build_cleanup; fi
     if (( rollback_failed )); then
         printf 'Automatic recovery was incomplete. Private backups remain in %s/backup.\n' "$BUILD_DIR" >&2
         printf 'Copy them to persistent root-only storage: systemd-tmpfiles ages old /var/tmp entries.\n' >&2
@@ -1546,7 +1532,7 @@ main() {
     init_paths
     preflight
     collect_settings
-    BUILD_DIR=$(mktemp -d /var/tmp/caddy-masque-setup-XXXXXX)
+    BUILD_DIR=$(mktemp -d "/var/tmp/caddy-masque-setup-$(date +%Y%m%d-%H%M%S).XXXXXX")
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
