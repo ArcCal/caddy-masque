@@ -116,7 +116,7 @@ and Go 1.27; no extra build tag is needed. From this checkout, xcaddy uses
 both dependencies:
 
 ```sh
-xcaddy build v2.11.7 --with github.com/ArcCal/caddy-masque=. \
+xcaddy build v2.11.9 --with github.com/ArcCal/caddy-masque=. \
   --with github.com/caddy-dns/cloudflare@v0.2.4 \
   --replace golang.org/x/net=./third_party/xnet \
   --replace github.com/quic-go/quic-go=./third_party/quic-go
