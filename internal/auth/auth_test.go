@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -475,5 +476,28 @@ func TestFailureLimiter(t *testing.T) {
 	l.failAt(netip.MustParseAddr("192.0.2.3"), now.Add(2*time.Minute))
 	if len(l.m) != 1 || !l.blockedAt(netip.MustParseAddr("192.0.2.3"), now.Add(2*time.Minute)) {
 		t.Errorf("expired entries kept: %d", len(l.m))
+	}
+}
+
+func TestAuthSlotsRespectCPUAndScheduler(t *testing.T) {
+	old := runtime.GOMAXPROCS(0)
+	t.Cleanup(func() { runtime.GOMAXPROCS(old) })
+	for _, tc := range []struct {
+		name           string
+		parallel, want int
+	}{
+		{"below_host_CPU", 1, 2},
+		{"above_host_CPU", runtime.NumCPU() + 3, runtime.NumCPU() * 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime.GOMAXPROCS(tc.parallel)
+			a := New()
+			if cap(a.slots) != tc.want {
+				t.Fatalf("GOMAXPROCS=%d NumCPU=%d slots=%d want=%d", tc.parallel, runtime.NumCPU(), cap(a.slots), tc.want)
+			}
+			if a.maxWaiting != int64(tc.want*waitingPerSlot) {
+				t.Fatalf("waiting cap=%d", a.maxWaiting)
+			}
+		})
 	}
 }

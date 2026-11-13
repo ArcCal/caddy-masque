@@ -425,7 +425,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		c.endOnExit(srv)
 	}
 	why := s.run(ctx)
-	log.Info("session ended", zap.String("why", why), zap.Stringer("stats", &s.stats))
+	log.Info("session ended", zap.String("why", why), zap.Stringer("stats", s.stats))
 	return nil
 }
 

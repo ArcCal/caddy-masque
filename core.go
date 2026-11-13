@@ -1,6 +1,7 @@
 package masque
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"net/http"
@@ -125,12 +126,15 @@ type core struct {
 	gw6        netip.Addr
 
 	// Lock order: sessMu, then poolMu.
-	sessMu   sync.RWMutex
-	sessions map[netip.Addr]*sessionHandle
-	poolMu   sync.Mutex
-	pool     *pool.Pool
-	recent   map[string]recentLease // by user name, under poolMu
-	nextID   atomic.Uint64
+	sessMu       sync.RWMutex
+	sessions     map[netip.Addr]*sessionHandle
+	userSessions map[string]int
+	poolMu       sync.Mutex
+	pool         *pool.Pool
+	recent       map[string]recentLease // by user name, under poolMu
+	recentByAddr map[netip.Addr]string
+	recentOrder  list.List
+	nextID       atomic.Uint64
 	// Session handlers that have not returned.
 	running  atomic.Int64
 	counters counters
@@ -163,15 +167,18 @@ type core struct {
 type recentLease struct {
 	addrs []netip.Addr
 	at    time.Time
+	order *list.Element
 }
 
 // sessionHandle is how packets from the network reach a session.
 type sessionHandle struct {
-	id       uint64
-	user     auth.User
-	toClient chan queued
-	revoked  chan struct{}
-	why      string // set before revoked closes
+	id         uint64
+	registered bool // guarded by core.sessMu
+	user       auth.User
+	stats      stats
+	toClient   chan queued
+	revoked    chan struct{}
+	why        string // set before revoked closes
 	// Signalled when the allowed destinations change.
 	rescope chan struct{}
 	once    sync.Once
@@ -186,18 +193,20 @@ func (h *sessionHandle) revoke(why string) {
 
 func newCore(cfg tunnelConfig, log *zap.Logger) (*core, error) {
 	c := &core{
-		cfg:        cfg,
-		log:        log,
-		auth:       auth.New(),
-		gw4:        cfg.ipv4.Addr(),
-		sessions:   map[netip.Addr]*sessionHandle{},
-		pool:       pool.New(cfg.ipv4, cfg.ipv6),
-		recent:     map[string]recentLease{},
-		forget:     forgetConntrack,
-		loginLimit: auth.NewFailureLimiter(loginFailures, time.Minute),
-		authLog:    logLimit{max: 60},
-		deviceLog:  logLimit{max: 1},
-		done:       make(chan struct{}),
+		cfg:          cfg,
+		log:          log,
+		auth:         auth.New(),
+		gw4:          cfg.ipv4.Addr(),
+		sessions:     map[netip.Addr]*sessionHandle{},
+		userSessions: map[string]int{},
+		pool:         pool.New(cfg.ipv4, cfg.ipv6),
+		recent:       map[string]recentLease{},
+		recentByAddr: map[netip.Addr]string{},
+		forget:       forgetConntrack,
+		loginLimit:   auth.NewFailureLimiter(loginFailures, time.Minute),
+		authLog:      logLimit{max: 60},
+		deviceLog:    logLimit{max: 1},
+		done:         make(chan struct{}),
 	}
 	if cfg.ipv6.IsValid() {
 		c.gw6 = cfg.ipv6.Addr()
@@ -314,11 +323,20 @@ func (c *core) readNetwork() {
 		if s == nil {
 			continue
 		}
+		// Only this goroutine produces packets; a consumer can only make
+		// more room. Avoid copying a packet when the queue is already full.
+		if len(s.toClient) == cap(s.toClient) {
+			s.stats.dropped.Add(1)
+			c.counters.dropped.Add(1)
+			continue
+		}
 		pkt := make([]byte, 1+h.TotalLen) // context ID 0, then the packet
 		copy(pkt[1:], buf[:h.TotalLen])
 		select {
 		case s.toClient <- queued{pkt: pkt, at: time.Now()}:
 		default: // queue full: dropped, as a network would
+			s.stats.dropped.Add(1)
+			c.counters.dropped.Add(1)
 		}
 	}
 }
@@ -349,6 +367,7 @@ func (c *core) setUsers(users map[string]string) {
 		if !c.auth.IsCurrent(s.user) {
 			c.log.Info("ending session: user removed or password changed", zap.String("user", s.user.Name), zap.Stringer("address", addr))
 			delete(c.sessions, addr)
+			c.unregisterSession(s)
 			s.revoke("user removed or password changed")
 		}
 	}
@@ -466,14 +485,18 @@ type lease struct {
 // entries are deleted. nil when no address is free, deleting fails, or the
 // user is no longer current.
 func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease {
-	if ctx.Err() != nil || c.ctx.Err() != nil {
+	// Refuse a known-full user before touching pool history or conntrack.
+	// The locked check below still serializes concurrent admissions.
+	if ctx.Err() != nil || c.ctx.Err() != nil || c.tooManySessions(user) {
 		return nil
 	}
 	var addrs []netip.Addr
 	var used []netip.Prefix
 	c.poolMu.Lock()
-	mine := c.recent[user.Name]
-	delete(c.recent, user.Name)
+	c.expireRecent(time.Now())
+	mine := c.takeRecent(user.Name)
+	// Incremental expiry may leave older records behind this batch. A user
+	// may reclaim only an address released within the reconnect grace.
 	if time.Since(mine.at) >= reconnectGrace {
 		mine.addrs = nil
 	}
@@ -501,19 +524,7 @@ func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease 
 			return nil
 		}
 		// Someone else's address now: no longer theirs to reclaim.
-		for name, r := range c.recent {
-			if !slices.Contains(r.addrs, a) {
-				continue
-			}
-			kept := r.addrs[:0:0]
-			for _, x := range r.addrs {
-				if x != a {
-					kept = append(kept, x)
-				}
-			}
-			r.addrs = kept
-			c.recent[name] = r
-		}
+		c.invalidateRecent(a)
 		if usedBefore {
 			used = append(used, netip.PrefixFrom(a, a.BitLen()))
 		}
@@ -551,6 +562,10 @@ func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease 
 	for _, a := range addrs {
 		c.sessions[a] = h
 	}
+	if len(addrs) > 0 {
+		c.userSessions[user.Name]++
+		h.registered = true
+	}
 	c.sessMu.Unlock()
 	return &lease{core: c, handle: h, addrs: addrs}
 }
@@ -562,13 +577,7 @@ func (c *core) atSessionLimit(user auth.User) bool {
 	if limit <= 0 {
 		return false
 	}
-	ids := map[uint64]bool{}
-	for _, s := range c.sessions {
-		if s.user.Name == user.Name {
-			ids[s.id] = true
-		}
-	}
-	return int64(len(ids)) >= limit
+	return int64(c.userSessions[user.Name]) >= limit
 }
 
 // tooManySessions is the same check for a request that was refused.
@@ -604,6 +613,7 @@ func (l *lease) release() {
 			delete(c.sessions, a)
 		}
 	}
+	c.unregisterSession(l.handle)
 	c.sessMu.Unlock()
 	// Both under the pool's lock, so an address cannot go to someone else
 	// before it is noted as this user's to reclaim (and then dropped from
@@ -612,6 +622,89 @@ func (l *lease) release() {
 	for _, a := range l.addrs {
 		c.pool.Release(a)
 	}
-	c.recent[l.handle.user.Name] = recentLease{addrs: l.addrs, at: time.Now()}
+	c.rememberRecent(l.handle.user.Name, l.addrs, time.Now())
 	c.poolMu.Unlock()
+}
+
+// unregisterSession updates the per-user count once even for dual-stack leases
+// removed by a configuration reload before their handler releases the pool.
+// sessMu is held.
+func (c *core) unregisterSession(h *sessionHandle) {
+	if !h.registered {
+		return
+	}
+	h.registered = false
+	if c.userSessions[h.user.Name]--; c.userSessions[h.user.Name] == 0 {
+		delete(c.userSessions, h.user.Name)
+	}
+}
+
+// takeRecent removes one reconnect record from every index. poolMu is held.
+func (c *core) takeRecent(name string) recentLease {
+	r, ok := c.recent[name]
+	if !ok {
+		return recentLease{}
+	}
+	delete(c.recent, name)
+	c.recentOrder.Remove(r.order)
+	for _, a := range r.addrs {
+		delete(c.recentByAddr, a)
+	}
+	return r
+}
+
+// expireRecent incrementally retires records in release order. A fixed batch
+// bounds work under poolMu after an idle period leaves a large expired backlog.
+// poolMu is held.
+func (c *core) expireRecent(now time.Time) {
+	for range 16 {
+		first := c.recentOrder.Front()
+		if first == nil {
+			return
+		}
+		name := first.Value.(string)
+		if now.Sub(c.recent[name].at) < reconnectGrace {
+			return
+		}
+		c.takeRecent(name)
+	}
+}
+
+// rememberRecent stores only the user's latest release, preserving the existing
+// reconnect policy while incrementally reclaiming expired history.
+// poolMu is held.
+func (c *core) rememberRecent(name string, addrs []netip.Addr, now time.Time) {
+	c.expireRecent(now)
+	c.takeRecent(name)
+	if len(addrs) == 0 {
+		return
+	}
+	c.recent[name] = recentLease{addrs: addrs, at: now, order: c.recentOrder.PushBack(name)}
+	for _, a := range addrs {
+		c.recentByAddr[a] = name
+	}
+}
+
+// invalidateRecent removes only the address whose ownership changed. Retain a
+// different family and keep the old lease's address slice immutable.
+// poolMu is held.
+func (c *core) invalidateRecent(a netip.Addr) {
+	name, ok := c.recentByAddr[a]
+	if !ok {
+		return
+	}
+	r := c.recent[name]
+	kept := r.addrs[:0:0]
+	for _, x := range r.addrs {
+		if x != a {
+			kept = append(kept, x)
+		}
+	}
+	if len(kept) == 0 {
+		c.takeRecent(name)
+		return
+	}
+	r.addrs = kept
+	c.recent[name] = r
+	delete(c.recentByAddr, a)
 }

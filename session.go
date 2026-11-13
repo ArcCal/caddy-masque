@@ -90,7 +90,7 @@ type session struct {
 	current atomic.Pointer[scope]
 	tun     tunnel
 	log     *zap.Logger
-	stats   stats
+	stats   *stats
 	// Shared by the errors sent to the client and those sent to the network
 	// for its sake.
 	icmpMu sync.Mutex
@@ -160,7 +160,7 @@ func (f *fragments) protocol(h ip.Header) (uint8, bool) {
 }
 
 func newSession(c *core, l *lease, sc scope, tun tunnel, log *zap.Logger) *session {
-	s := &session{core: c, lease: l, scope: sc, tun: tun, log: log, icmp: ip.NewRateLimit(),
+	s := &session{core: c, lease: l, scope: sc, tun: tun, log: log, stats: &l.handle.stats, icmp: ip.NewRateLimit(),
 		probeID: uint16(rand.Uint32()), probeData: make([]byte, probeData), probeReply: make(chan struct{})}
 	for _, a := range l.addrs {
 		if a.Is6() {

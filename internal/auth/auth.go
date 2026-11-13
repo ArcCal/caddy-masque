@@ -257,7 +257,8 @@ type remembered struct {
 
 // New makes an authenticator with no users.
 func New() *Authenticator {
-	slots := runtime.NumCPU() * 2
+	// Hash concurrency follows the smaller host or scheduler CPU budget.
+	slots := min(runtime.NumCPU(), runtime.GOMAXPROCS(0)) * 2
 	cacheKey := make([]byte, 32)
 	if _, err := rand.Read(cacheKey); err != nil {
 		panic(err)

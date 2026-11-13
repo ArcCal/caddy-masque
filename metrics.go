@@ -66,13 +66,9 @@ func (m *collector) Collect(ch chan<- prometheus.Metric) {
 func (c *core) activeSessions() map[string]int {
 	c.sessMu.RLock()
 	defer c.sessMu.RUnlock()
-	seen := map[uint64]bool{}
-	out := map[string]int{}
-	for _, s := range c.sessions {
-		if !seen[s.id] {
-			seen[s.id] = true
-			out[s.user.Name]++
-		}
+	out := make(map[string]int, len(c.userSessions))
+	for name, n := range c.userSessions {
+		out[name] = n
 	}
 	return out
 }

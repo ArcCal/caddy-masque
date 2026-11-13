@@ -1,0 +1,168 @@
+Local performance, security and interoperability audit, round 2
+Date: 2026-11-13
+
+Status
+======
+The initial audit examined uncommitted local changes. A subsequent review and
+revalidation precede authorized local commits. No merge, push or deployment is
+part of this validation.
+Baseline: ddff14e6d576c824f053efb7d86a5b5b7260b3b5.
+Companion masque-vpn baseline: 955ae4d327b4789eb69e7731e1a0b6a2026243f6.
+Raw evidence: /workspace/work/perf-audit-round2/
+Initial audit indexes: final-results.json, source-manifest.json,
+evidence-manifest.json. Pre-commit evidence: /workspace/work/precommit-round2/.
+These are local artifacts. Earlier reports are intermediate evidence, not a
+claim that their dependency versions or pending statuses remain current.
+
+Changes and invariants
+======================
+- Reuse a small capsule writer buffer under the existing writer mutex. Retained
+  capacity is bounded at 2 KiB; oversized writes are not kept indefinitely.
+- Reject a full host-to-client queue before copying the packet. Existing queue
+  synchronization and drop semantics remain; global/session counters agree.
+- Move the embedded statistics value from the session to its session handle,
+  with the session holding a pointer to that value. This lets network-queue
+  drops and session logs update/read the same counters; the old statistics
+  value was already embedded, so this does not remove a separate allocation.
+- Index recent leases by address and maintain release order. Bound incidental
+  expiry cleanup to 16 entries per activity; use-time expiry checks remain
+  mandatory. Released address slices are immutable while shared by the index.
+- Maintain per-user active counts, including dual-stack revocation and late
+  release. Reject an already full user quota before pool/conntrack work, then
+  recheck under the final allocation lock. Registered state prevents duplicate
+  decrements. A 10000-operation model and concurrency/rollback tests cover these
+  indexes and counters.
+- Limit concurrent password checks to twice the smaller of NumCPU/GOMAXPROCS.
+  This avoids excessive work in CPU-constrained processes. The password hashing
+  algorithm and cost, constant-time checks and authentication policy are intact.
+- Update toolchain 1.26.10 to 1.26.11 and klauspost/compress 1.20.1 to 1.20.2.
+  README documents patched minima 1.26.11 or 1.27.4. Patch rustix in the test
+  client lock without unrelated Windows dependency downgrades.
+
+The security updates address GO-2026-6859 (HTTP/1 connection-close header race)
+and GO-2026-6865 (compression parser panic). Neither change weakens protocol or
+security policy. No local HTTP/2 or HTTP/3 fork source was changed. Fork pin and
+patch provenance verification passed. No DNSSEC, TLS verification, ownership,
+revocation or packet validation bypass was introduced.
+
+Performance evidence
+====================
+Isolated baseline/candidate capsule-writer and full-queue allocation tests and
+benchmarks are preserved as caddy/writer-* and caddy/queue-*; allocation changes
+are the primary conclusion, not shared-host timing. Authentication/lease
+measurements and candidate pool analysis are retained under the preceding audit
+and round-2 artifacts. Recent-lease cleanup now has a deterministic per-activity
+work bound; correctness still depends on use-time expiry checks, which remain.
+
+The interval address-pool candidate was rejected: common default-pool operations
+regressed 14-52% and fragmented heap use increased 2.87 times. No claim of
+improved public-WAN throughput is made from local microbenchmarks.
+
+Final validation
+================
+Go race JSON counts distinguish top-level tests from nested cases. Do not add
+these counts to overlapping interop runs as a unique-test total.
+
+Suite / caddy evidence file                     Top / nested pass / failures
+Go 1.26.11 full race, secured-race.json          203 / 162 / 0
+Go 1.27.4 full race, go1274-race.json            204 / 171 / 0
+HTTP/2+HPACK+httpcommon race, go1274-h2-race      525 / 384 / 0
+HTTP/3 race, go1274-h3-race                      190 / 479 / 0
+QUIC core normal, quic-core-final               959 / 874 / 0
+QUIC core race, quic-core-race-final             958 / 872 / 0
+
+Skip handling:
+- Full root runs skip three privileged host-network cases; all three pass
+  separately under race with real isolated nftables (interop/hostnet-secured).
+- The CLI interop skip on Go 1.26.11 is closed by a separate nine-case run;
+  Go 1.27.4 includes those cases in its full run.
+- The intentionally top-level-skipped lifecycle helper is executed through its
+  parent subprocess test; it is not a standalone passing test.
+- QUIC skips two root-only forced socket-buffer tests outside the container;
+  both pass under race in the isolated privileged fixture.
+- The allocation-sensitive QUIC frame parser test is included in normal tests
+  and intentionally omitted from the race build.
+- HTTP/2 still skips its external-internet test. The upstream incremental HPACK
+  stress test is enabled in a scratch overlay: its normal build passes (one
+  MiB name and value, one-byte input increments, exact decoded field checked).
+  Its race build exceeded 90 seconds. This is not a passing race stress test or
+  evidence of a production slowdown; the upstream skip exists for slow execution.
+
+Further checks:
+- QUIC real-UDP suites pass for versions 1 and 2, including migration, PMTU,
+  datagrams, key updates and reset behavior (quic-wire-v{1,2}-final.log).
+- Both fork provenance checks, HTTP/2 security gate, go vet and module checksum
+  verification pass. Capsule stream fuzzing: 644043 executions in 30 seconds,
+  no failure (fuzz-final.log). Fuzz duration is finite, not exhaustive proof.
+- Final kernel E2E after security update: 229 passed, zero failures/skips.
+  Includes a 20-second outage that resumes without QUIC reconnect, idle-timeout
+  recovery, dual-stack NAT, MTU, reload/crash cleanup and lossy/slow H2/H3 paths.
+  Userspace NETSIM models latency/jitter/loss/bandwidth; kernel netem was absent.
+- Independent RFC 9484/9297 wire probe: 75 passed, zero failures/skips.
+- Current clients under server race checking: CLI 9, NF 8, Headless 8,
+  Mac/Killswitch 16, CF generic frontend 8 cases; all pass. IPv4-only/dual-stack,
+  H3 datagrams/capsules, H2 and HTTP/1.1 are covered where applicable.
+  NF/Headless use separate immutable executables, built sequentially, because
+  their fixture projects share an output executable name in the common cache.
+  Pre/post hashes match (interop/frozen-clients/). Earlier concurrent runs using
+  the shared output path are superseded, not counted as source-bound evidence.
+- IETF portable GUI core: 107 tests, zero failures/skips against the actual
+  kernel server. This does not exercise AppKit or Network.framework.
+- Eight installer fixture tests pass; shell syntax checks pass. Fixtures do not
+  prove packaging on every supported operating system.
+
+Security scan provenance
+========================
+govulncheck 1.9.0, source/symbol mode, Go 1.26.11 and Go 1.27.4:
+zero reachable advisories in both runs. JSON findings were parsed by reachability;
+exit status alone is not the conclusion. See caddy/security-final-summary.json.
+
+The local database was generated from the official golang/vulndb repository
+because direct database access was unavailable. Its metadata reports last
+modified 2026-11-11T02:51:11Z. Go archives were obtained from the official download
+host and verified against go.dev release SHA256 values. compress was obtained
+from its official origin and verified by go.sum. A blocked database-generator
+dependency was fetched from its official origin and its canonical module hash
+checked against go.sum; no production dependency replacement was introduced.
+
+Only module-level GO-2026-5932 remains: deprecated x/crypto/openpgp, which is not
+reachable in this program. Explicit advisory lookups for the transport fork
+upstream versions returned no advisories; local fork verification also passed.
+All 12 Cargo locks across both repositories have no known vulnerabilities or
+unsoundness findings in the pinned RustSec snapshot. Remaining unmaintained
+dependency warnings are documented in the masque-vpn companion report. Registry
+yank checks were disabled; no claim is made about unqueried current yank state.
+
+Limits and reproduction
+=======================
+Finite tests do not prove all IETF requirements, inputs or schedules. Source
+inventory is not a claim of line-by-line review of all vendored upstream code.
+Failed/skipped/interrupted commands remain in the evidence directory and do not
+count as passes. The final suite results above supersede earlier incomplete runs.
+Native macOS framework/UI/PF behavior, code signing, ARM runtime and live public
+WAN/Cloudflare behavior were unavailable. No claim of zero possible regressions
+or universal speedup is made.
+
+Use the patched Go toolchain with GOTOOLCHAIN=local; full validation used
+GOMAXPROCS=2 and -p 2. Run maintained root, HTTP/2 security and transport fork
+test entry points; use MASQUE_CLIENT to enable CLI interop. Root-only tests need
+an isolated TUN/nftables environment. The local environment/run-kernel.sh avoids
+host networking and host firewall changes. Complete outputs, scratch overlays,
+source hashes, binaries and immutable-client matrix hashes are retained under
+the evidence root. Companion details are in masque-vpn's
+docs/validation/performance-audit/round2-local-audit.txt.
+
+Pre-commit follow-up
+===================
+Independent review found no additional Caddy production blocker. The Go 1.27.4
+full race suite was rerun with -count=1, GOMAXPROCS=2, -p 2 and the real
+MASQUE_CLIENT: 204 top-level and 171 nested cases passed, zero failed. Its three
+privileged ruleset skips were separately rerun in an isolated container and all
+passed; the remaining top-level skip is the parent-driven lifecycle helper.
+See precommit-round2/caddy-race.json and caddy-hostnet.log.
+
+The companion CF gateway's delayed reload race and VLESS dependency preparation
+index-flag gap were found and fixed before committing, with failing controls and
+passing regressions. Those fixes do not change Caddy production source. Earlier
+test counts and source hashes above remain historical evidence rather than being
+silently replaced with hashes of later source.

@@ -97,7 +97,7 @@ Existing users carry over as they are: each `[[user]]` in `server.toml` becomes 
 
 ## Building by hand
 
-Needs Go 1.26.9 or 1.27.2, or a later reviewed patch of those lines:
+Needs Go 1.26.11 or 1.27.4, or a later reviewed patch of those lines:
 
 ```sh
 (

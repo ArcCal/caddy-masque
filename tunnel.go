@@ -117,12 +117,20 @@ type capsuleWriter struct {
 	mu    sync.Mutex
 	w     io.Writer
 	flush func() error
+	buf   []byte
 }
 
+// Retain room for normal IP packets, not exceptional large control capsules.
+// The buffer belongs to this writer and is never shared between sessions.
+const maxRetainedCapsuleBuffer = 2048
+
 func (cw *capsuleWriter) writeCapsule(c proto.Capsule) error {
-	b := proto.Append(nil, c)
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
+	b := proto.Append(cw.buf[:0], c)
+	if cap(b) <= maxRetainedCapsuleBuffer {
+		cw.buf = b[:0]
+	}
 	if _, err := cw.w.Write(b); err != nil {
 		return err
 	}
