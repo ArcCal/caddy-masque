@@ -1,0 +1,74 @@
+Pre-push support/client integration review - 2026-11-13
+
+Raw evidence directory: /workspace/work/perf-audit/caddy
+Relative log names below refer to that directory.
+
+Read-only production review
+Reviewed actual diffs and adjacent lease ownership/cleanup, native queue input,
+packet construction/fragmentation, test transport shutdown, synthetic H2 peer,
+installer fixture and reference interop authority paths. Read both AGENTS,
+design objectives and relevant history. Existing passing logs were checked.
+No concrete production regression was identified in these reviewed changes.
+
+- Caddy membership guard uses the same exact netip equality as invalidation,
+  remains under poolMu and preserves copy-on-write for matching records.
+- NF try_reserve immediately sends without retaining a permit across await;
+  bounded FIFO, closed-channel result and overflow accounting remain intact.
+- VLESS fitting-packet ownership transfer follows checked family/length and
+  complete header/checksum generation; oversized fragmentation is unchanged.
+- Fixture changes retain the original payload, TLS, authentication and server
+  cleanup checks. Bounded endpoint drain repairs process lifetime; it does not
+  establish native Apple lifecycle validation or prove the initial failure's
+  precise cause. Installer trusted executable discovery is only substituted
+  in its disposable mocked script; production trusted-path logic is unchanged.
+
+Concrete required-entrypoint mismatch
+Caddy .github/workflows/validate.yml invokes tests/run-client-wrapper-interop.py
+without the masque-vpn Headless adapter. The earlier successful 24-case audit
+used that adapter, which repairs stale temporary local-package lock records and
+an old NF descriptor. Direct --compile-only exited 101 at cargo metadata --locked:
+"cannot update the lock file .../Cargo.lock because --locked was passed".
+Original failure log: push-review-direct-runner.log.
+The Caddy descriptor also lacked current NF Server.proxy and Server.forwarded.
+This drift predates the performance changes but blocks the required CI entrypoint.
+
+Minimal targeted repair
+- tests/clients/Cargo.lock: only the two local Mac/Killswitch package versions
+  changed from 3.0.0 to their current 3.0.3. Registry versions/checksums unchanged.
+- tests/clients/nf_support-extension.rs: initialize the current descriptor's
+  proxy and forwarded fields using the existing validated Headless descriptor.
+  The proxy has manage=false and no reference listener/task is started.
+No runner, CI workflow, production transport, --locked requirement, timeout,
+case count or skip rejection was weakened. The direct runner is now exercised
+with --release, matching CI's optimized Rust harness choice and Go race checking.
+
+Cross-repository coordination
+Caddy's new endpoint drain calls Backend::quic_endpoints(), added in masque-vpn
+Core/tests/support. Make the matching masque-vpn commit available before Caddy
+CI fetches it. The direct runner uses NF GUI Core; it does not use the newly
+separated Headless Core. Parent handles the independent latest-main/Headless review.
+
+Validation commands (documented local Rust/Go environment):
+  python3 -B tests/run-client-wrapper-interop.py --masque-vpn-root /workspace/masque-vpn --release --compile-only
+  python3 -B tests/run-client-wrapper-interop.py --masque-vpn-root /workspace/masque-vpn --release
+Logs: push-review-direct-compile.log and push-review-direct-final.txt.
+Input hashes: push-review-source-hashes.json. Final results are recorded below.
+
+Compile-only result: exit 0. Rust optimized build completed in 2m 53s; Go race
+compile completed in 1.155s. Its zero-case output is explicitly compilation
+evidence, not an interoperability pass. All 11 recorded relevant source hashes
+were unchanged before launching the full direct matrix.
+
+Final direct-entrypoint result: exit 0. All 16 Mac/Killswitch and all 8 NF
+portable-core matrix cases passed under Go race checking, with optimized Rust
+harnesses. Zero failing/skipped cases; Go package elapsed 305.726 seconds.
+The original runner also verified the exact expected case sets. No Headless
+adapter or temporary descriptor monkeypatch was used for this successful run.
+All 11 recorded relevant source hashes were unchanged after the run. Optimized
+executable hashes are recorded in push-review-binary-hashes.json and remained
+unchanged through the final matrix checks.
+
+Result: the reproduced official-entrypoint blocker is repaired and the reviewed
+changes are ready for coordinated source submission. Remote CI, native Apple
+and privileged kernel/release acceptance remain separate; no such pass is
+claimed from this local protocol matrix. No commit or push was performed.

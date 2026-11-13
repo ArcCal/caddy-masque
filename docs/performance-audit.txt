@@ -1,0 +1,346 @@
+Caddy MASQUE server performance audit
+
+Raw evidence directory: /workspace/work/perf-audit/caddy
+Relative log and scratch-source names below refer to that directory.
+Source baseline: 3b5963f. Adopted one minimal production change: core.acquire
+skips copying unrelated recent-lease address slices. Added one dual-stack
+ownership/conntrack regression; no other production changes. The NF interop
+fixture additionally waits for its QUIC test transport to drain before exit.
+Toolchain: official Go 1.26.10 linux/amd64; GOMAXPROCS=2, build -p2.
+The shared host has a four-CPU cgroup quota. Concurrent initial builds affect
+absolute timings; allocation counts and paired local comparisons are the stronger
+microbenchmark evidence. No WAN throughput extrapolation is justified.
+
+SCOPE AND EVIDENCE
+Read AGENTS.md, README, docs/design.md, CHANGELOG, prior audit and conformance
+records, relevant commit history, core.go, session.go, tunnel.go, handler request
+and tunnel setup, app.go listener/config lifecycle, metrics.go, hostnet TUN setup,
+packet parsing/checksums, Capsule decoder, routes, authentication and address pool.
+Independent auth/routes sub-audit: auth-routes.txt, with additional production
+file coverage. Focused pinned fork review includes datagram_queue.go, protocol
+receive-window/default limits, and patch contracts. Strict fork verification
+compares the complete shipped forks to authenticated upstream plus recorded
+patches. This is not a line-by-line audit of every third-party dependency or a
+proof that no undiscovered defect exists.
+
+PERFORMANCE FACTORS AND EXPERIMENTS
+1. Capsule encoding (tunnel.go writeCapsule): proto.Append(nil,c) allocates a new
+   frame for each packet, before taking the writer mutex. Every H2 packet also
+   calls Flush. CPU/GC and syscall/frame overhead can limit small-packet rates.
+   Experimental auditReuseWriter uses a bounded, writer-owned buffer under the
+   existing mutex. Wire bytes are compared across 0/64/1280/65535 byte payloads.
+   It deliberately changes no framing, flush frequency, ordering, or security
+   behavior. Buffer retention trades bounded per-session memory for allocation
+   savings. Candidate stays in a Go overlay, not production.
+2. Capsule decode (internal/proto/capsule.go): Push appends, Next copies payload,
+   and the empty buffer is nilled. This ensures independently owned values and
+   bounds retention, but creates steady allocation on stream transports.
+   Ownership-preserving reuse needs separate lifetime tests; no unsafe zero-copy
+   patch is proposed. Production decoder allocations are benchmarked.
+3. Historical lease admission (core.acquire): each fresh assigned address scans
+   every remembered user under poolMu and clones unrelated address slices. The
+   recent map retains historical entries indefinitely unless that name reconnects.
+   This is admission latency, not packet throughput. Candidate adds a membership
+   check before cloning/updating unrelated entries, preserving invalidation for
+   an actually reused address. Adopted after the overlay experiment. Benchmarks
+   use 0/1000/10000 historical names, which
+   can accumulate across configured-user churn; they are not a claim that all
+   deployments have that history. This does not remove the O(history) scan or
+   claim to solve map retention. It only eliminates copies of unrelated slices.
+4. Pool near exhaustion: production allocator scans sequentially under poolMu.
+   /112 is an accepted IPv6 pool. With just one free entry it measured about
+   2.27-2.38ms vs 4.59-5.82us for a similarly full /24, and 138-159ns for a fresh
+   /64. This is a worst-case accepted configuration, not typical /64 behavior.
+   Do not remove conntrack cleanup or address ownership checks to speed admission.
+5. Host-to-client queue: 1024 packets, age cap 200ms. A full queue allocates/copies
+   the packet before dropping it. A slow transport can therefore cause avoidable
+   GC work. Increasing queues trades loss for latency/memory and is not a general
+   fix. Full-queue drops currently bypass the exported drop counter, while age
+   drops increment it; the metric cannot fully diagnose saturation from code.
+6. One TUN reader and a userspace copy per accepted host packet; every inbound
+   client packet calls one TUN write. No TUN multiqueue/GSO batching is configured.
+   These are scalability candidates, not measured kernel bottlenecks here.
+   Kernel impairment/netns end-to-end capability must be checked separately.
+7. Transport tradeoffs: H1/H2 carry IP packets on reliable TCP streams; loss can
+   impose outer TCP head-of-line delay and interact with inner TCP. H3 Capsules
+   still serialize reliable stream bytes. H3 DATAGRAM avoids that reliability but
+   still shares congestion control and bounded queues. Never silently fall back
+   to reliable delivery for an oversized negotiated Datagram (RFC 9484 10.1).
+8. QUIC flow control defaults: 512KiB initial stream window, 768KiB initial
+   connection window, 6MiB stream maximum and 15MiB connection maximum. These can
+   constrain a high-bandwidth/high-RTT Capsule stream, while DATAGRAM frames are
+   not stream-flow-controlled. An increase needs memory-budget and peer-window
+   measurements; no unconditional window inflation is justified. The bandwidth-
+   delay product is throughput times RTT: windows should be compared with that
+   measured demand and concurrent-connection memory budget, not raised blindly.
+9. QUIC Datagram queues: 32 outbound frames (Add waits), 128 inbound frames
+   (overflow drops). The receiving fork allocates before checking full. The
+   server also has its own 1024-packet queue. Queue depth alone does not imply a
+   WAN throughput ceiling; pacing, congestion, RTT, loss and scheduling matter.
+10. MTU: server default is 1350, with IPv6 minimum 1280; initial QUIC packet sizing, actual
+    DATAGRAM overhead and PMTU determine usable payload. IPv4 DF feedback, IPv4
+    fragmentation and IPv6 MTU probes are protocol/security obligations. Disabling
+    them or increasing MTU without path validation is a rejected optimization.
+11. Authentication: Argon2 resource cost and per-source/global admission bounds
+    intentionally prevent brute-force and memory/CPU exhaustion. Cached successful
+    credentials accelerate reconnects. Concurrency follows runtime.NumCPU rather
+    than CPU/memory cgroup budget; deployment tuning is warranted, not weaker hashes.
+12. QUIC uses paced Reno mode (NewSentPacketHandler passes true to the
+    cubicSender constructor), inherited initial 32-datagram congestion window
+    and maximum 10000 datagrams. This is distinct from stream flow control.
+    Congestion algorithms/initial-window choices need fairness, loss and path
+    tests before tuning; no alternative controller is adopted. UDP socket
+    buffers target 7MiB; actual kernel limits and scheduling can change drops.
+    QUIC UDP batching/GSO support must not be confused with the unbatched TUN
+    path. No disabled security, congestion-credit or anti-amplification check is
+    an acceptable speed optimization.
+13. Shared-map lock contention, session-limit scans, metrics collection, scoped
+    DNS resolution (5s bound), conntrack subprocess cleanup, TLS/QUIC handshake,
+    and 30s host-network repair are additional latency/resource factors. Route
+    checks already use binary search; replacing them without evidence is rejected.
+
+SECURITY AND IETF BOUNDARIES
+Preserve source-address ownership/BCP38, private/link-local isolation, route scope,
+checksum validation before local ICMP, conntrack clearing before address reuse,
+TLS verification, authentication strength, bounded queues and the correct stream
+vs connection error codes. A throughput improvement obtained by dropping these
+checks is outside the user's requirements. Default session limits, cancellation,
+website behavior, reload rollback, graceful shutdown and malformed-input isolation
+are covered by the existing root suite; package-level skips are tracked below.
+
+DEPENDENCY ACCESS
+Default proxy downloads for three modules redirected to denied storage.googleapis.com.
+Official GitHub origins supplied circl/compress via GOPROXY=direct. Google API was
+fetched at github.com/googleapis/google-api-go-client tag v0.298.0 (commit
+6dcd60047ebda7f68b4cc0ab9bffa8c73b887096), normalized to its canonical module ZIP,
+and Go authenticated it against the original go.sum:
+h1:YW18RkHBMZBA1ergX0m4biagzgbiPTb2uTsRsDPWNRY=.
+No dependency versions, checksum verification, proxy trust or repository lockfiles
+were changed. Module cache: /home/agent/go/pkg/mod.
+
+LIMITATIONS
+Native arm64, Go 1.27, deployed TLS/DNS/NAT configuration, real TUN/kernel WAN
+throughput, NIC offloads, long-duration many-user soak and exhaustive fuzzing remain
+unrun. Loopback/protocol tests and microbenchmarks cannot substitute for them.
+The baseline full suite skips TestInteropMasqueClient without MASQUE_CLIENT.
+The later separate final-source interoperability phase supplies it and records
+actual cases below; no network claim is derived from the baseline skip.
+
+MEASURED CANDIDATES
+All timings are local synthetic microbenchmarks, three 200ms samples each.
+Historical admission creates IPv6 leases with unrelated remembered entries and
+stubs device/conntrack; rows are not active-session counts or packet throughput.
+
+History   Baseline bytes/allocations      Candidate bytes/allocations  Median ns
+0         49,656 B / 7                    49,656 B / 7                 15,331 -> 16,041
+1,000     121,656 B / 2,007               49,656 B / 7                 149,899 -> 44,407
+10,000    about 769,660 B / 20,007        about 49,656 B / 7           2,023,126 -> 195,216
+
+Raw evidence: bench.txt, acquire-candidate.txt, bench-overlay.json,
+candidate-overlay.json, performance_candidates_test.go, core-candidate.go.
+Adoption rationale: the 3-line guard uses the already-imported slices.Contains,
+changes neither address matching nor cleanup of matched entries, and removes
+2 allocations per unrelated two-address historical record. Matching entries keep
+snapshot copying. Full source validation after adoption is recorded separately.
+TestReusedAddressPreservesOtherFamilyReconnect validates selective invalidation,
+reclaiming the untouched IPv6 address without conntrack clearing, IPv4 conntrack
+clearing on both ownership changes, and immutable old lease address snapshots.
+Existing failed-cleanup, cancellation, expiry, session-limit and reload tests stay.
+
+Capsule write experiment (io.Discard, no socket/TLS/syscall benchmark):
+64 bytes: 88 B / 2 allocations -> 0 B / 0 allocations.
+1280 bytes: 1416 B / 2 allocations -> 0 B / 0 allocations.
+65535 bytes: 73736 B / 2 allocations -> unchanged because the proposed retained
+capacity cap rejects that frame. TestAuditReuseWire passed exact encoded bytes
+for 0/64/1280/65535/1280 payloads. This candidate was NOT adopted: serializing
+encoding under the writer lock, retained per-session memory, concurrent control
+frames and flush/error behavior need dedicated stress coverage and real I/O data.
+No speed conclusion is drawn from io.Discard's apparent MB/s.
+
+Production Capsule decoder measured 144 B/2 allocations at 64-byte payloads,
+2688 B/2 at 1280 bytes, and 139264 B/2 at 65535 bytes. No decoder change adopted.
+
+COMPLETED BASELINE VALIDATION
+Commands run with official Go 1.26.10, GOMAXPROCS=2 and module read-only mode:
+- go test -mod=readonly -p 2 -json ./...: exit 0; 345 passed test events,
+  5 skipped test events, 8 tested packages, 2 packages without test files.
+  tests-final.json/build-final.log. Initial dependency-blocked tests.json is NOT
+  the successful final baseline.
+- go test -race -mod=readonly -p 2 -json ./internal/... ./tests/netsim: exit 0;
+  99 passed events, 3 skipped nft syntax cases, 7 tested packages.
+  internal-race.json/internal-race-build.log.
+- In third_party/xnet: go test -race -mod=readonly -p 2 -json ./http2 ./http2/hpack
+  -run 'Test.*(FlowControl|Reset|Header|ExtendedConnect|Setting|Table|Conn)':
+  exit 0, 246 passed test events, no skips. h2-race.json/h2-race-build.log.
+- In third_party/quic-go: go test -race -mod=readonly -p 2 -json ./http3
+  -run 'Test.*(Datagram|Push|Frame|Settings|Window|Cancel)': exit 0,
+  85 passed events, no skips. h3-race.json/h3-race-build.log.
+- python3 -B tests/test-http2-security.py --json-summary security-summary.json
+  --json-log security-tests.json: passed all 31 required events (11 top-level,
+  20 nested), no missing/failing/skipped cases; Go -race and http2legacy.
+  Covers GO-2026-6603/6610/6611/6612/6617 and bounded initial window accounting.
+- python3 tests/verify-http2-fork.py and python3 tests/verify-http3-fork.py:
+  strict full-tree fork verification passed: verify-h2.txt, verify-h3.txt.
+  Verified pinned x/net v0.62.0 and quic-go v0.63.0 against upstream+documented
+  protocol/fixture patches and legal notice normalization. Nested modules were
+  tested explicitly; root go test alone does not cover them.
+- Baseline skips: TestInteropMasqueClient needs MASQUE_CLIENT; lifecycle exit
+  helper only runs as the subprocess launched by its parent test; three
+  internal/hostnet TestRuleset cases report "no nft to check the syntax".
+  Skips are not passes. Exhaustive nested-fork suites/fuzzing remain unrun.
+
+CURRENT SOURCE VALIDATION AFTER THE ADOPTED GUARD
+- go test -mod=readonly -p 2 -count=1 -json ./...: exit 0; 346 passed
+  test events, the same 5 explicit skips, 8 tested packages, 2 packages without
+  test files. Root package 81.061s. tests-current.json/build-current.log.
+- git diff --check: passed. Initial audited Caddy delta was 3 production lines in
+  core.go, the 36-line dual-stack lease regression in session_test.go, and
+  10 test-only lines in tests/clients/nf.rs for orderly Quinn endpoint drain.
+  The latter fixture is validated by the final interop matrix below.
+- go test -race -mod=readonly -p 2 -count=1 -json .: exit 0, 247 passed
+  test events, 2 explicit skips (interop without MASQUE_CLIENT, lifecycle helper);
+  root 95.362s. root-race-current.json/root-race-current-build.log.
+  The unchanged internal packages already passed their race suite. Independent
+  auth/routes reviewer approved exact-equality, poolMu, snapshot-copy, conntrack,
+  rollback and dual-stack ownership semantics of the minimal guard.
+
+INTEROPERABILITY HANDOFF
+The supplied Caddy root TestInteropMasqueClient covers production Rust CLI SOCKS
+with file and stdin configurations, HTTP/3 Datagram and Capsules, HTTP/2,
+HTTP/1.1, automatic choice, IPv4/IPv6 small/full-MTU packets, IPv6 MTU probe and
+stdin EOF cleanup. The native-client wrappers use the full current NF descriptor
+adapter in masque-nf-headless/test-caddy-interop.py and validate 16 Mac/Killswitch
+plus 8 NF portable-core cases under Go race checking. tests/run-cf-client-interop.py
+validates 8 CF generic frontend cases using current CF lockfiles/forks. These
+interop commands run after the client phase is complete; they do
+not validate actual Apple Network.framework, UI rendering, PacketTunnel routing,
+or production Cloudflare endpoints on this Linux host.
+
+ADDITIONAL TRANSPORT REGRESSIONS
+- In third_party/quic-go: go test -race -mod=readonly -p 2 -count=1 -json
+  ./internal/ackhandler ./internal/congestion
+  -run 'Test.*(Reno|Congestion|Amplification|Pacing|Window)': exit 0,
+  19 passed test events across 2 packages, no skips; quic-congestion-race.json.
+- In third_party/quic-go: go test -race -mod=readonly -p 2 -count=1 -json .
+  -run '^TestDatagramQueue': exit 0, 5 passed test events, no skips;
+  quic-datagram-race.json. These are bounded focused regressions, not the
+  exhaustive QUIC test suite.
+
+INITIAL INTEROPERABILITY RESULTS
+- Production masque-client: MASQUE_CLIENT=/workspace/work/nf-audit/rust-target/debug/masque-client
+  go test -race -mod=readonly -p 2 -count=1 -timeout 5m
+  -run '^TestInteropMasqueClient$' -json .: exit 0, all 9 matrix cases,
+  110.936s, no skips. interop-cli.json/interop-cli-build.log.
+- CF generic frontend: python3 -B tests/run-cf-client-interop.py
+  --masque-vpn-root /workspace/masque-vpn: exit 0, all 8 matrix cases,
+  Go-race package 110.971s, no skips. interop-cf.txt.
+- Initial current Mac/Killswitch+NF wrapper run: full command via
+  masque-nf-headless/test-caddy-interop.py --caddy-root /workspace/caddy-masque.
+  Mac/Killswitch 16/16 matrix cases passed. NF 7/8 passed; dual-stack/h3 FAILED
+  the Go waitNoSessions three-second assertion after every Rust protocol/data
+  subcase printed PASS. Full run exited 1, 316.106s; not counted as a passing
+  wrapper matrix. Raw failure preserved in interop-wrappers.txt.
+- Exact isolated original NF dual-stack/h3 repeated three times with diagnostic
+  Go overlay passed (42.616s). This does not negate the observed initial failure.
+  The teardown diagnosis and bounded orderly QUIC endpoint drain comparison
+  are recorded below. No production lifecycle change or server cleanup timeout
+  increase was made. Quinn Endpoint::wait_idle documents that immediate process
+  exit after local close can force peers to wait their idle timeout; the exact
+  original-failure causal stack remains unobserved.
+
+NF TEARDOWN DIAGNOSIS (FAILURE RETAINED)
+The unchanged NF helper used Backend::Drop (local conn.close) then waited only
+for the TCP SOCKS listening address to become bindable. This was not a completed
+QUIC wire shutdown: a scratch helper captured Quinn endpoint clones BEFORE core
+cancellation, then observed open_connections()==1 after the local listener was
+released. Awaiting each Endpoint::wait_idle with the existing 20-second operation
+bound reduced the count to zero before printing PASS/exiting.
+
+Quinn 0.11.12 endpoint.rs documents wait_idle as needed before process exit to
+make a good-faith effort to notify peers; immediate exit can force their idle
+timeout. Exact isolated original dual-stack/h3 tests passed 3+8 times (42.616s,
+115.634s). A paired scratch comparison with the same three Go repetitions passed
+both with drain (45.650s) and without drain (43.715s); the latter still logged
+one pending QUIC connection after local-listener release. Therefore the lifecycle
+gap is directly confirmed, while the original intermittent server residual was
+not reproduced in isolation and its exact causal stack was not captured. Do not
+claim the repeated passes alone explain or erase that failure.
+
+Artifacts: interop-nf-diagnostic.txt, interop-nf-diagnostic-8.txt,
+interop-nf-drain-candidate.txt, interop-nf-drain-disabled.txt;
+interop-diagnostic-overlay.json/caddy-test-diagnostic.go add server residual
+logging only in scratch, preserving the original three-second cleanup check.
+The adopted minimal correction affects test fixtures only: capture endpoints before
+cancellation and await bounded orderly drain before the helper process exits.
+No server timeout or production QUIC cancellation behavior is changed.
+
+FINAL FIXTURE VALIDATION
+Current test-only fix: Backend::quic_endpoints() in masque-vpn/masque-nf/Core/tests/
+support/mod.rs snapshots live endpoints. Caddy tests/clients/nf.rs captures them
+before normal cancellation, drops the backend, retains the local-listener check,
+and awaits each endpoint.wait_idle under the existing 20-second operation bound.
+The wrong-credential case drains any still-live endpoints too. The external Go
+waitNoSessions deadline remains exactly three seconds. Both repositories passed
+git diff --check; no diagnostic flags or forced exits are tracked.
+
+The complete 24-case matrix passed from frozen final sources, logged to
+interop-wrappers-final.txt. A separate scratch crash-control helper deliberately
+exited the final active H3 case before cancellation and failed the original Go
+server cleanup assertion as expected. It is not an original-race reproduction.
+
+NEGATIVE CONTROL AND FINAL SOURCE FREEZE
+A separate scratch caddy-nf-crash-control process deliberately exited the last
+active dual-stack H3 stream-zero case BEFORE cancellation/close. As expected,
+the unchanged server waitNoSessions assertion failed after three seconds.
+The diagnostic captured two address entries belonging to the same authenticated
+session plus running=1. Exit 1; Go package 19.030s. This validates the cleanup
+assertion detects missing peer shutdown; it is a deliberate abrupt-exit control,
+not a reproduction proving the original intermittent failure's exact cause.
+Raw diagnostic: interop-nf-crash-control.txt.
+
+The final tracked fixture additionally asserts a single live endpoint snapshot
+for accepted HTTP/3 cases, preventing the drain loop from passing vacuously.
+An early final-matrix run compiled before that assertion was added; it was
+explicitly interrupted with exit 130 and preserved as
+interop-wrappers-pre-guard-interrupted.txt, not counted as a successful matrix.
+The replacement full24 run uses frozen final sources and retains the unchanged
+12-second MTU-probe stability checks in each case.
+
+FINAL COMPLETED INTEROPERABILITY AND RULESET RESULTS
+- Final wrapper command exited 0: all 16 current Mac/Killswitch cases and all
+  8 current NF portable-core cases passed under Go race checking, zero skips,
+  zero failing cases. Package elapsed 314.161s. Runner explicitly checked all
+  distinct expected cases, then printed both complete-matrix success messages.
+  Current source uses the test-only endpoint drain and active-endpoint assertion.
+  Log: interop-wrappers-final.txt. The initial 23/24 failure remains recorded;
+  subsequent complete success is not claimed to prove all possible teardown
+  races absent or to reproduce native Apple Network.framework behavior.
+- Final interop total: CLI 9 + CF generic frontend 8 + Mac/Killswitch 16 + NF 8
+  = 41 distinct Caddy interoperability matrix cases passed, no final skips.
+- Parent's later targeted nft syntax gate passed in an isolated rootless network
+  namespace with extracted official nft: TestRuleset/v4, /dual_stack, /host_access
+  all passed (4 pass events including parent), zero skips. Original baseline
+  nft skips remain in their raw logs and are not relabeled as passes. This is
+  syntax validation, not a real TUN/NAT/forwarding or throughput acceptance test.
+  Command supplied by parent:
+  env PATH=/workspace/work/perf-audit/packages/root/usr/sbin:/workspace/work/perf-audit/caddy/go/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  LD_LIBRARY_PATH=/workspace/work/perf-audit/packages/root/usr/lib/x86_64-linux-gnu
+  GOMAXPROCS=2 unshare -Urn /workspace/work/perf-audit/caddy/go/bin/go test
+  -mod=readonly -p2 -count=1 -run '^TestRuleset$' -v ./internal/hostnet
+  Log: nft-ruleset-userns.txt.
+- Final git diff --check passed. No commits or pushes were made. No generated
+  __pycache__ source artifacts remain in the Caddy working tree.
+
+
+SUBSEQUENT PRE-PUSH REVIEW
+The official CI wrapper entrypoint initially failed on stale local-package
+lock records and an outdated NF test descriptor. The prior complete matrix had
+used the Headless compatibility entrypoint. This distinction was checked during
+pre-push review, then repaired with only two local-package version updates and
+the current descriptor fields. Registry pins, --locked, timeouts and assertions
+are unchanged. The official direct --release entrypoint now passes all 24 cases
+under Go race checking, zero failures/skips, 305.726s. Current independent
+Headless integration separately passes its maintained 24-case entrypoint.
+See performance-pre-push-review.txt and the companion repository's
+docs/validation/performance-audit/pre-push-review.md for exact scope and logs.
+No commit or push was performed by this review.

@@ -1101,6 +1101,42 @@ func TestReusedAddressesForgetTheirConnections(t *testing.T) {
 	}
 }
 
+func TestReusedAddressPreservesOtherFamilyReconnect(t *testing.T) {
+	// IPv4 has one client address, while IPv6 has room for fresh leases.
+	e := newTestEnv(t, &App{IPv4: "10.89.0.1/30", IPv6: "fd89::1/64"})
+	ctx := context.Background()
+	first := e.core.acquire(ctx, alice, true, true)
+	if first == nil {
+		t.Fatal("initial dual-stack lease failed")
+	}
+	addrs := slices.Clone(first.addrs)
+	first.release()
+	other := e.core.acquire(ctx, bob, true, false)
+	if other == nil {
+		t.Fatal("IPv4 reuse failed")
+	}
+	other.release()
+
+	// Reusing Alice's IPv4 address invalidates only that remembered address.
+	// Her IPv6 address and its connections remain hers to reclaim.
+	reconnected := e.core.acquire(ctx, alice, true, true)
+	if reconnected == nil {
+		t.Fatal("dual-stack reconnect failed")
+	}
+	defer reconnected.release()
+	if !slices.Equal(reconnected.addrs, addrs) {
+		t.Errorf("reconnect got %v, had %v", reconnected.addrs, addrs)
+	}
+	if !slices.Equal(first.addrs, addrs) {
+		t.Errorf("address invalidation changed the old lease: %v", first.addrs)
+	}
+	calls := e.forgetCalls()
+	want := []netip.Prefix{netip.PrefixFrom(addrs[0], 32)}
+	if len(calls) != 2 || !slices.Equal(calls[0], want) || !slices.Equal(calls[1], want) {
+		t.Errorf("expected only IPv4 reuse cleanup, got %v", calls)
+	}
+}
+
 func TestPoolExhaustion(t *testing.T) {
 	e := newTestEnv(t, &App{IPv4: "10.89.0.1/29", IPv6: "fd89::1/64"})
 	ctx := context.Background()

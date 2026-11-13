@@ -148,9 +148,15 @@ async fn case(server: &Server, mode: &str, family: &str, limit: Option<usize>, s
     if expected == "HTTP/3" { ensure!(backend.opened.lock().unwrap().iter().all(|(kind, _)| *kind != OPEN_TCP), "forced NF HTTP/3 fell back to TCP"); }
     ensure!(backend.opened.lock().unwrap().len() == 1 && backend.status.borrow().1 == expected,
         "NF reconnected or changed transport during the established session");
+    let endpoints = backend.quic_endpoints();
+    ensure!(expected != "HTTP/3" || endpoints.len() == 1, "NF test transport lost its active QUIC endpoint before shutdown");
     task.abort(); let _ = task.await;
     drop(backend);
     within(async { loop { if std::net::TcpListener::bind(address).is_ok() { break; } tokio::time::sleep(Duration::from_millis(10)).await; } }).await?;
+    // Local listener release does not mean the QUIC close reached the peer.
+    // Keep the runtime alive for Quinn's bounded closing/draining period.
+    within(async { for endpoint in endpoints { endpoint.wait_idle().await; } })
+        .await.context("NF test transport did not finish QUIC shutdown")?;
     println!("PASS NF {mode} {family} capacity={limit:?} idle-stream-zero={stream_zero}: verified transport, DNS, TCP half-close/100013 bytes, UDP full1280-byte IP packets, family isolation, cancellation");
     Ok(())
 }
@@ -166,6 +172,10 @@ async fn refusal(server: &Server, mode: &str) -> Result<()> {
     let expected = if mode == "http/1.1" { "200 OK" } else { "404 Not Found" };
     ensure!(format!("{error:#}").contains(expected), "NF refusal did not carry expected {expected}: {error:#}");
     ensure!(backend.status.borrow().0 != 1, "NF declared connected with wrong credentials");
+    let endpoints = backend.quic_endpoints();
+    drop(backend);
+    within(async { for endpoint in endpoints { endpoint.wait_idle().await; } })
+        .await.context("NF refused test transport did not finish QUIC shutdown")?;
     println!("PASS NF {mode} wrong credentials: {expected}, no connected state");
     Ok(())
 }

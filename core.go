@@ -502,6 +502,9 @@ func (c *core) acquire(ctx context.Context, user auth.User, v4, v6 bool) *lease 
 		}
 		// Someone else's address now: no longer theirs to reclaim.
 		for name, r := range c.recent {
+			if !slices.Contains(r.addrs, a) {
+				continue
+			}
 			kept := r.addrs[:0:0]
 			for _, x := range r.addrs {
 				if x != a {
