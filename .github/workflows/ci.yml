@@ -5,9 +5,9 @@
 # started by hand with the tag of an existing release builds and attaches
 # that tag's code the same way (for a release whose own run failed).
 #
-# The end-to-end test needs masque-vpn's client, from the private
-# ArcCal/masque-vpn repository. MASQUE_VPN_TOKEN must hold a token that can
-# read it; missing access fails validation and prevents artifact uploads.
+# End-to-end tests use ArcCal/masque-vpn. Public checkouts use the job token;
+# private checkouts require MASQUE_VPN_TOKEN with read access. Checkout or
+# test failure prevents artifact uploads.
 name: ci
 
 on:

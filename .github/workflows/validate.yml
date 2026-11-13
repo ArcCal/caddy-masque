@@ -96,13 +96,12 @@ jobs:
         go: ["1.26", "1.27"]
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     env:
-      HAVE_CLIENT: ${{ secrets.MASQUE_VPN_TOKEN != '' }}
       TRUSTED_SOURCE: ${{ (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
-      - name: Require authenticated client checkout for interoperability tests
-        if: env.HAVE_CLIENT != 'true' || env.TRUSTED_SOURCE != 'true'
+      - name: Require trusted source for interoperability tests
+        if: env.TRUSTED_SOURCE != 'true'
         run: |
-          echo "::error::required interoperability tests cannot run: MASQUE_VPN_TOKEN must read ArcCal/masque-vpn, and fork pull requests need validation from a trusted repository branch"
+          echo "::error::required interoperability tests cannot run: fork pull requests need validation from a trusted repository branch"
           exit 1
       - uses: actions/checkout@v7
         with:
@@ -112,7 +111,7 @@ jobs:
         with:
           persist-credentials: false
           repository: ArcCal/masque-vpn
-          token: ${{ secrets.MASQUE_VPN_TOKEN }}
+          token: ${{ secrets.MASQUE_VPN_TOKEN || github.token }}
           path: masque-vpn
       - uses: actions/setup-go@v7
         with:
