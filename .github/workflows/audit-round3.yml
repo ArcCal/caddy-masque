@@ -1,0 +1,15 @@
+name: Cross-platform audit round 3
+
+on:
+  push:
+    branches: [audit-round3]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+    secrets:
+      MASQUE_VPN_TOKEN: ${{ secrets.MASQUE_VPN_TOKEN }}
