@@ -499,7 +499,7 @@ func testHandshakeCloseListener(t *testing.T, createListener func(*tls.Config) *
 
 	select {
 	case <-connQueued:
-	case <-time.After(scaleDuration(10 * time.Millisecond)):
+	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for connection queued")
 	}
 

@@ -138,11 +138,12 @@ short, for example by a write deadline (`http.ResponseController`'s
 reading), can end inside a DATA frame. Upstream still closed the stream with a
 FIN, and RFC 9114 Section 7.1 requires the peer to treat a cleanly ended stream
 whose last frame was truncated as a connection error of type H3_FRAME_ERROR,
-which ends every other request on that connection. Now the first failed write
-is remembered, later writes return it, and `Stream.Close` (used by the server
-after a handler returns, by hijacked streams such as CONNECT-IP tunnels and by
-`RequestStream.Close`) resets the send direction with H3_REQUEST_CANCELLED
-(RFC 9114 Section 8.1). Complete writes still end with a FIN.
+which ends every other request on that connection. Before the v0.65 migration,
+the first failed write was remembered and later writes returned it. In the current
+fork, `Stream.Close` (used by the server after a handler returns, by hijacked
+streams such as CONNECT-IP tunnels and by `RequestStream.Close`) resets an
+unfinished or still-failed send direction with H3_REQUEST_CANCELLED (RFC 9114
+Section 8.1). Complete writes still end with a FIN.
 
 `http3/truncated_write_test.go` checks both cases: on the unpatched fork the
 failed-write case failed 20 of 20 runs (the stream kept writing and was never
@@ -246,3 +247,10 @@ migration without these corrections.
 The HTTP/3 qlog tracer entry point used by Caddy is retained as a forwarding
 function to the upstream QUIC tracer. Both event schemas are registered by the
 new upstream implementation; QLOGDIR behavior and disabled tracing are tested.
+
+The macOS race suite exposed upstream fixtures that assumed a handshake or
+request started within 10 ms. Listener shutdown tests now synchronize with
+handshake and handler events. Deadline shutdown checks use the actual deadline
+and bounded completion, excluding unrelated connection setup time. Error codes,
+continued service of existing connections, and graceful request completion
+remain required.

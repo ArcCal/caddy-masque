@@ -1304,6 +1304,17 @@
  	}, time.Second, 5*time.Millisecond)
  	require.Greater(t, packetsPath1.Load(), c1BeforeSwitch)
  	// some path probing might have happened
+--- a/integrationtests/self/handshake_test.go
++++ b/integrationtests/self/handshake_test.go
+@@ -499,7 +499,7 @@
+ 
+ 	select {
+ 	case <-connQueued:
+-	case <-time.After(scaleDuration(10 * time.Millisecond)):
++	case <-time.After(time.Second):
+ 		t.Fatal("timeout waiting for connection queued")
+ 	}
+ 
 --- a/integrationtests/self/mtu_test.go
 +++ b/integrationtests/self/mtu_test.go
 @@ -186,7 +186,7 @@

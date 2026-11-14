@@ -2887,6 +2887,123 @@
  
  			t.Logf("HTTP/2 request: %+v", h2Request)
  			t.Logf("HTTP/3 request: %+v", h3Request)
+--- a/integrationtests/self/http_shutdown_test.go
++++ b/integrationtests/self/http_shutdown_test.go
+@@ -8,6 +8,7 @@
+ 	"net"
+ 	"net/http"
+ 	"net/url"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -195,43 +196,46 @@
+ func TestGracefulShutdownLongLivedRequest(t *testing.T) {
+ 	delay := scaleDuration(25 * time.Millisecond)
+ 	errChan := make(chan error, 1)
+-	requestChan := make(chan time.Duration, 1)
++	requestChan := make(chan time.Time, 1)
++	deadlineChan := make(chan time.Time, 1)
+ 
+ 	var server *http3.Server
+ 	mux := http.NewServeMux()
+ 	port := startHTTPServer(t, mux, func(s *http3.Server) { server = s })
+ 	mux.HandleFunc("/shutdown", func(w http.ResponseWriter, r *http.Request) {
+-		start := time.Now()
+ 		w.WriteHeader(http.StatusOK)
+ 		w.(http.Flusher).Flush()
+ 
+ 		// The request simulated here takes longer than the server's graceful shutdown period.
+ 		// We expect it to be terminated once the server shuts down.
+-		go func() {
+-			ctx, cancel := context.WithTimeout(context.Background(), delay)
+-			defer cancel()
+-			errChan <- server.Shutdown(ctx)
+-		}()
+-
+-		// measure how long it takes until the request errors
+-		for t := range time.NewTicker(delay / 10).C {
++		ctx, cancel := context.WithTimeout(context.Background(), delay)
++		defer cancel()
++		deadline, _ := ctx.Deadline()
++		deadlineChan <- deadline
++		go func() { errChan <- server.Shutdown(ctx) }()
++
++		// The request must remain active until the shutdown deadline expires.
++		ticker := time.NewTicker(delay / 10)
++		defer ticker.Stop()
++		for t := range ticker.C {
+ 			if _, err := w.Write([]byte(t.String())); err != nil {
+-				requestChan <- time.Since(start)
++				requestChan <- time.Now()
+ 				return
+ 			}
+ 		}
+ 	})
+ 
+-	start := time.Now()
+-	resp, err := newHTTP3Client(t).Get(fmt.Sprintf("https://localhost:%d/shutdown", port))
++	client := newHTTP3Client(t)
++	client.Timeout = time.Second
++	resp, err := client.Get(fmt.Sprintf("https://localhost:%d/shutdown", port))
+ 	require.NoError(t, err)
+ 	require.Equal(t, http.StatusOK, resp.StatusCode)
+ 	_, err = io.Copy(io.Discard, resp.Body)
+ 	var h3Err *http3.Error
+ 	require.ErrorAs(t, err, &h3Err)
+ 	require.Equal(t, http3.ErrCodeNoError, h3Err.ErrorCode)
+-	took := time.Since(start)
+-	require.InDelta(t, delay.Seconds(), took.Seconds(), (delay / 2).Seconds())
++	deadline := <-deadlineChan
++	require.False(t, time.Now().Before(deadline), "request terminated before shutdown deadline")
+ 
+ 	// make sure that shutdown returned due to context deadline
+ 	select {
+@@ -242,8 +246,8 @@
+ 	}
+ 
+ 	select {
+-	case requestDuration := <-requestChan:
+-		require.InDelta(t, delay.Seconds(), requestDuration.Seconds(), (delay / 2).Seconds())
++	case stoppedAt := <-requestChan:
++		require.False(t, stoppedAt.Before(deadline), "handler terminated before shutdown deadline")
+ 	case <-time.After(time.Second):
+ 		t.Fatal("did not receive request duration")
+ 	}
+@@ -384,7 +388,11 @@
+ 		w.WriteHeader(http.StatusOK)
+ 	})
+ 	handlerChan := make(chan struct{})
++	releaseHandler := sync.OnceFunc(func() { close(handlerChan) })
++	t.Cleanup(releaseHandler)
++	handlerStarted := make(chan struct{})
+ 	mux.HandleFunc("/long", func(w http.ResponseWriter, r *http.Request) {
++		close(handlerStarted)
+ 		<-handlerChan
+ 		w.WriteHeader(http.StatusOK)
+ 	})
+@@ -438,7 +446,11 @@
+ 			defer cancel()
+ 			longReqChan <- dial(t, ctx, u)
+ 		}()
+-		time.Sleep(scaleDuration(10 * time.Millisecond))
++		select {
++		case <-handlerStarted:
++		case <-time.After(time.Second):
++			t.Fatal("long request did not reach the handler")
++		}
+ 
+ 		go func() { shutdownChan <- server.Shutdown(context.Background()) }()
+ 	} else {
+@@ -501,7 +513,7 @@
+ 		case <-time.After(scaleDuration(10 * time.Millisecond)):
+ 		}
+ 
+-		close(handlerChan)
++		releaseHandler()
+ 		select {
+ 		case err := <-longReqChan:
+ 			require.NoError(t, err)
 --- a/integrationtests/self/http_test.go
 +++ b/integrationtests/self/http_test.go
 @@ -1082,6 +1082,7 @@
