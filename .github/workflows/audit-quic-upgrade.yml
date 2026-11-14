@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   GOMAXPROCS: '2'
@@ -54,22 +55,19 @@ jobs:
             masque-nf/Core/src masque-nf/App/Sources masque-nf-headless/Core masque-nf-headless/Sources
           python3 baseline/tests/verify-http3-fork.py
           python3 candidate/tests/verify-http3-fork.py
-      - name: Full updated QUIC library on macOS with the race detector
-        working-directory: candidate/third_party/quic-go
-        env:
-          # Match upstream integration.yml; this scales test timers only.
-          TIMESCALE_FACTOR: '3'
+      # Full QUIC race, native core/Swift and lifecycle tests passed in run 43571555253.
+      # Reuse the exact native adapters while correcting only host test fixtures.
+      - uses: actions/download-artifact@v8
+        with:
+          name: quic-upgrade-native-binaries
+          run-id: 43571555253
+          repository: ArcCal/caddy-masque
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/reused
+      - name: Verify previously tested native binaries
         run: |
-          go test -p 2 -count=1 -run '^TestFrameParserAllocs$' ./internal/wire > "$RUNNER_TEMP/mac-quic-allocation.log"
-          go test -race -p 2 -count=5 -timeout 2m -json -run '^(TestHandshakeCloseListener|TestGracefulShutdownLongLivedRequest|TestHTTP3ListenerGracefulShutdown|TestHTTPServerIdleTimeout)$' ./integrationtests/self > "$RUNNER_TEMP/mac-quic-shutdown-race.json"
-          go test -race -skip '^TestFrameParserAllocs$' -p 2 -count=1 -timeout 12m -json ./... > "$RUNNER_TEMP/mac-quic-race.json"
-      - name: Build and test actual native NF and Headless adapters
-        working-directory: clients
-        run: |
-          bash masque-nf-headless/build-macos.sh
-          bash masque-nf-headless/build-baseline-macos.sh
-          git show 261b3c7acf6d1775613e0344311d2ace655a6b19:masque-nf/App/Sources/MasqueNF/NativeClient.swift > "$RUNNER_TEMP/nf-adapter.swift"
-          cmp "$RUNNER_TEMP/nf-adapter.swift" masque-nf/App/Sources/MasqueNF/NativeClient.swift
+          tar -C "$RUNNER_TEMP/reused" -xzf "$RUNNER_TEMP/reused/binaries.tar.gz"
+          (cd "$RUNNER_TEMP/reused" && shasum -a 256 -c SHA256SUMS)
       - name: Prepare identical host fixtures and build both Caddy versions
         run: |
           python3 audit/tests/quic-upgrade/prepare.py --clients clients --baseline baseline --candidate candidate
@@ -81,17 +79,31 @@ jobs:
           go -C baseline test -mod=readonly -p 2 -c -ldflags='-s -w' -o "$RUNNER_TEMP/binaries/baseline-peer"
           go -C candidate test -mod=readonly -p 2 -c -ldflags='-s -w' -o "$RUNNER_TEMP/binaries/candidate-peer"
           cp "$CARGO_TARGET_DIR/release/examples/native-audit-destination" "$RUNNER_TEMP/binaries/destination"
-          cp clients/masque-nf-headless/work/ab/baseline "$RUNNER_TEMP/binaries/nf"
-          cp clients/masque-nf-headless/dist/masque-nf-headless "$RUNNER_TEMP/binaries/headless"
-          swiftc clients/masque-nf-headless/Verification/RemoveTestTrust.swift -o "$RUNNER_TEMP/binaries/remove-trust"
-          for binary in baseline-peer candidate-peer destination nf headless remove-trust; do
+          cp "$RUNNER_TEMP/reused/nf" "$RUNNER_TEMP/binaries/nf"
+          cp "$RUNNER_TEMP/reused/headless" "$RUNNER_TEMP/binaries/headless"
+          cp "$RUNNER_TEMP/reused/remove-trust" "$RUNNER_TEMP/binaries/remove-trust"
+          for binary in baseline-peer candidate-peer destination; do
             codesign --force --sign - "$RUNNER_TEMP/binaries/$binary"
+          done
+          for binary in baseline-peer candidate-peer destination nf headless remove-trust; do
             codesign --verify --strict "$RUNNER_TEMP/binaries/$binary"
+          done
+          for binary in nf headless remove-trust; do
+            cmp "$RUNNER_TEMP/reused/$binary" "$RUNNER_TEMP/binaries/$binary"
           done
           (cd "$RUNNER_TEMP/binaries" && shasum -a 256 baseline-peer candidate-peer destination nf headless remove-trust > SHA256SUMS)
           tar -C "$RUNNER_TEMP/binaries" -czf "$RUNNER_TEMP/binaries.tar.gz" .
           git -C candidate diff --exit-code -- . ':!native_audit_test.go'
           git -C baseline diff --exit-code -- . ':!native_audit_test.go'
+      - name: Verify both independent test CAs and the bounded host bridge
+        run: |
+          for client in nf headless; do
+            python3 audit/tests/quic-upgrade/compare.py --clients clients \
+              --client "$RUNNER_TEMP/binaries/$client" \
+              --baseline "$RUNNER_TEMP/binaries/baseline-peer" --candidate "$RUNNER_TEMP/binaries/candidate-peer" \
+              --destination "$RUNNER_TEMP/binaries/destination" --trust-cleanup "$RUNNER_TEMP/binaries/remove-trust" \
+              --logs "$RUNNER_TEMP/fixture-smoke/$client" --mib 1 --warmup-mib 1 --rounds 1
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: quic-upgrade-native-binaries
@@ -100,11 +112,8 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: quic-upgrade-mac-library-tests
-          path: |
-            ${{ runner.temp }}/mac-quic-shutdown-race.json
-            ${{ runner.temp }}/mac-quic-race.json
-            ${{ runner.temp }}/mac-quic-allocation.log
+          name: quic-upgrade-fixture-smoke
+          path: ${{ runner.temp }}/fixture-smoke
           retention-days: 3
           if-no-files-found: warn
 

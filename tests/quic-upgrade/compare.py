@@ -56,6 +56,10 @@ def main():
                 fp = subprocess.check_output(['openssl','x509','-in',cert,'-noout','-fingerprint','-sha1'],text=True).strip().split('=',1)[1].replace(':','')
                 subprocess.run(['sudo','-n','security','add-trusted-cert','-d','-r','trustRoot','-k','/Library/Keychains/System.keychain',cert],check=True,timeout=30)
                 anchors.append((der,fp))
+        if not a.portable:
+            installed = subprocess.check_output(['security','find-certificate','-a','-Z','/Library/Keychains/System.keychain'],text=True,timeout=30)
+            assert all(fp in installed for _,fp in anchors), 'A test CA was not installed in the keychain'
+            report['trust_installation_verified'] = True
         transports = ['h2','h3']; modes = ['download','upload','duplex']
         if a.reverse: transports.reverse(); modes.reverse()
         for transport in transports:
@@ -95,6 +99,7 @@ def main():
         assert len(report['trials']) == 2*3*a.rounds*4
         report['all_trials_complete']=True
     finally:
+        report['bridge_retry_messages'] = {label:(a.logs/(label+'-peer.log')).read_text().count('packet bridge') for label in peers}
         failures=[]
         for der,fp in reversed(anchors):
             try:
@@ -105,9 +110,15 @@ def main():
             try: runtime['stop'](peer)
             except Exception as error: failures.append(str(error))
         for log in handles: log.close()
+        if not a.portable and anchors:
+            try:
+                installed = subprocess.check_output(['security','find-certificate','-a','-Z','/Library/Keychains/System.keychain'],text=True,timeout=30)
+                assert all(fp not in installed for _,fp in anchors), 'A test CA remains in the keychain'
+            except Exception as error: failures.append(str(error))
         report['cleanup_errors']=failures
         (a.logs/'report.json').write_text(json.dumps(report,indent=2)+'\n')
         assert not failures, failures
+        assert not any(report['bridge_retry_messages'].values()), 'Host packet bridge backpressure affected measurements'
 
 if __name__ == '__main__':
     main()
