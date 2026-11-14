@@ -1,4 +1,4 @@
-name: QUIC upgrade targeted native performance
+name: QUIC upgrade repeat original native transfer sizes
 on:
   push:
     branches: [audit/quic-targeted-performance]
@@ -47,7 +47,7 @@ jobs:
           PY
           swiftc clients/masque-nf-headless/Verification/RemoveTestTrust.swift -o "$RUNNER_TEMP/remove-trust"
           swiftc audit/tests/quic-upgrade/CheckTestTrust.swift -o "$RUNNER_TEMP/check-trust"
-      - name: Check longer downloads and repeat uploads with crossed peer startup
+      - name: Repeat original transfer sizes with crossed peer startup
         env:
           AUDIT_TRIAL: ${{ matrix.trial }}
         run: |
@@ -62,12 +62,11 @@ jobs:
             protocol=${case%-*}
             mode=${case#*-}
             mib=32
-            if [ "$mode" = download ]; then mib=128; fi
             python3 audit/tests/quic-upgrade/compare.py --clients clients \
               --client "$RUNNER_TEMP/binaries/headless" \
               --baseline "$RUNNER_TEMP/binaries/baseline-peer" --candidate "$RUNNER_TEMP/binaries/candidate-peer" \
               --destination "$RUNNER_TEMP/binaries/destination" --trust-cleanup "$RUNNER_TEMP/remove-trust" \
-              --logs "$RUNNER_TEMP/measurements/$case" --mib "$mib" --warmup-mib 16 --rounds 8 \
+              --logs "$RUNNER_TEMP/measurements/$case" --mib "$mib" --warmup-mib 8 --rounds 8 \
               --transports "$protocol" --modes "$mode" "${args[@]}"
             for anchor in "$RUNNER_TEMP/measurements/$case/"*-anchor.der; do
               python3 -c 'import subprocess,sys; subprocess.run(sys.argv[1:], check=True, timeout=20)' \
