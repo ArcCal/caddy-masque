@@ -34,7 +34,12 @@ jobs:
           swiftc clients/masque-nf-headless/Verification/RemoveTestTrust.swift -o "$RUNNER_TEMP/remove-trust"
           swiftc audit/tests/quic-upgrade/CheckTestTrust.swift -o "$RUNNER_TEMP/check-trust"
       - name: Prove the original failure and verify actual trust removal
+        timeout-minutes: 3
         run: |
+          set -x
+          bounded() {
+            python3 -c 'import subprocess,sys; subprocess.run(sys.argv[1:], check=True, timeout=20)' "$@"
+          }
           work="$RUNNER_TEMP/trust-check"
           mkdir "$work"
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Native trust $(uuidgen)" \
@@ -42,23 +47,23 @@ jobs:
           openssl x509 -in "$work/root.pem" -outform DER -out "$work/root.der"
           fp=$(openssl x509 -in "$work/root.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
           cleanup() {
-            sudo -n "$RUNNER_TEMP/remove-trust" "$work/root.der" || true
-            sudo -n security delete-certificate -Z "$fp" /Library/Keychains/System.keychain || true
+            bounded sudo -n "$RUNNER_TEMP/remove-trust" "$work/root.der" || true
+            bounded sudo -n security delete-certificate -Z "$fp" /Library/Keychains/System.keychain || true
           }
           trap cleanup EXIT
-          "$RUNNER_TEMP/check-trust" "$work/root.der" absent
-          sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$work/root.pem"
-          "$RUNNER_TEMP/check-trust" "$work/root.der" trusted
-          sudo -n "$RUNNER_TEMP/original" "$work/root.der"
-          if "$RUNNER_TEMP/check-trust" "$work/root.der" absent; then
+          bounded "$RUNNER_TEMP/check-trust" "$work/root.der" absent
+          bounded sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$work/root.pem"
+          bounded "$RUNNER_TEMP/check-trust" "$work/root.der" trusted
+          bounded sudo -n "$RUNNER_TEMP/original" "$work/root.der"
+          if bounded "$RUNNER_TEMP/check-trust" "$work/root.der" absent; then
             echo 'Original cleanup unexpectedly removed trust'
             exit 1
           fi
-          "$RUNNER_TEMP/check-trust" "$work/root.der" trusted
-          sudo -n "$RUNNER_TEMP/remove-trust" "$work/root.der"
-          "$RUNNER_TEMP/check-trust" "$work/root.der" absent
-          sudo -n security delete-certificate -Z "$fp" /Library/Keychains/System.keychain
-          "$RUNNER_TEMP/check-trust" "$work/root.der" absent
+          bounded "$RUNNER_TEMP/check-trust" "$work/root.der" trusted
+          bounded sudo -n "$RUNNER_TEMP/remove-trust" "$work/root.der"
+          bounded "$RUNNER_TEMP/check-trust" "$work/root.der" absent
+          bounded sudo -n security delete-certificate -Z "$fp" /Library/Keychains/System.keychain
+          bounded "$RUNNER_TEMP/check-trust" "$work/root.der" absent
           trap - EXIT
       - uses: actions/download-artifact@v8
         with:
