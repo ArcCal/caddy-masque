@@ -56,9 +56,12 @@ jobs:
           python3 candidate/tests/verify-http3-fork.py
       - name: Full updated QUIC library on macOS with the race detector
         working-directory: candidate/third_party/quic-go
+        env:
+          # Match upstream integration.yml; this scales test timers only.
+          TIMESCALE_FACTOR: '3'
         run: |
           go test -p 2 -count=1 -run '^TestFrameParserAllocs$' ./internal/wire > "$RUNNER_TEMP/mac-quic-allocation.log"
-          go test -race -p 2 -count=5 -timeout 2m -json -run '^(TestHandshakeCloseListener|TestGracefulShutdownLongLivedRequest|TestHTTP3ListenerGracefulShutdown)$' ./integrationtests/self > "$RUNNER_TEMP/mac-quic-shutdown-race.json"
+          go test -race -p 2 -count=5 -timeout 2m -json -run '^(TestHandshakeCloseListener|TestGracefulShutdownLongLivedRequest|TestHTTP3ListenerGracefulShutdown|TestHTTPServerIdleTimeout)$' ./integrationtests/self > "$RUNNER_TEMP/mac-quic-shutdown-race.json"
           go test -race -skip '^TestFrameParserAllocs$' -p 2 -count=1 -timeout 12m -json ./... > "$RUNNER_TEMP/mac-quic-race.json"
       - name: Build and test actual native NF and Headless adapters
         working-directory: clients
