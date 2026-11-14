@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: ArcCal/caddy-masque
-          ref: 53c7982af05055b7477598bfcfa76cef969db537
+          ref: 43414f50acab0cbe0bf007c7012ad13c1cb80537
           path: candidate
           persist-credentials: false
       - uses: actions/checkout@v7
@@ -58,6 +58,7 @@ jobs:
         working-directory: candidate/third_party/quic-go
         run: |
           go test -p 2 -count=1 -run '^TestFrameParserAllocs$' ./internal/wire > "$RUNNER_TEMP/mac-quic-allocation.log"
+          go test -race -p 2 -count=5 -timeout 2m -json -run '^(TestHandshakeCloseListener|TestGracefulShutdownLongLivedRequest|TestHTTP3ListenerGracefulShutdown)$' ./integrationtests/self > "$RUNNER_TEMP/mac-quic-shutdown-race.json"
           go test -race -skip '^TestFrameParserAllocs$' -p 2 -count=1 -timeout 12m -json ./... > "$RUNNER_TEMP/mac-quic-race.json"
       - name: Build and test actual native NF and Headless adapters
         working-directory: clients
@@ -98,6 +99,7 @@ jobs:
         with:
           name: quic-upgrade-mac-library-tests
           path: |
+            ${{ runner.temp }}/mac-quic-shutdown-race.json
             ${{ runner.temp }}/mac-quic-race.json
             ${{ runner.temp }}/mac-quic-allocation.log
           retention-days: 3
