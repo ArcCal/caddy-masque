@@ -37,7 +37,7 @@ jobs:
         run: |
           work="$RUNNER_TEMP/trust-check"
           mkdir "$work"
-          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Disposable native trust test $(uuidgen)" \
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Native trust $(uuidgen)" \
             -keyout "$work/key.pem" -out "$work/root.pem" -addext 'basicConstraints=critical,CA:TRUE'
           openssl x509 -in "$work/root.pem" -outform DER -out "$work/root.der"
           fp=$(openssl x509 -in "$work/root.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
