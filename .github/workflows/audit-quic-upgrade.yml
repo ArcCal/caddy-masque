@@ -1,0 +1,197 @@
+name: QUIC upgrade native compatibility and performance
+
+on:
+  push:
+    branches: [audit/quic-065-native]
+
+permissions:
+  contents: read
+
+env:
+  GOMAXPROCS: '2'
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  RUSTUP_TOOLCHAIN: '1.99.1'
+  MACOSX_DEPLOYMENT_TARGET: '27.0'
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: audit
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: ArcCal/caddy-masque
+          ref: 53c7982af05055b7477598bfcfa76cef969db537
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: ArcCal/caddy-masque
+          ref: 137b199647513a4ad82436025cc0145abee4af37
+          path: baseline
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: ArcCal/masque-vpn
+          ref: c14567823de476f41fc5a506aacc7dcd723b1c4d
+          fetch-depth: 0
+          path: clients
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.4
+          cache: false
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Verify unchanged production clients and exact server forks
+        run: |
+          git -C clients diff --exit-code eba1198996be0974a0a6d84a555a0522a3b0a827 -- \
+            Cargo.toml Cargo.lock crates vendor masque-nf/Core/Cargo.toml masque-nf/Core/Cargo.lock \
+            masque-nf/Core/src masque-nf/App/Sources masque-nf-headless/Core masque-nf-headless/Sources
+          python3 baseline/tests/verify-http3-fork.py
+          python3 candidate/tests/verify-http3-fork.py
+      - name: Full updated QUIC library on macOS with the race detector
+        working-directory: candidate/third_party/quic-go
+        run: |
+          go test -p 2 -count=1 -run '^TestFrameParserAllocs$' ./internal/wire > "$RUNNER_TEMP/mac-quic-allocation.log"
+          go test -race -skip '^TestFrameParserAllocs$' -p 2 -count=1 -timeout 12m -json ./... > "$RUNNER_TEMP/mac-quic-race.json"
+      - name: Build and test actual native NF and Headless adapters
+        working-directory: clients
+        run: |
+          bash masque-nf-headless/build-macos.sh
+          bash masque-nf-headless/build-baseline-macos.sh
+          git show 261b3c7acf6d1775613e0344311d2ace655a6b19:masque-nf/App/Sources/MasqueNF/NativeClient.swift > "$RUNNER_TEMP/nf-adapter.swift"
+          cmp "$RUNNER_TEMP/nf-adapter.swift" masque-nf/App/Sources/MasqueNF/NativeClient.swift
+      - name: Prepare identical host fixtures and build both Caddy versions
+        run: |
+          python3 audit/tests/quic-upgrade/prepare.py --clients clients --baseline baseline --candidate candidate
+          export CARGO_HOME="$PWD/clients/masque-nf-headless/work/cargo"
+          export CARGO_TARGET_DIR="$PWD/clients/masque-nf-headless/work/baseline-rust"
+          cargo test --locked --release --manifest-path clients/masque-nf/Core/Cargo.toml --example native-audit-destination
+          cargo build --locked --release --manifest-path clients/masque-nf/Core/Cargo.toml --example native-audit-destination
+          mkdir "$RUNNER_TEMP/binaries"
+          go -C baseline test -mod=readonly -p 2 -c -ldflags='-s -w' -o "$RUNNER_TEMP/binaries/baseline-peer"
+          go -C candidate test -mod=readonly -p 2 -c -ldflags='-s -w' -o "$RUNNER_TEMP/binaries/candidate-peer"
+          cp "$CARGO_TARGET_DIR/release/examples/native-audit-destination" "$RUNNER_TEMP/binaries/destination"
+          cp clients/masque-nf-headless/work/ab/baseline "$RUNNER_TEMP/binaries/nf"
+          cp clients/masque-nf-headless/dist/masque-nf-headless "$RUNNER_TEMP/binaries/headless"
+          swiftc clients/masque-nf-headless/Verification/RemoveTestTrust.swift -o "$RUNNER_TEMP/binaries/remove-trust"
+          for binary in baseline-peer candidate-peer destination nf headless remove-trust; do
+            codesign --force --sign - "$RUNNER_TEMP/binaries/$binary"
+            codesign --verify --strict "$RUNNER_TEMP/binaries/$binary"
+          done
+          (cd "$RUNNER_TEMP/binaries" && shasum -a 256 baseline-peer candidate-peer destination nf headless remove-trust > SHA256SUMS)
+          tar -C "$RUNNER_TEMP/binaries" -czf "$RUNNER_TEMP/binaries.tar.gz" .
+          git -C candidate diff --exit-code -- . ':!native_audit_test.go'
+          git -C baseline diff --exit-code -- . ':!native_audit_test.go'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: quic-upgrade-native-binaries
+          path: ${{ runner.temp }}/binaries.tar.gz
+          retention-days: 3
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: quic-upgrade-mac-library-tests
+          path: |
+            ${{ runner.temp }}/mac-quic-race.json
+            ${{ runner.temp }}/mac-quic-allocation.log
+          retention-days: 3
+          if-no-files-found: warn
+
+  interop:
+    needs: build
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ArcCal/masque-vpn
+          ref: c14567823de476f41fc5a506aacc7dcd723b1c4d
+          path: clients
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: quic-upgrade-native-binaries
+          path: ${{ runner.temp }}
+      - name: Verify exact binaries and exercise both clients over every HTTP version
+        run: |
+          mkdir "$RUNNER_TEMP/binaries"
+          tar -C "$RUNNER_TEMP/binaries" -xzf "$RUNNER_TEMP/binaries.tar.gz"
+          (cd "$RUNNER_TEMP/binaries" && shasum -a 256 -c SHA256SUMS)
+          export AUDIT_DESTINATION="$RUNNER_TEMP/binaries/destination"
+          failed=0
+          for client in nf headless; do
+            for server in baseline candidate; do
+              for transport in http/1.1 h2 h3; do
+                suffix=${transport//\//-}
+                python3 clients/masque-nf-headless/test-native-tunnel.py \
+                  --client "$RUNNER_TEMP/binaries/$client" --transports "$transport" \
+                  --peer "$RUNNER_TEMP/binaries/$server-peer" --peer-arg=-test.run=^TestNativeAuditPeer$ \
+                  --peer-arg=-test.timeout=5m --trust-cleanup "$RUNNER_TEMP/binaries/remove-trust" \
+                  --logs "$RUNNER_TEMP/interop/$client-$server-$suffix" || failed=$((failed + 1))
+              done
+            done
+          done
+          test "$failed" -eq 0
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: quic-upgrade-native-interop
+          path: ${{ runner.temp }}/interop
+          retention-days: 3
+          if-no-files-found: warn
+
+  measure:
+    needs: build
+    runs-on: xcode-27
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [nf, headless]
+        trial: [ab1, ab2, aa]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: audit
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: ArcCal/masque-vpn
+          ref: c14567823de476f41fc5a506aacc7dcd723b1c4d
+          path: clients
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: quic-upgrade-native-binaries
+          path: ${{ runner.temp }}
+      - name: Compare server versions on a clean host with complete data and EOF checks
+        env:
+          AUDIT_CLIENT: ${{ matrix.client }}
+          AUDIT_TRIAL: ${{ matrix.trial }}
+        run: |
+          mkdir "$RUNNER_TEMP/binaries"
+          tar -C "$RUNNER_TEMP/binaries" -xzf "$RUNNER_TEMP/binaries.tar.gz"
+          (cd "$RUNNER_TEMP/binaries" && shasum -a 256 -c SHA256SUMS)
+          args=()
+          if [ "$AUDIT_TRIAL" = aa ]; then args+=(--control); fi
+          if [ "$AUDIT_TRIAL" = ab2 ]; then args+=(--reverse); fi
+          python3 audit/tests/quic-upgrade/compare.py --clients clients \
+            --client "$RUNNER_TEMP/binaries/$AUDIT_CLIENT" \
+            --baseline "$RUNNER_TEMP/binaries/baseline-peer" --candidate "$RUNNER_TEMP/binaries/candidate-peer" \
+            --destination "$RUNNER_TEMP/binaries/destination" --trust-cleanup "$RUNNER_TEMP/binaries/remove-trust" \
+            --logs "$RUNNER_TEMP/measurements" --mib 32 --warmup-mib 8 --rounds 4 "${args[@]}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: quic-upgrade-${{ matrix.client }}-${{ matrix.trial }}
+          path: |
+            ${{ runner.temp }}/measurements
+            ${{ runner.temp }}/binaries/SHA256SUMS
+          retention-days: 3
+          if-no-files-found: warn
