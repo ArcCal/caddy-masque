@@ -66,6 +66,12 @@ def align_lock(workspace, environment, lockfiles):
     so the harness always tests the dependency versions the clients ship.
     """
     targets = client_versions(lockfiles)
+    # Refresh local package versions before enforcing the registry pins below.
+    subprocess.run(
+        ["cargo", "metadata", "--format-version=1",
+         "--manifest-path", str(workspace / "Cargo.toml")],
+        cwd=workspace, env=environment, check=True, stdout=subprocess.DEVNULL,
+    )
     attempted = set()
     while True:
         stale = sorted(
