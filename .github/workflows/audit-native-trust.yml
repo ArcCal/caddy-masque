@@ -1,0 +1,90 @@
+name: Native test trust cleanup verification
+on:
+  push:
+    branches: [audit/native-trust-cleanup]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  trust:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: audit
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: ArcCal/masque-vpn
+          ref: c14567823de476f41fc5a506aacc7dcd723b1c4d
+          path: clients
+          persist-credentials: false
+      - name: Build original and minimally corrected cleanup tools
+        run: |
+          swiftc clients/masque-nf-headless/Verification/RemoveTestTrust.swift -o "$RUNNER_TEMP/original"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('clients/masque-nf-headless/Verification/RemoveTestTrust.swift')
+          old = 'SecTrustSettingsSetTrustSettings(certificate, .admin, nil)'
+          text = p.read_text()
+          assert text.count(old) == 1
+          p.write_text(text.replace(old, 'SecTrustSettingsRemoveTrustSettings(certificate, .admin)'))
+          PY
+          swiftc clients/masque-nf-headless/Verification/RemoveTestTrust.swift -o "$RUNNER_TEMP/remove-trust"
+          swiftc audit/tests/quic-upgrade/CheckTestTrust.swift -o "$RUNNER_TEMP/check-trust"
+      - name: Prove the original failure and verify actual trust removal
+        run: |
+          work="$RUNNER_TEMP/trust-check"
+          mkdir "$work"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Disposable native trust test $(uuidgen)" \
+            -keyout "$work/key.pem" -out "$work/root.pem" -addext 'basicConstraints=critical,CA:TRUE'
+          openssl x509 -in "$work/root.pem" -outform DER -out "$work/root.der"
+          fp=$(openssl x509 -in "$work/root.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
+          cleanup() {
+            sudo -n "$RUNNER_TEMP/remove-trust" "$work/root.der" || true
+            sudo -n security delete-certificate -Z "$fp" /Library/Keychains/System.keychain || true
+          }
+          trap cleanup EXIT
+          "$RUNNER_TEMP/check-trust" "$work/root.der" absent
+          sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$work/root.pem"
+          "$RUNNER_TEMP/check-trust" "$work/root.der" trusted
+          sudo -n "$RUNNER_TEMP/original" "$work/root.der"
+          if "$RUNNER_TEMP/check-trust" "$work/root.der" absent; then
+            echo 'Original cleanup unexpectedly removed trust'
+            exit 1
+          fi
+          "$RUNNER_TEMP/check-trust" "$work/root.der" trusted
+          sudo -n "$RUNNER_TEMP/remove-trust" "$work/root.der"
+          "$RUNNER_TEMP/check-trust" "$work/root.der" absent
+          sudo -n security delete-certificate -Z "$fp" /Library/Keychains/System.keychain
+          "$RUNNER_TEMP/check-trust" "$work/root.der" absent
+          trap - EXIT
+      - uses: actions/download-artifact@v8
+        with:
+          name: quic-upgrade-native-binaries
+          run-id: 43574007312
+          repository: ArcCal/caddy-masque
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/reused
+      - name: Verify native transfers with corrected cleanup
+        run: |
+          tar -C "$RUNNER_TEMP/reused" -xzf "$RUNNER_TEMP/reused/binaries.tar.gz"
+          (cd "$RUNNER_TEMP/reused" && shasum -a 256 -c SHA256SUMS)
+          for client in nf headless; do
+            python3 audit/tests/quic-upgrade/compare.py --clients clients \
+              --client "$RUNNER_TEMP/reused/$client" \
+              --baseline "$RUNNER_TEMP/reused/baseline-peer" --candidate "$RUNNER_TEMP/reused/candidate-peer" \
+              --destination "$RUNNER_TEMP/reused/destination" --trust-cleanup "$RUNNER_TEMP/remove-trust" \
+              --logs "$RUNNER_TEMP/verified-cleanup/$client" --mib 1 --warmup-mib 1 --rounds 1
+            for anchor in "$RUNNER_TEMP/verified-cleanup/$client/"*-anchor.der; do
+              "$RUNNER_TEMP/check-trust" "$anchor" absent
+            done
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: verified-native-trust-cleanup
+          path: ${{ runner.temp }}/verified-cleanup
+          retention-days: 3
+          if-no-files-found: warn
