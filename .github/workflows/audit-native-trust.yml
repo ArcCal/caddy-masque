@@ -29,7 +29,7 @@ jobs:
           old = 'SecTrustSettingsSetTrustSettings(certificate, .admin, nil)'
           text = p.read_text()
           assert text.count(old) == 1
-          p.write_text(text.replace(old, 'SecTrustSettingsRemoveTrustSettings(certificate, .admin)'))
+          p.write_text(text.replace(old, 'SecTrustSettingsSetTrustSettings(certificate, .admin, [kSecTrustSettingsResult as String: SecTrustSettingsResult.deny.rawValue] as CFDictionary)'))
           PY
           swiftc clients/masque-nf-headless/Verification/RemoveTestTrust.swift -o "$RUNNER_TEMP/remove-trust"
           swiftc audit/tests/quic-upgrade/CheckTestTrust.swift -o "$RUNNER_TEMP/check-trust"
@@ -55,15 +55,15 @@ jobs:
           bounded sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$work/root.pem"
           bounded "$RUNNER_TEMP/check-trust" "$work/root.der" trusted
           bounded sudo -n "$RUNNER_TEMP/original" "$work/root.der"
-          if bounded "$RUNNER_TEMP/check-trust" "$work/root.der" absent; then
+          if bounded "$RUNNER_TEMP/check-trust" "$work/root.der" untrusted; then
             echo 'Original cleanup unexpectedly removed trust'
             exit 1
           fi
           bounded "$RUNNER_TEMP/check-trust" "$work/root.der" trusted
           bounded sudo -n "$RUNNER_TEMP/remove-trust" "$work/root.der"
-          bounded "$RUNNER_TEMP/check-trust" "$work/root.der" absent
+          bounded "$RUNNER_TEMP/check-trust" "$work/root.der" untrusted
           bounded sudo -n security delete-certificate -Z "$fp" /Library/Keychains/System.keychain
-          bounded "$RUNNER_TEMP/check-trust" "$work/root.der" absent
+          bounded "$RUNNER_TEMP/check-trust" "$work/root.der" untrusted
           trap - EXIT
       - uses: actions/download-artifact@v8
         with:
@@ -83,7 +83,8 @@ jobs:
               --destination "$RUNNER_TEMP/reused/destination" --trust-cleanup "$RUNNER_TEMP/remove-trust" \
               --logs "$RUNNER_TEMP/verified-cleanup/$client" --mib 1 --warmup-mib 1 --rounds 1
             for anchor in "$RUNNER_TEMP/verified-cleanup/$client/"*-anchor.der; do
-              "$RUNNER_TEMP/check-trust" "$anchor" absent
+              python3 -c 'import subprocess,sys; subprocess.run(sys.argv[1:], check=True, timeout=20)' \
+                "$RUNNER_TEMP/check-trust" "$anchor" untrusted
             done
           done
       - uses: actions/upload-artifact@v7
