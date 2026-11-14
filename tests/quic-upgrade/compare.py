@@ -19,6 +19,9 @@ def main():
     p.add_argument('--portable', action='store_true')
     p.add_argument('--control', action='store_true')
     p.add_argument('--reverse', action='store_true')
+    p.add_argument('--swap-peers', action='store_true')
+    p.add_argument('--transports', nargs='+', choices=['h2','h3'], default=['h2','h3'])
+    p.add_argument('--modes', nargs='+', choices=['download','upload','duplex'], default=['download','upload','duplex'])
     p.add_argument('--mib', type=int, choices=range(1,129), default=32)
     p.add_argument('--warmup-mib', type=int, choices=range(1,17), default=8)
     p.add_argument('--rounds', type=int, choices=[1,2,4,8], default=4)
@@ -31,11 +34,14 @@ def main():
     runtime = runpy.run_path(str(a.clients/'scripts/test-native-regression.py'))
     measure = runpy.run_path(str(a.clients/'scripts/test-native-streaming.py'))['measure']
     binaries = {'baseline': a.baseline.resolve(), 'candidate': (a.baseline if a.control else a.candidate).resolve()}
+    if a.swap_peers:
+        binaries = dict(reversed(list(binaries.items())))
     digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     report = {'scope': 'Portable harness preflight' if a.portable else 'Actual Network.framework client against Caddy',
               'server_sha256': {label:digest(path) for label,path in binaries.items()},
               'client_sha256':digest(a.client), 'destination_sha256':digest(a.destination),
               'control':a.control, 'mib':a.mib, 'warmup_mib':a.warmup_mib, 'rounds':a.rounds,
+              'transports':a.transports, 'modes':a.modes, 'peer_start_order':list(binaries),
               'limits':['Loopback and shared simulated destination; no WAN claim',
                         'Timed payload includes verified EOF; no discarded observations',
                         'Server CPU covers Go peer; destination process is separate',
@@ -60,7 +66,7 @@ def main():
             installed = subprocess.check_output(['security','find-certificate','-a','-Z','/Library/Keychains/System.keychain'],text=True,timeout=30)
             assert all(fp in installed for _,fp in anchors), 'A test CA was not installed in the keychain'
             report['trust_installation_verified'] = True
-        transports = ['h2','h3']; modes = ['download','upload','duplex']
+        transports = list(a.transports); modes = list(a.modes)
         if a.reverse: transports.reverse(); modes.reverse()
         for transport in transports:
             for mode in modes:
@@ -96,7 +102,7 @@ def main():
                         report['trials'].append(row)
                         (a.logs/'report.json').write_text(json.dumps(report,indent=2)+'\n')
                         print(json.dumps(row),flush=True)
-        assert len(report['trials']) == 2*3*a.rounds*4
+        assert len(report['trials']) == len(transports)*len(modes)*a.rounds*4
         report['all_trials_complete']=True
     finally:
         report['bridge_retry_messages'] = {label:(a.logs/(label+'-peer.log')).read_text().count('packet bridge') for label in peers}

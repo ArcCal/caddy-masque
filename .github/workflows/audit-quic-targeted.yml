@@ -1,0 +1,85 @@
+name: QUIC upgrade targeted native performance
+on:
+  push:
+    branches: [audit/quic-targeted-performance]
+permissions:
+  contents: read
+  actions: read
+env:
+  GOMAXPROCS: '2'
+jobs:
+  measure:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        trial: [ab1, ab2, aa]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: audit
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: ArcCal/masque-vpn
+          ref: c14567823de476f41fc5a506aacc7dcd723b1c4d
+          path: clients
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: quic-upgrade-native-binaries
+          run-id: 43574007312
+          repository: ArcCal/caddy-masque
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/binaries
+      - name: Verify frozen binaries and build corrected trust cleanup
+        run: |
+          tar -C "$RUNNER_TEMP/binaries" -xzf "$RUNNER_TEMP/binaries/binaries.tar.gz"
+          (cd "$RUNNER_TEMP/binaries" && shasum -a 256 -c SHA256SUMS)
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('clients/masque-nf-headless/Verification/RemoveTestTrust.swift')
+          old = 'SecTrustSettingsSetTrustSettings(certificate, .admin, nil)'
+          text = p.read_text()
+          assert text.count(old) == 1
+          p.write_text(text.replace(old, 'SecTrustSettingsSetTrustSettings(certificate, .admin, [kSecTrustSettingsResult as String: SecTrustSettingsResult.deny.rawValue] as CFDictionary)'))
+          PY
+          swiftc clients/masque-nf-headless/Verification/RemoveTestTrust.swift -o "$RUNNER_TEMP/remove-trust"
+          swiftc audit/tests/quic-upgrade/CheckTestTrust.swift -o "$RUNNER_TEMP/check-trust"
+      - name: Check longer downloads and repeat uploads with crossed peer startup
+        env:
+          AUDIT_TRIAL: ${{ matrix.trial }}
+        run: |
+          args=()
+          cases=(h2-download h3-upload)
+          if [ "$AUDIT_TRIAL" = aa ]; then args+=(--control); fi
+          if [ "$AUDIT_TRIAL" = ab2 ]; then
+            args+=(--swap-peers)
+            cases=(h3-upload h2-download)
+          fi
+          for case in "${cases[@]}"; do
+            protocol=${case%-*}
+            mode=${case#*-}
+            mib=32
+            if [ "$mode" = download ]; then mib=128; fi
+            python3 audit/tests/quic-upgrade/compare.py --clients clients \
+              --client "$RUNNER_TEMP/binaries/headless" \
+              --baseline "$RUNNER_TEMP/binaries/baseline-peer" --candidate "$RUNNER_TEMP/binaries/candidate-peer" \
+              --destination "$RUNNER_TEMP/binaries/destination" --trust-cleanup "$RUNNER_TEMP/remove-trust" \
+              --logs "$RUNNER_TEMP/measurements/$case" --mib "$mib" --warmup-mib 16 --rounds 8 \
+              --transports "$protocol" --modes "$mode" "${args[@]}"
+            for anchor in "$RUNNER_TEMP/measurements/$case/"*-anchor.der; do
+              python3 -c 'import subprocess,sys; subprocess.run(sys.argv[1:], check=True, timeout=20)' \
+                "$RUNNER_TEMP/check-trust" "$anchor" untrusted
+            done
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: quic-targeted-headless-${{ matrix.trial }}
+          path: |
+            ${{ runner.temp }}/measurements
+            ${{ runner.temp }}/binaries/SHA256SUMS
+          retention-days: 3
+          if-no-files-found: warn
