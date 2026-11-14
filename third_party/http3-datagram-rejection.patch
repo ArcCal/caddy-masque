@@ -189,22 +189,36 @@
 +}
 --- a/http3/state_tracking_stream.go
 +++ b/http3/state_tracking_stream.go
-@@ -30,0 +31,2 @@
+@@ -28,6 +28,8 @@
+ 	mx             sync.Mutex
+ 	sendStreamDone bool
+ 	recvErr        error
 +	// Set by the HTTP handler when the request defines no Datagram semantics.
 +	datagramsRejected bool
-@@ -144 +145,0 @@
+ 
+ 	clearer streamClearer
+ }
+@@ -135,16 +137,43 @@
+ 
+ func (s *stateTrackingStream) enqueueDatagram(data []byte) {
+ 	s.mx.Lock()
 -	defer s.mx.Unlock()
-@@ -146,0 +148 @@
+ 
+ 	if s.recvErr != nil {
 +		s.mx.Unlock()
-@@ -148,0 +151,5 @@
+ 		return
+ 	}
 +	if s.datagramsRejected {
 +		s.mx.Unlock()
 +		s.abortRejectedDatagram()
 +		return
 +	}
-@@ -149,0 +157 @@
+ 	if len(s.queue) >= streamDatagramQueueLen {
 +		s.mx.Unlock()
-@@ -153,0 +162,21 @@
+ 		return
+ 	}
+ 	s.queue = append(s.queue, data)
+ 	s.signalHasDatagram()
 +	s.mx.Unlock()
 +}
 +
@@ -226,3 +240,6 @@
 +	// connection, so neither is called while the queue mutex is held.
 +	s.CancelRead(quic.StreamErrorCode(ErrCodeDatagramError))
 +	s.CancelWrite(quic.StreamErrorCode(ErrCodeDatagramError))
+ }
+ 
+ func (s *stateTrackingStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {

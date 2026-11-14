@@ -2,6 +2,12 @@ on: [push, pull_request]
 
 permissions: read-all
 
+# On PRs, a new push cancels outdated runs.
+# Other runs use the run ID as the group, so they never wait for or cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -58,7 +64,7 @@ jobs:
       matrix:
         go: [ "1.26.x", "1.27.x" ]
     env:
-      GOLANGCI_LINT_VERSION: v2.13.0
+      GOLANGCI_LINT_VERSION: v2.14.0
     name: golangci-lint (Go ${{ matrix.go }})
     steps:
       - uses: actions/checkout@v7

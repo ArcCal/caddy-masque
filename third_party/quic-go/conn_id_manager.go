@@ -20,16 +20,16 @@ type newConnID struct {
 type connIDManager struct {
 	queue []newConnID
 
-	highestProbingID  uint64
-	pathMx            sync.Mutex
-	pathProbing       map[pathID]newConnID // initialized lazily
-	pathControlRefs   map[protocol.ConnectionID]*pathControlCIDReference
-	peerRetirePriorTo uint64
-	activeRetired     bool
+	highestUsedSequenceNumber uint64
+	pathMx                    sync.Mutex
+	pathProbing               map[pathID]newConnID // initialized lazily
+	pathControlRefs           map[protocol.ConnectionID]*pathControlCIDReference
+	peerRetirePriorTo         uint64
+	activeRetired             bool
 
 	handshakeComplete         bool
 	activeSequenceNumber      uint64
-	highestRetired            uint64
+	highestRetired            uint64 // the highest Retire Prior To value received
 	activeConnectionID        protocol.ConnectionID
 	activeStatelessResetToken *protocol.StatelessResetToken
 
@@ -130,7 +130,7 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
 		}
 	}
 	if !known {
-		if f.SequenceNumber < max(h.activeSequenceNumber, h.highestProbingID) || f.SequenceNumber < h.highestRetired {
+		if f.SequenceNumber <= h.highestUsedSequenceNumber || f.SequenceNumber < h.highestRetired {
 			h.queueControlFrame(&wire.RetireConnectionIDFrame{SequenceNumber: f.SequenceNumber})
 		} else if err := h.addConnectionID(f.SequenceNumber, f.ConnectionID, f.StatelessResetToken); err != nil {
 			return err
@@ -145,6 +145,18 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
 		h.updateConnectionID()
 	}
 	return nil
+}
+
+func (h *connIDManager) isInUse(seq uint64) bool {
+	if seq == h.activeSequenceNumber {
+		return true
+	}
+	for _, entry := range h.pathProbing {
+		if entry.SequenceNumber == seq {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *connIDManager) addConnectionID(seq uint64, connID protocol.ConnectionID, resetToken protocol.StatelessResetToken) error {
@@ -185,19 +197,25 @@ func (h *connIDManager) addConnectionID(seq uint64, connID protocol.ConnectionID
 
 func (h *connIDManager) updateConnectionID() {
 	h.assertNotClosed()
+	front := h.queue[0]
+	h.queue = h.queue[1:]
+	h.highestUsedSequenceNumber = max(h.highestUsedSequenceNumber, front.SequenceNumber)
+	h.replaceActiveConnectionID(front)
+	h.addStatelessResetToken(front.StatelessResetToken)
+}
+
+// replaceActiveConnectionID preserves references held by queued path controls.
+// The caller registers a reset token only for a newly allocated connection ID.
+func (h *connIDManager) replaceActiveConnectionID(c newConnID) {
 	if !h.activeRetired {
 		h.retireActiveConnectionID()
 	}
-
-	front := h.queue[0]
-	h.queue = h.queue[1:]
-	h.activeSequenceNumber = front.SequenceNumber
-	h.activeConnectionID = front.ConnectionID
-	h.activeStatelessResetToken = &front.StatelessResetToken
+	h.activeSequenceNumber = c.SequenceNumber
+	h.activeConnectionID = c.ConnectionID
+	h.activeStatelessResetToken = &c.StatelessResetToken
 	h.activeRetired = false
 	h.packetsSinceLastChange = 0
-	h.packetsPerConnectionID = protocol.PacketsPerConnectionID/2 + uint32(h.rand.Int31n(protocol.PacketsPerConnectionID))
-	h.addStatelessResetToken(*h.activeStatelessResetToken)
+	h.packetsPerConnectionID = protocol.PacketsPerConnectionID/2 + h.rand.Uint32N(protocol.PacketsPerConnectionID)
 }
 
 func (h *connIDManager) Close() {
@@ -284,7 +302,7 @@ func (h *connIDManager) GetConnIDForPath(id pathID) (protocol.ConnectionID, bool
 	h.assertNotClosed()
 	// if we're using zero-length connection IDs, we don't need to change the connection ID
 	if h.activeConnectionID.Len() == 0 {
-		return protocol.ConnectionID{}, true
+		return h.activeConnectionID, true
 	}
 
 	if h.pathProbing == nil {
@@ -300,7 +318,7 @@ func (h *connIDManager) GetConnIDForPath(id pathID) (protocol.ConnectionID, bool
 	front := h.queue[0]
 	h.queue = h.queue[1:]
 	h.pathProbing[id] = front
-	h.highestProbingID = front.SequenceNumber
+	h.highestUsedSequenceNumber = max(h.highestUsedSequenceNumber, front.SequenceNumber)
 	h.addStatelessResetToken(front.StatelessResetToken)
 	return front.ConnectionID, true
 }
@@ -315,6 +333,28 @@ func (h *connIDManager) RetireConnIDForPath(pathID pathID) {
 	}
 	h.retireConnectionID(entry, true)
 	delete(h.pathProbing, pathID)
+}
+
+// SwitchToPath is called when the connection switches to a path.
+// The connection ID allocated to the path becomes the active connection ID,
+// and the previously active connection ID is retired.
+func (h *connIDManager) SwitchToPath(id pathID) {
+	h.pathMx.Lock()
+	defer h.pathMx.Unlock()
+
+	h.assertNotClosed()
+	next, ok := h.pathProbing[id]
+	if !ok {
+		// The path doesn't have a connection ID if the connection switched away from it before,
+		// or if the peer retired it (using Retire Prior To).
+		// If there's no unused connection ID, there's no choice but to keep using the active one.
+		if len(h.queue) > 0 {
+			h.updateConnectionID()
+		}
+		return
+	}
+	delete(h.pathProbing, id)
+	h.replaceActiveConnectionID(next)
 }
 
 func (h *connIDManager) IsActiveStatelessResetToken(token protocol.StatelessResetToken) bool {

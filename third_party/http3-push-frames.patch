@@ -1,6 +1,6 @@
 --- a/http3/client.go
 +++ b/http3/client.go
-@@ -177,15 +177,17 @@
+@@ -176,15 +176,17 @@
  	hstr := c.rawConn.TrackStream(str)
  	rsp := &http.Response{}
  	trace := httptrace.ContextClientTrace(ctx)
@@ -26,19 +26,19 @@
  		requestWriter,
  		reqDone,
  		c.decoder,
-@@ -215,6 +217,12 @@
+@@ -212,6 +214,12 @@
+ 				return
+ 			}
  			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameError), "")
- 			return
- 		}
++			return
++		}
 +		// This client never sends MAX_PUSH_ID, so a CANCEL_PUSH references a
 +		// push ID greater than currently allowed (RFC 9114 section 7.2.3).
 +		if _, ok := f.(*cancelPushFrame); ok {
 +			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "")
-+			return
-+		}
+ 			return
+ 		}
  		// GOAWAY is the only frame allowed at this point:
- 		// * unexpected frames are ignored by the frame parser
- 		// * we don't support any extension that might add support for more frames
 --- a/http3/frames.go
 +++ b/http3/frames.go
 @@ -48,6 +48,12 @@
@@ -54,10 +54,11 @@
  	r         io.Reader
  	streamID  quic.StreamID
  	closeConn func(quic.ApplicationErrorCode, string) error
-@@ -60,6 +66,27 @@
+@@ -59,6 +65,27 @@
+ 		t, err := quicvarint.Read(r)
  		if err != nil {
  			return nil, err
- 		}
++		}
 +		// Frames that are not permitted on this stream are connection errors
 +		// whatever their payload, so they are rejected before it is read.
 +		switch t {
@@ -78,10 +79,9 @@
 +				p.closeConn(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "")
 +				return nil, errors.New("peer sent an unexpected frame: PUSH_PROMISE")
 +			}
-+		}
+ 		}
  		l, err := quicvarint.Read(r)
  		if err != nil {
- 			return nil, err
 @@ -85,7 +112,7 @@
  			}, nil
  		case 0x4: // SETTINGS
@@ -137,7 +137,7 @@
  		case 0x2, 0x6, 0x8, 0x9: // reserved frame types
  			if qlogger != nil {
  				qlogger.RecordEvent(qlog.FrameParsed{
-@@ -299,20 +341,55 @@
+@@ -295,19 +337,54 @@
  	return b
  }
  
@@ -191,43 +191,32 @@
 +	id, err := parseVarIntPayload(r, l)
  	if err != nil {
  		return nil, err
- 	}
+-	}
 -	if r.NumRead-startLen != int(l) {
 -		return nil, errors.New("GOAWAY frame: inconsistent length")
--	}
+ 	}
  	frame.StreamID = quic.StreamID(id)
  	if qlogger != nil {
- 		qlogger.RecordEvent(qlog.FrameParsed{
 --- a/http3/frames_test.go
 +++ b/http3/frames_test.go
-@@ -96,58 +96,158 @@
- 	require.Equal(t, []byte("foo"), payload)
+@@ -26,7 +26,11 @@
+ 		copy(b, data[:i])
+ 		fp := frameParser{r: bytes.NewReader(b)}
+ 		_, err := fp.ParseNext(nil)
+-		require.ErrorIs(t, err, io.EOF)
++		if i == 0 {
++			require.ErrorIs(t, err, io.EOF)
++		} else {
++			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
++		}
+ 	}
+ }
+ 
+@@ -100,58 +104,158 @@
+ 	require.Equal(t, qlog.RawInfo{Length: 8, PayloadLength: 3}, logged[1].(qlog.FrameParsed).Raw)
  }
  
 -func TestParserUnsupportedFrameTypes(t *testing.T) {
--	for _, tc := range []struct {
--		name string
--		ft   uint64
--		qf   any
--	}{
--		{name: "CANCEL_PUSH", ft: 0x3, qf: qlog.CancelPushFrame{}},
--		{name: "PUSH_PROMISE", ft: 0x5, qf: qlog.PushPromiseFrame{}},
--		{name: "MAX_PUSH_ID", ft: 0xd, qf: qlog.MaxPushIDFrame{}},
--	} {
--		t.Run(tc.name, func(t *testing.T) {
--			var eventRecorder events.Recorder
--
--			data := quicvarint.Append(nil, tc.ft)
--			data = quicvarint.Append(data, 6)
--			data = append(data, []byte("foobar")...)
--			df := &dataFrame{Length: 3}
--			data = df.Append(data)
--			data = append(data, []byte("foo")...)
--
--			r := bytes.NewReader(data)
--			fp := frameParser{streamID: 42, r: r}
--
--			f, err := fp.ParseNext(&eventRecorder)
 +// Push is not supported, but push frames are not skipped. CANCEL_PUSH and MAX_PUSH_ID are returned so that
 +// callers can reject them (RFC 9114 sections 7.2.3 and 7.2.7); the parser
 +// rejects PUSH_PROMISE (section 7.2.5) and frames that are not permitted on a
@@ -252,12 +241,7 @@
 +			data := append(quicvarint.Append(quicvarint.Append(nil, typ), uint64(len(tc.payload))), tc.payload...)
 +			fp := frameParser{r: bytes.NewReader(append(data, following...))}
 +			f, err := fp.ParseNext(nil)
- 			require.NoError(t, err)
--			require.IsType(t, &dataFrame{}, f)
--			df = f.(*dataFrame)
--			require.Equal(t, uint64(3), df.Length)
--			payload := make([]byte, 3)
--			_, err = io.ReadFull(r, payload)
++			require.NoError(t, err)
 +			switch typ {
 +			case 0x3:
 +				require.Equal(t, &cancelPushFrame{PushID: tc.value}, f)
@@ -267,29 +251,10 @@
 +				require.Equal(t, &maxPushIDFrame{PushID: tc.value}, f)
 +			}
 +			f, err = fp.ParseNext(nil)
- 			require.NoError(t, err)
--			require.Equal(t, []byte("foo"), payload)
++			require.NoError(t, err)
 +			require.Equal(t, &dataFrame{Length: 3}, f)
 +		}
- 
--			headerLen := quicvarint.Len(tc.ft) + quicvarint.Len(6)
--			dfLen, _ := expectedFrameLength(t, df)
--			require.Equal(t,
--				[]qlogwriter.Event{
--					qlog.FrameParsed{
--						StreamID: 42,
--						Raw:      qlog.RawInfo{Length: headerLen, PayloadLength: 6},
--						Frame:    qlog.Frame{Frame: tc.qf},
--					},
--					qlog.FrameParsed{
--						StreamID: 42,
--						Raw:      qlog.RawInfo{Length: dfLen, PayloadLength: 3},
--						Frame:    qlog.Frame{Frame: qlog.DataFrame{}},
--					},
--				},
--				eventRecorder.Events(qlog.FrameParsed{}),
--			)
--		})
++
 +		// Malformed payloads (section 7.1): empty, shorter than the integer
 +		// they start, or longer than it. Nothing past the declared payload is
 +		// read, so the following frame is still unread.
@@ -319,10 +284,10 @@
 +		// A stream that ends inside the payload ends the frame early.
 +		fp = frameParser{r: bytes.NewReader(quicvarint.Append(quicvarint.Append(nil, typ), 2)[:2])}
 +		_, err = fp.ParseNext(nil)
-+		require.ErrorIs(t, err, io.EOF)
++		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 +		fp = frameParser{r: bytes.NewReader(append(quicvarint.Append(quicvarint.Append(nil, typ), 2), 0x40))}
 +		_, err = fp.ParseNext(nil)
-+		require.ErrorIs(t, err, io.EOF)
++		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 +	}
 +
 +	// A one-byte payload that starts a two-byte integer is malformed at once;
@@ -372,7 +337,25 @@
 +	// H3_FRAME_UNEXPECTED; a client never sends MAX_PUSH_ID, so on its request
 +	// streams any PUSH_PROMISE is H3_ID_ERROR (section 7.2.5). Neither reads
 +	// the payload, which may be truncated.
-+	for _, tc := range []struct {
+ 	for _, tc := range []struct {
+-		name string
+-		ft   uint64
+-		qf   any
+-	}{
+-		{name: "CANCEL_PUSH", ft: 0x3, qf: qlog.CancelPushFrame{}},
+-		{name: "PUSH_PROMISE", ft: 0x5, qf: qlog.PushPromiseFrame{}},
+-		{name: "MAX_PUSH_ID", ft: 0xd, qf: qlog.MaxPushIDFrame{}},
+-	} {
+-		t.Run(tc.name, func(t *testing.T) {
+-			var eventRecorder events.Recorder
+-
+-			data := quicvarint.Append(nil, tc.ft)
+-			data = quicvarint.Append(data, 6)
+-			data = append(data, []byte("foobar")...)
+-			df := &dataFrame{Length: 3}
+-			data = df.Append(data)
+-			data = append(data, []byte("foo")...)
+-
 +		client bool
 +		code   ErrCode
 +	}{{false, ErrCodeFrameUnexpected}, {true, ErrCodeIDError}} {
@@ -390,14 +373,45 @@
 +		for _, client := range []bool{false, true} {
 +			code = 0
 +			data := append(quicvarint.Append(nil, typ), 2, 0, 0)
-+			r := bytes.NewReader(data)
+ 			r := bytes.NewReader(data)
+-			fp := frameParser{streamID: 42, r: r}
+-
+-			f, err := fp.ParseNext(&eventRecorder)
+-			require.NoError(t, err)
+-			require.IsType(t, &dataFrame{}, f)
+-			df = f.(*dataFrame)
+-			require.Equal(t, uint64(3), df.Length)
+-			payload := make([]byte, 3)
+-			_, err = io.ReadFull(r, payload)
+-			require.NoError(t, err)
+-			require.Equal(t, []byte("foo"), payload)
+-
+-			headerLen := quicvarint.Len(tc.ft) + quicvarint.Len(6)
+-			dfLen, _ := expectedFrameLength(t, df)
+-			require.Equal(t,
+-				[]qlogwriter.Event{
+-					qlog.FrameParsed{
+-						StreamID: 42,
+-						Raw:      qlog.RawInfo{Length: headerLen + 6, PayloadLength: 6},
+-						Frame:    qlog.Frame{Frame: tc.qf},
+-					},
+-					qlog.FrameParsed{
+-						StreamID: 42,
+-						Raw:      qlog.RawInfo{Length: dfLen, PayloadLength: 3},
+-						Frame:    qlog.Frame{Frame: qlog.DataFrame{}},
+-					},
+-				},
+-				eventRecorder.Events(qlog.FrameParsed{}),
+-			)
+-		})
+-	}
 +			fp := frameParser{client: client, request: true, r: r, closeConn: closeConn}
 +			_, err := fp.ParseNext(nil)
 +			require.Error(t, err)
 +			require.Equal(t, quic.ApplicationErrorCode(ErrCodeFrameUnexpected), code)
 +			require.Equal(t, 3, r.Len())
 +		}
- 	}
++	}
 +	// Request streams still skip unknown frame types.
 +	r := bytes.NewReader(append([]byte{0x21, 2, 0, 0}, following...))
 +	fp = frameParser{request: true, r: r, closeConn: closeConn}
@@ -409,7 +423,7 @@
  func TestParserHeadersFrame(t *testing.T) {
 --- a/http3/server_conn.go
 +++ b/http3/server_conn.go
-@@ -110,7 +110,7 @@
+@@ -114,7 +114,7 @@
  	connCtx := c.serverContext
  	maxHeaderBytes := c.requestMaxHeaderBytes()
  
@@ -418,7 +432,7 @@
  	frame, err := fp.ParseNext(qlogger)
  	if err != nil {
  		if errors.Is(err, errPriorityUpdateForPush) {
-@@ -267,6 +267,8 @@
+@@ -270,6 +270,8 @@
  }
  
  func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *frameParser) {
@@ -427,7 +441,7 @@
  	for {
  		f, err := fp.ParseNext(c.qlogger)
  		if err != nil {
-@@ -295,6 +297,18 @@
+@@ -298,6 +300,18 @@
  			c.rawConn.UpdateStreamPriority(quic.StreamID(frame.ElementID), urgency, incremental)
  		case *goAwayFrame:
  			// Server push is not supported, so there is no push state to update.
@@ -448,7 +462,7 @@
  			return
 --- a/http3/stream.go
 +++ b/http3/stream.go
-@@ -65,6 +65,7 @@
+@@ -68,6 +68,7 @@
  		qlogger:        qlogger,
  		parseTrailer:   parseTrailer,
  		frameParser: &frameParser{

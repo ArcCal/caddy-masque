@@ -60,8 +60,8 @@ func TestConnectionDatagramCapacityFitsPacket(t *testing.T) {
 					return append(src, bytes.Repeat([]byte{'s'}, 16)...)
 				})
 				tp.sealingManager.EXPECT().Get1RTTSealer().Return(sealer, nil)
-				tp.pnManager.EXPECT().PeekPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x42), pnLen)
-				tp.pnManager.EXPECT().PopPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x42))
+				tp.pnManager.EXPECT().PeekPacketNumber(protocol.PacketNumberSpaceAppData).Return(protocol.PacketNumber(0x42), pnLen)
+				tp.pnManager.EXPECT().PopPacketNumber(protocol.PacketNumberSpaceAppData).Return(protocol.PacketNumber(0x42))
 				tp.framer.EXPECT().HasData().Return(false)
 				tp.ackFramer.EXPECT().GetAckFrame(protocol.Encryption1RTT, gomock.Any(), true).Return(nil)
 				buf := getPacketBuffer()
@@ -80,10 +80,11 @@ func TestConnectionDatagramCapacityFitsPacket(t *testing.T) {
 func TestConnectionMTUProbeRespectsCongestionBudget(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	tc := newServerTestConnection(t, ctrl, &Config{InitialPacketSize: 1400}, false, connectionOptHandshakeConfirmed())
+	tc.conn.peerParams = &wire.TransportParameters{MaxUDPPayloadSize: 1452}
 	now := monotime.Now()
 	h := ackhandler.NewSentPacketHandler(0, 1400, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveServer, nil, utils.DefaultLogger)
 	for range 31 {
-		pn := h.PopPacketNumber(protocol.Encryption1RTT)
+		pn := h.PopPacketNumber(protocol.PacketNumberSpaceAppData)
 		h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []ackhandler.Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 1400, false, false)
 	}
 	tc.conn.sentPacketHandler = h
@@ -104,7 +105,7 @@ func TestMTUDiscovererClampsInitialAndReset(t *testing.T) {
 	now := monotime.Now()
 	d.Start(now.Add(-time.Minute))
 	require.False(t, d.ShouldSendProbe(now))
-	d.Reset(now, 1400, 1300)
+	d.Reset(1400, 1300)
 	require.Equal(t, protocol.ByteCount(1300), d.CurrentSize())
 	require.False(t, d.ShouldSendProbe(now.Add(time.Minute)))
 }
@@ -134,8 +135,8 @@ func TestPackPartialAmplificationBudgetSendsHandshakeOnly(t *testing.T) {
 	tp.packer.handshakeStream.Write(make([]byte, 2000))
 	tp.sealingManager.EXPECT().GetInitialSealer().Return(newMockShortHeaderSealer(ctrl), nil)
 	tp.sealingManager.EXPECT().GetHandshakeSealer().Return(newMockShortHeaderSealer(ctrl), nil)
-	tp.pnManager.EXPECT().PeekPacketNumber(protocol.EncryptionHandshake).Return(protocol.PacketNumber(0x42), protocol.PacketNumberLen2)
-	tp.pnManager.EXPECT().PopPacketNumber(protocol.EncryptionHandshake).Return(protocol.PacketNumber(0x42))
+	tp.pnManager.EXPECT().PeekPacketNumber(protocol.PacketNumberSpaceHandshake).Return(protocol.PacketNumber(0x42), protocol.PacketNumberLen2)
+	tp.pnManager.EXPECT().PopPacketNumber(protocol.PacketNumberSpaceHandshake).Return(protocol.PacketNumber(0x42))
 	tp.ackFramer.EXPECT().GetAckFrame(protocol.EncryptionHandshake, gomock.Any(), false).Return(nil)
 	p, err := tp.packer.PackCoalescedPacket(false, 806, monotime.Now(), protocol.Version1)
 	require.NoError(t, err)

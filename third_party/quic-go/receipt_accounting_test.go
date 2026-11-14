@@ -35,7 +35,7 @@ func TestBufferedPacketReceiptAccounting(t *testing.T) {
 			}
 			physicalBytes := packet.Size()
 			unpacker.EXPECT().UnpackLongHeader(gomock.Any(), gomock.Any()).Return(nil, handshake.ErrKeysNotYetAvailable).Times(count)
-			processed, err := c.handleOnePacket(packet, 0)
+			processed, err := c.handleOnePacket(packet, 0, activePathID)
 			require.NoError(t, err)
 			require.False(t, processed)
 			require.Len(t, c.undecryptablePackets, count)
@@ -48,7 +48,7 @@ func TestBufferedPacketReceiptAccounting(t *testing.T) {
 			c.undecryptablePackets = nil
 			unpacker.EXPECT().UnpackLongHeader(gomock.Any(), gomock.Any()).Return(nil, handshake.ErrKeysNotYetAvailable).Times(count)
 			for _, p := range queued {
-				_, err = c.handleOnePacket(p.receivedPacket, p.checksum)
+				_, err = c.handleOnePacket(p.receivedPacket, p.checksum, activePathID)
 				require.NoError(t, err)
 			}
 			t.Logf("network bytes=%d, bytes recorded after deferred retry=%d, remaining budget=%d", physicalBytes,
@@ -67,7 +67,7 @@ func TestBufferedPacketReceiptAccounting(t *testing.T) {
 			queued = c.undecryptablePackets
 			c.undecryptablePackets = nil
 			for _, p := range queued {
-				processed, err = c.handleOnePacket(p.receivedPacket, p.checksum)
+				processed, err = c.handleOnePacket(p.receivedPacket, p.checksum, activePathID)
 				require.NoError(t, err)
 				require.True(t, processed)
 			}
@@ -87,7 +87,7 @@ func TestBufferedPacketReceiptAccounting(t *testing.T) {
 					pn++
 					return result, nil
 				}).Times(count)
-			_, err = c.handleOnePacket(duplicate, 0)
+			_, err = c.handleOnePacket(duplicate, 0, activePathID)
 			require.NoError(t, err)
 			require.Equal(t, uint64(2*physicalBytes), c.connStats.BytesReceived.Load())
 			require.Equal(t, 6*physicalBytes, c.sentPacketHandler.AmplificationBudget())
@@ -110,7 +110,7 @@ func TestDuplicateNetworkReceiptEarnsCredit(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		p := getLongHeaderPacket(t, tc.remoteAddr, &hdr, []byte{0})
 		total += p.Size()
-		_, err := c.handleOnePacket(p, 0)
+		_, err := c.handleOnePacket(p, 0, activePathID)
 		require.NoError(t, err)
 		require.Equal(t, 3*total, c.sentPacketHandler.AmplificationBudget())
 	}

@@ -26,7 +26,7 @@ func TestMigrationBindsLatestNonProbingPathAndConnectionID(t *testing.T) {
 			ctrl := gomock.NewController(t)
 			unpacker := NewMockUnpacker(ctrl)
 			c := newServerTestConnection(t, ctrl, nil, false, connectionOptUnpacker(unpacker), connectionOptHandshakeConfirmed())
-			require.NoError(t, c.conn.handleTransportParameters(&wire.TransportParameters{MaxUDPPayloadSize: 1452}))
+			require.NoError(t, c.conn.handleTransportParameters(&wire.TransportParameters{MaxUDPPayloadSize: 1452, InitialSourceConnectionID: protocol.ZeroLengthConnectionID}))
 			oldCID := protocol.ParseConnectionID([]byte{1, 1, 1, 1})
 			newCID := protocol.ParseConnectionID([]byte{2, 2, 2, 2})
 			c.conn.connIDManager = newConnIDManager(oldCID, func(protocol.StatelessResetToken) {}, func(protocol.StatelessResetToken) {}, func(wire.Frame) {})
@@ -59,7 +59,7 @@ func TestMigrationBindsLatestNonProbingPathAndConnectionID(t *testing.T) {
 				data[0] = 0x40
 				copy(data[1:], incomingCID.Bytes())
 				b := getPacketBuffer()
-				processed, err := c.conn.handleShortHeaderPacket(receivedPacket{data: data, buffer: b, remoteAddr: remote, rcvTime: monotime.Now()}, false, 0)
+				processed, err := c.conn.handleShortHeaderPacket(receivedPacket{data: data, buffer: b, remoteAddr: remote, rcvTime: monotime.Now()}, false, 0, activePathID)
 				b.MaybeRelease()
 				require.NoError(t, err)
 				require.True(t, processed)

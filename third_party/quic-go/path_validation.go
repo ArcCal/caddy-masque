@@ -2,6 +2,7 @@ package quic
 
 import (
 	"net"
+	"strconv"
 
 	"github.com/quic-go/quic-go/internal/ackhandler"
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -33,7 +34,8 @@ func (c *Conn) sendPathProbeFrames(destConnID protocol.ConnectionID, frames []ac
 			return err
 		}
 		c.logger.Debugf("sending path probe packet to %s", remoteAddr)
-		c.logShortHeaderPacketWithDatagramPayloadChecksum(probe, protocol.ECNNon, buf.Len(), false, datagramPayloadChecksum)
+		id, _ := c.pathManager.IDForPath(remoteAddr)
+		c.logShortHeaderPacketWithDatagramPayloadChecksum(probe, protocol.ECNNon, buf.Len(), false, datagramPayloadChecksum, strconv.FormatInt(int64(id), 10))
 		c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, now)
 		c.pathManager.SentProbe(remoteAddr, buf.Len(), probeFrames)
 		c.sendQueue.SendProbe(buf, remoteAddr, info)

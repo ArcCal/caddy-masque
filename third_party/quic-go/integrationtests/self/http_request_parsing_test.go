@@ -22,11 +22,12 @@ import (
 func TestHTTPServerRequestParsing(t *testing.T) {
 	requests := make(chan *http.Request, 1)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		_, err := io.Copy(io.Discard, r.Body)
+		requests <- r
+		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		requests <- r
 		w.WriteHeader(http.StatusTeapot)
 	})
 
@@ -109,6 +110,20 @@ func TestHTTPServerRequestParsing(t *testing.T) {
 			contentLength: int64(len("known-length body")),
 		},
 		{
+			name:          "POST request shorter than Content-Length",
+			method:        http.MethodPost,
+			authority:     "quic-go.net",
+			path:          "/post-short",
+			body:          "short body",
+			contentLength: 20,
+		},
+		{
+			name:      "POST request without body",
+			method:    http.MethodPost,
+			authority: "quic-go.net",
+			path:      "/post-no-body",
+		},
+		{
 			name:      "origin form with escaped path",
 			method:    http.MethodGet,
 			authority: "quic-go.net",
@@ -182,9 +197,12 @@ func TestHTTPServerRequestParsing(t *testing.T) {
 				},
 				Trailer: tc.trailer,
 			}
-			if tc.body != "" {
+			switch {
+			case tc.body != "":
 				request.Body = io.NopCloser(strings.NewReader(tc.body))
 				request.ContentLength = tc.contentLength
+			case tc.method == http.MethodPost:
+				request.Body = http.NoBody
 			}
 
 			resp, err := h2Client.Do(request.Clone(t.Context()))
@@ -192,17 +210,26 @@ func TestHTTPServerRequestParsing(t *testing.T) {
 			h2Request := <-requests
 			require.NoError(t, resp.Body.Close())
 			require.Equal(t, 2, resp.ProtoMajor)
-			require.Equal(t, http.StatusTeapot, resp.StatusCode)
+			h2Status := resp.StatusCode
 
 			if tc.body != "" {
 				request.Body = io.NopCloser(strings.NewReader(tc.body))
 			}
 			resp, err = h3Client.Do(request.Clone(t.Context()))
-			require.NoError(t, err)
+			if tc.contentLength > int64(len(tc.body)) {
+				// RFC 9114 Section 4.1.2 requires H3_MESSAGE_ERROR for a short body.
+				var h3err *http3.Error
+				require.ErrorAs(t, err, &h3err)
+				require.Equal(t, http3.ErrCodeMessageError, h3err.ErrorCode)
+				require.True(t, h3err.Remote)
+				require.Equal(t, http.StatusBadRequest, h2Status)
+			} else {
+				require.NoError(t, err)
+				require.NoError(t, resp.Body.Close())
+				require.Equal(t, 3, resp.ProtoMajor)
+				require.Equal(t, h2Status, resp.StatusCode)
+			}
 			h3Request := <-requests
-			require.NoError(t, resp.Body.Close())
-			require.Equal(t, 3, resp.ProtoMajor)
-			require.Equal(t, http.StatusTeapot, resp.StatusCode)
 
 			t.Logf("HTTP/2 request: %+v", h2Request)
 			t.Logf("HTTP/3 request: %+v", h3Request)

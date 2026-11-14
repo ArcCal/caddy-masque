@@ -9,5 +9,5 @@
     "Update an entry only together with the fork it pins and its patches."
   ],
   "golang.org/x/net v0.62.0": "h1:18ELalfM5+XNRwzM2nYqXsZQ9ByS1uhj2O/U7+5jqRY=",
-  "github.com/quic-go/quic-go v0.63.0": "h1:LIFGHI4PFUhhw2dDD1ARHdCff143ffMHwZtbnbuJ78A="
+  "github.com/quic-go/quic-go v0.65.0": "h1:BJQSjdTvLPLmWtaCupUphRbgxgpZhdO/GMpr9Eoe3B4="
 }

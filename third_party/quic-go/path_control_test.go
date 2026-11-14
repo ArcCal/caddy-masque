@@ -123,7 +123,7 @@ func TestBoundPathCreditReleaseAndResourceBound(t *testing.T) {
 	tc := newServerTestConnection(t, nil, nil, false)
 	credit := tc.conn.pathControlCredit(tc.remoteAddr, packetInfo{})
 	credit.inFlight = true
-	h := &pathControlCreditHandler{credit: credit, conn: tc.conn}
+	h := &pathControlCreditHandler{credit: credit, conn: tc.conn.Conn}
 	h.OnAcked(&wire.PathResponseFrame{})
 	require.False(t, credit.inFlight)
 	credit.inFlight = true // another packet has borrowed the same credit
@@ -189,7 +189,7 @@ func TestBoundFormerPathWaitsForFreshCIDAfterPeerRetirement(t *testing.T) {
 	newCID := protocol.ParseConnectionID([]byte{5, 6, 7, 8})
 	token := protocol.StatelessResetToken{3, 4}
 	h.queue = append(h.queue, newConnID{SequenceNumber: 2, ConnectionID: newCID, StatelessResetToken: token})
-	tc.connRunner.EXPECT().AddResetToken(token, tc.conn)
+	tc.connRunner.EXPECT().AddResetToken(token, &tc.conn.pathReceiver)
 	tc.connRunner.EXPECT().RemoveResetToken(token)
 	sph.EXPECT().HasCongestionBudget(protocol.ByteCount(1200)).Return(true)
 	tc.packer.EXPECT().PackPathProbePacket(newCID, gomock.Any(), protocol.ByteCount(1200), gomock.Any()).DoAndReturn(

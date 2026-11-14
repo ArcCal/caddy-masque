@@ -146,7 +146,7 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (_ frame, err error
 			if qlogger != nil {
 				qlogger.RecordEvent(qlog.FrameParsed{
 					StreamID: p.streamID,
-					Raw:      qlog.RawInfo{Length: r.NumRead, PayloadLength: int(l)},
+					Raw:      qlog.RawInfo{Length: r.NumRead + int(l), PayloadLength: int(l)},
 					Frame:    qlog.Frame{Frame: qlog.CancelPushFrame{}},
 				})
 			}
@@ -159,7 +159,7 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (_ frame, err error
 			if qlogger != nil {
 				qlogger.RecordEvent(qlog.FrameParsed{
 					StreamID: p.streamID,
-					Raw:      qlog.RawInfo{Length: r.NumRead, PayloadLength: int(l)},
+					Raw:      qlog.RawInfo{Length: r.NumRead + int(l), PayloadLength: int(l)},
 					Frame:    qlog.Frame{Frame: qlog.PushPromiseFrame{}},
 				})
 			}
@@ -178,7 +178,7 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (_ frame, err error
 			if qlogger != nil {
 				qlogger.RecordEvent(qlog.FrameParsed{
 					StreamID: p.streamID,
-					Raw:      qlog.RawInfo{Length: r.NumRead, PayloadLength: int(l)},
+					Raw:      qlog.RawInfo{Length: r.NumRead + int(l), PayloadLength: int(l)},
 					Frame:    qlog.Frame{Frame: qlog.MaxPushIDFrame{}},
 				})
 			}
@@ -202,7 +202,7 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (_ frame, err error
 			if qlogger != nil {
 				qlogger.RecordEvent(qlog.FrameParsed{
 					StreamID: p.streamID,
-					Raw:      qlog.RawInfo{Length: r.NumRead, PayloadLength: int(l)},
+					Raw:      qlog.RawInfo{Length: r.NumRead + int(l), PayloadLength: int(l)},
 					Frame:    qlog.Frame{Frame: qlog.UnknownFrame{Type: t}},
 				})
 			}
@@ -272,8 +272,9 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
 	}
 	frame := &settingsFrame{MaxFieldSectionSize: -1}
 	b := bytes.NewReader(buf)
-	settingsFrame := qlog.SettingsFrame{MaxFieldSectionSize: -1}
-	var readMaxFieldSectionSize, readDatagram, readExtendedConnect bool
+
+	datagram := int64(-1)
+	extendedConnect := int64(-1)
 	for b.Len() > 0 {
 		id, err := quicvarint.Read(b)
 		if err != nil { // should not happen. We allocated the whole frame already.
@@ -288,36 +289,28 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
 		case 0x2, 0x3, 0x4, 0x5:
 			return nil, &settingsError{fmt.Sprintf("reserved HTTP/2 setting: %d", id)}
 		case settingMaxFieldSectionSize:
-			if readMaxFieldSectionSize {
+			if frame.MaxFieldSectionSize >= 0 {
 				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
 			}
-			readMaxFieldSectionSize = true
 			frame.MaxFieldSectionSize = int64(val)
-			settingsFrame.MaxFieldSectionSize = int64(val)
 		case settingExtendedConnect:
-			if readExtendedConnect {
+			if extendedConnect >= 0 {
 				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
 			}
-			readExtendedConnect = true
 			if val != 0 && val != 1 {
 				return nil, &settingsError{fmt.Sprintf("invalid value for SETTINGS_ENABLE_CONNECT_PROTOCOL: %d", val)}
 			}
+			extendedConnect = int64(val)
 			frame.ExtendedConnect = val == 1
-			if qlogger != nil {
-				settingsFrame.ExtendedConnect = new(frame.ExtendedConnect)
-			}
 		case settingDatagram:
-			if readDatagram {
+			if datagram >= 0 {
 				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
 			}
-			readDatagram = true
 			if val != 0 && val != 1 {
 				return nil, &settingsError{fmt.Sprintf("invalid value for SETTINGS_H3_DATAGRAM: %d", val)}
 			}
+			datagram = int64(val)
 			frame.Datagram = val == 1
-			if qlogger != nil {
-				settingsFrame.Datagram = new(frame.Datagram)
-			}
 		default:
 			if _, ok := frame.Other[id]; ok {
 				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
@@ -329,15 +322,18 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
 		}
 	}
 	if qlogger != nil {
-		settingsFrame.Other = maps.Clone(frame.Other)
-
 		qlogger.RecordEvent(qlog.FrameParsed{
 			StreamID: streamID,
 			Raw: qlog.RawInfo{
 				Length:        r.NumRead,
 				PayloadLength: int(l),
 			},
-			Frame: qlog.Frame{Frame: settingsFrame},
+			Frame: qlog.Frame{Frame: qlog.SettingsFrame{
+				MaxFieldSectionSize: frame.MaxFieldSectionSize,
+				Datagram:            datagram,
+				ExtendedConnect:     extendedConnect,
+				Other:               maps.Clone(frame.Other),
+			}},
 		})
 	}
 	return frame, nil

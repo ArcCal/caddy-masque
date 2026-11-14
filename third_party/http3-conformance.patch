@@ -1,29 +1,68 @@
-diff --git a/http3/body.go b/http3/body.go
-index cd05ecb..f76d3f5 100644
 --- a/http3/body.go
 +++ b/http3/body.go
-@@ -22,0 +23 @@ var errTooMuchData = errors.New("peer sent too much data")
-+var errTooLittleData = errors.New("peer sent too little data")
-@@ -59,0 +61,3 @@ func (r *body) Read(b []byte) (int, error) {
+@@ -3,6 +3,7 @@
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"sync"
+ 
+@@ -20,6 +21,7 @@
+ }
+ 
+ var errTooMuchData = errors.New("peer sent too much data")
++var errTooLittleData = fmt.Errorf("peer sent too little data: %w", io.ErrUnexpectedEOF)
+ 
+ // The body is used in the requestBody (for a http.Request) and the responseBody (for a http.Response).
+ type body struct {
+@@ -57,6 +59,9 @@
+ }
+ 
+ func (r *body) Read(b []byte) (int, error) {
 +	if r.str.tunnel.Load() {
 +		r.hasContentLength = false
 +	}
-@@ -66,0 +71,4 @@ func (r *body) Read(b []byte) (int, error) {
+ 	if err := r.checkContentLengthViolation(); err != nil {
+ 		return 0, err
+ 	}
+@@ -64,14 +69,18 @@
+ 		b = b[:min(int64(len(b)), r.remainingContentLength)]
+ 	}
+ 	n, err := r.str.Read(b)
 +	// The response can establish a CONNECT tunnel while this read blocks.
 +	if r.str.tunnel.Load() {
 +		r.hasContentLength = false
 +	}
-@@ -70,0 +79,5 @@ func (r *body) Read(b []byte) (int, error) {
-+	if err == io.EOF && r.hasContentLength && r.remainingContentLength > 0 {
+ 	r.remainingContentLength -= int64(n)
+ 	if err := r.checkContentLengthViolation(); err != nil {
+ 		return n, err
+ 	}
+-	// The peer ended the stream before sending as much content as it announced.
+-	// There's nothing left to reset at this point, so only surface the error, like net/http does.
+ 	if err == io.EOF && r.hasContentLength && r.remainingContentLength > 0 {
+-		return n, io.ErrUnexpectedEOF
 +		r.str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
 +		r.str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
 +		return n, errTooLittleData
-+	}
-diff --git a/http3/body_test.go b/http3/body_test.go
-index 252a288..4714ede 100644
+ 	}
+ 	return n, err
+ }
 --- a/http3/body_test.go
 +++ b/http3/body_test.go
-@@ -140,0 +141,20 @@ func testResponseBodyLengthLimiting(t *testing.T, alongFrameBoundary bool) {
+@@ -108,6 +108,8 @@
+ 	str := NewMockDatagramStream(mockCtrl)
+ 	str.EXPECT().StreamID().Return(quic.StreamID(42)).AnyTimes()
+ 	str.EXPECT().Read(gomock.Any()).DoAndReturn(buf.Read).AnyTimes()
++	str.EXPECT().CancelRead(quic.StreamErrorCode(ErrCodeMessageError)).Times(2)
++	str.EXPECT().CancelWrite(quic.StreamErrorCode(ErrCodeMessageError)).Times(2)
+ 	rb := newResponseBody(
+ 		newStream(str, nil, nil, func(io.Reader, *headersFrame) error { return nil }, nil),
+ 		6,
+@@ -160,3 +162,23 @@
+ 	require.Zero(t, n)
+ 	require.ErrorIs(t, err, errTooMuchData)
+ }
 +
 +func TestBodyCONNECTTransitionDuringRead(t *testing.T) {
 +	ctrl := gomock.NewController(t)
@@ -44,11 +83,12 @@ index 252a288..4714ede 100644
 +	require.NoError(t, err)
 +	require.Equal(t, "tunnel bytes", string(got))
 +}
-diff --git a/http3/client_test.go b/http3/client_test.go
-index 19f3106..3d3e0ee 100644
 --- a/http3/client_test.go
 +++ b/http3/client_test.go
-@@ -413,0 +414,9 @@ func testClient1xxHandling(t *testing.T, numEarlyHints int, terminalStatus int,
+@@ -452,6 +452,15 @@
+ 	for range numEarlyHints {
+ 		rw.WriteHeader(http.StatusEarlyHints)
+ 	}
 +	if terminalStatus == http.StatusSwitchingProtocols {
 +		// A conforming server writer cannot generate 101; inject it to test the receiver.
 +		rspBuf.Write(conformanceHeaders(t, ":status", "101"))
@@ -58,9 +98,9 @@ index 19f3106..3d3e0ee 100644
 +		)
 +		return
 +	}
-diff --git a/http3/conformance_test.go b/http3/conformance_test.go
-new file mode 100644
-index 0000000..ebc6090
+ 	rw.WriteHeader(terminalStatus)
+ 	rw.Flush()
+ 	rspBytes := rspBuf.Bytes()
 --- /dev/null
 +++ b/http3/conformance_test.go
 @@ -0,0 +1,394 @@
@@ -458,56 +498,100 @@ index 0000000..ebc6090
 +		})
 +	}
 +}
-diff --git a/http3/conn.go b/http3/conn.go
-index 039bebf..3d6ddb0 100644
 --- a/http3/conn.go
 +++ b/http3/conn.go
-@@ -184,0 +185 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
-+			return
-@@ -186 +187 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
+@@ -197,14 +197,16 @@
+ 	case streamTypeQPACKEncoderStream:
+ 		if isFirst := c.rcvdQPACKEncoderStr.CompareAndSwap(false, true); !isFirst {
+ 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK encoder stream")
+-		}
 -		// Our QPACK implementation doesn't use the dynamic table yet.
-+		c.handleQPACKStream(str, true)
-@@ -190,0 +192 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
-+			return
-@@ -192 +194 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
--		// Our QPACK implementation doesn't use the dynamic table yet.
-+		c.handleQPACKStream(str, false)
-@@ -222,0 +225,4 @@ func (c *rawConn) handleControlStream(str *quic.ReceiveStream) {
-+		if _, ok := errors.AsType[*settingsError](err); ok {
-+			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeSettingsError), err.Error())
 +			return
 +		}
-diff --git a/http3/conn_test.go b/http3/conn_test.go
-index b93c08a..2f7f852 100644
++		c.handleQPACKStream(str, true)
+ 		return
+ 	case streamTypeQPACKDecoderStream:
+ 		if isFirst := c.rcvdQPACKDecoderStr.CompareAndSwap(false, true); !isFirst {
+ 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK decoder stream")
+-		}
+-		// Our QPACK implementation doesn't use the dynamic table yet.
++			return
++		}
++		c.handleQPACKStream(str, false)
+ 		return
+ 	case streamTypePushStream:
+ 		if isServer {
+@@ -233,6 +235,10 @@
+ 	if err != nil {
+ 		if errors.Is(err, errPriorityUpdateForPush) {
+ 			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeMissingSettings), "")
++			return
++		}
++		if _, ok := errors.AsType[*settingsError](err); ok {
++			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeSettingsError), err.Error())
+ 			return
+ 		}
+ 		_, isStreamError := errors.AsType[*quic.StreamError](err)
 --- a/http3/conn_test.go
 +++ b/http3/conn_test.go
-@@ -174 +174 @@ func TestConnControlStreamFailures(t *testing.T) {
+@@ -181,12 +181,12 @@
+ 	t.Run("missing SETTINGS", func(t *testing.T) {
+ 		testConnControlStreamFailures(t, (&dataFrame{}).Append(nil), nil, ErrCodeMissingSettings)
+ 	})
 -	t.Run("frame error", func(t *testing.T) {
 +	t.Run("settings error", func(t *testing.T) {
-@@ -179 +179 @@ func TestConnControlStreamFailures(t *testing.T) {
+ 		testConnControlStreamFailures(t,
+ 			// 1337 is invalid value for the Extended CONNECT setting
+ 			(&settingsFrame{Other: map[uint64]uint64{settingExtendedConnect: 1337}}).Append(nil),
+ 			nil,
 -			ErrCodeFrameError,
 +			ErrCodeSettingsError,
-diff --git a/http3/error_codes.go b/http3/error_codes.go
-index d0b10a1..9122eb8 100644
+ 		)
+ 	})
+ 	t.Run("control stream closed before SETTINGS", func(t *testing.T) {
 --- a/http3/error_codes.go
 +++ b/http3/error_codes.go
-@@ -30,0 +31,2 @@ const (
+@@ -28,6 +28,8 @@
+ 	ErrCodeVersionFallback          ErrCode = 0x110
+ 	ErrCodeDatagramError            ErrCode = 0x33
+ 	ErrCodeQPACKDecompressionFailed ErrCode = 0x200
 +	ErrCodeQPACKEncoderStreamError  ErrCode = 0x201
 +	ErrCodeQPACKDecoderStreamError  ErrCode = 0x202
-@@ -80,0 +83,4 @@ func (e ErrCode) string() string {
+ )
+ 
+ func (e ErrCode) String() string {
+@@ -78,6 +80,10 @@
+ 		return "H3_DATAGRAM_ERROR"
+ 	case ErrCodeQPACKDecompressionFailed:
+ 		return "QPACK_DECOMPRESSION_FAILED"
 +	case ErrCodeQPACKEncoderStreamError:
 +		return "QPACK_ENCODER_STREAM_ERROR"
 +	case ErrCodeQPACKDecoderStreamError:
 +		return "QPACK_DECODER_STREAM_ERROR"
-diff --git a/http3/frames.go b/http3/frames.go
-index 46e97eb..1d55aaa 100644
+ 	default:
+ 		return ""
+ 	}
 --- a/http3/frames.go
 +++ b/http3/frames.go
-@@ -8,0 +9 @@ import (
+@@ -6,6 +6,7 @@
+ 	"fmt"
+ 	"io"
+ 	"maps"
 +	"sync/atomic"
-@@ -55,0 +57 @@ type frameParser struct {
+ 
+ 	"github.com/quic-go/quic-go"
+ 	"github.com/quic-go/quic-go/http3/qlog"
+@@ -53,18 +54,47 @@
+ 	client bool
+ 	// request is set on request streams, where frames that belong only on
+ 	// the control stream are rejected as soon as their type is read.
 +	tunnel    *atomic.Bool
-@@ -62 +64,13 @@ type frameParser struct {
+ 	request   bool
+ 	r         io.Reader
+ 	streamID  quic.StreamID
+ 	closeConn func(quic.ApplicationErrorCode, string) error
+ }
+ 
 -func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
 +// truncatedFrame distinguishes a clean frame-boundary EOF from a FIN inside a
 +// frame. Peer resets and transport errors retain their original semantics.
@@ -522,7 +606,7 @@ index 46e97eb..1d55aaa 100644
 +}
 +
 +func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (_ frame, err error) {
-@@ -63,0 +78,7 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
+ 	r := &countingByteReader{Reader: quicvarint.NewReader(p.r)}
 +	defer func() {
 +		if err == io.ErrUnexpectedEOF || err == io.EOF && r.NumRead > 0 {
 +			err = truncatedFrame(p.closeConn, err)
@@ -530,7 +614,11 @@ index 46e97eb..1d55aaa 100644
 +			p.closeConn(quic.ApplicationErrorCode(ErrCodeFrameError), err.Error())
 +		}
 +	}()
-@@ -68,0 +90,9 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
+ 	for {
+ 		t, err := quicvarint.Read(r)
+ 		if err != nil {
+ 			return nil, err
++		}
 +		if p.tunnel != nil && p.tunnel.Load() {
 +			switch t {
 +			case 0x1, 0x3, 0x4, 0x5, 0x7, 0xd, 0xf0700, 0xf0701:
@@ -539,54 +627,62 @@ index 46e97eb..1d55aaa 100644
 +				p.closeConn(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "unexpected frame on a CONNECT tunnel")
 +				return nil, fmt.Errorf("peer sent an unexpected frame: type %#x on a CONNECT tunnel", t)
 +			}
-+		}
-@@ -224,0 +255,5 @@ type settingsFrame struct {
+ 		}
+ 		// Frames that are not permitted on this stream are connection errors
+ 		// whatever their payload, so they are rejected before it is read.
+@@ -222,6 +252,11 @@
+ 	Other           map[uint64]uint64 // all settings that we don't explicitly recognize
+ }
+ 
 +// settingsError reports invalid setting semantics, rather than a malformed frame.
 +type settingsError struct{ message string }
 +
 +func (e *settingsError) Error() string { return e.message }
 +
-@@ -252,0 +288,2 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
+ const maxSettingsFrameSize = 8 << 10
+ 
+ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*settingsFrame, error) {
+@@ -251,32 +286,34 @@
+ 		}
+ 
+ 		switch id {
 +		case 0x2, 0x3, 0x4, 0x5:
 +			return nil, &settingsError{fmt.Sprintf("reserved HTTP/2 setting: %d", id)}
-@@ -255 +292 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
+ 		case settingMaxFieldSectionSize:
+ 			if frame.MaxFieldSectionSize >= 0 {
 -				return nil, fmt.Errorf("duplicate setting: %d", id)
 +				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
-@@ -262 +299 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
+ 			}
+ 			frame.MaxFieldSectionSize = int64(val)
+ 		case settingExtendedConnect:
+ 			if extendedConnect >= 0 {
 -				return nil, fmt.Errorf("duplicate setting: %d", id)
 +				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
-@@ -266 +303 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
+ 			}
+ 			if val != 0 && val != 1 {
 -				return nil, fmt.Errorf("invalid value for SETTINGS_ENABLE_CONNECT_PROTOCOL: %d", val)
 +				return nil, &settingsError{fmt.Sprintf("invalid value for SETTINGS_ENABLE_CONNECT_PROTOCOL: %d", val)}
-@@ -274 +311 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
+ 			}
+ 			extendedConnect = int64(val)
+ 			frame.ExtendedConnect = val == 1
+ 		case settingDatagram:
+ 			if datagram >= 0 {
 -				return nil, fmt.Errorf("duplicate setting: %d", id)
 +				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
-@@ -278 +315 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
+ 			}
+ 			if val != 0 && val != 1 {
 -				return nil, fmt.Errorf("invalid value for SETTINGS_H3_DATAGRAM: %d", val)
 +				return nil, &settingsError{fmt.Sprintf("invalid value for SETTINGS_H3_DATAGRAM: %d", val)}
-@@ -286 +323 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
+ 			}
+ 			datagram = int64(val)
+ 			frame.Datagram = val == 1
+ 		default:
+ 			if _, ok := frame.Other[id]; ok {
 -				return nil, fmt.Errorf("duplicate setting: %d", id)
 +				return nil, &settingsError{fmt.Sprintf("duplicate setting: %d", id)}
-diff --git a/http3/frames_test.go b/http3/frames_test.go
-index 13fad6d..c568574 100644
---- a/http3/frames_test.go
-+++ b/http3/frames_test.go
-@@ -29 +29,5 @@ func testFrameParserEOF(t *testing.T, data []byte) {
--		require.ErrorIs(t, err, io.EOF)
-+		if i == 0 {
-+			require.ErrorIs(t, err, io.EOF)
-+		} else {
-+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
-+		}
-@@ -166 +170 @@ func TestParserPushFrames(t *testing.T) {
--		require.ErrorIs(t, err, io.EOF)
-+		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
-@@ -169 +173 @@ func TestParserPushFrames(t *testing.T) {
--		require.ErrorIs(t, err, io.EOF)
-+		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
-diff --git a/http3/header_field_conformance_test.go b/http3/header_field_conformance_test.go
-new file mode 100644
-index 0000000..305b1d1
+ 			}
+ 			if frame.Other == nil {
+ 				frame.Other = make(map[uint64]uint64)
 --- /dev/null
 +++ b/http3/header_field_conformance_test.go
 @@ -0,0 +1,212 @@
@@ -802,29 +898,52 @@ index 0000000..305b1d1
 +	require.Equal(t, map[string][]string{"x-trailer": {"public"}}, decodeHeader(t, &buf))
 +	require.Equal(t, "private", trailers.Get("X-Hop"))
 +}
-diff --git a/http3/headers.go b/http3/headers.go
-index 26bf168..3450275 100644
 --- a/http3/headers.go
 +++ b/http3/headers.go
-@@ -29,0 +30,7 @@ var errHeaderTooLarge = errors.New("http3: headers too large")
+@@ -32,6 +32,13 @@
+ }
+ 
+ var errHeaderTooLarge = errors.New("http3: headers too large")
++
 +// trailerError distinguishes malformed field sections from read deadlines and
 +// other transport errors while receiving the trailer frame payload.
 +type trailerError struct{ err error }
 +
 +func (e *trailerError) Error() string { return e.err.Error() }
 +func (e *trailerError) Unwrap() error { return e.err }
-+
-@@ -55 +62 @@ var invalidHeaderFields = [...]string{
+ 
+ // readHeaderBlock preallocates up to 8 KiB, growing larger buffers as data arrives.
+ // The caller must check length against the configured header size limit first.
+@@ -76,7 +83,7 @@
+ 	"upgrade",
+ }
+ 
 -func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, headerFields *[]qpack.HeaderField) (header, error) {
 +func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, headerFields *[]qpack.HeaderField, isConnect bool) (header, error) {
-@@ -106,0 +114,3 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
+ 	hdr := header{Headers: make(http.Header)}
+ 	var readFirstRegularHeader, readContentLength, hasMethod, hasStatus bool
+ 	var contentLengthStr string
+@@ -128,6 +135,9 @@
+ 			case ":scheme":
+ 				_, isDuplicatePseudoHeader = hdr.Headers[h.Name]
+ 				hdr.Headers[h.Name] = nil
 +				if h.Value != "" && !validURIScheme(h.Value) {
 +					return header{}, fmt.Errorf("invalid :scheme: %q", h.Value)
 +				}
-@@ -127 +137 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
+ 				// URI schemes are case-insensitive and canonically lowercase, see section 3.1 of RFC 3986
+ 				hdr.Scheme = strings.ToLower(h.Value)
+ 			case ":status":
+@@ -148,12 +158,21 @@
+ 				return header{}, fmt.Errorf("invalid response pseudo header: %s", h.Name)
+ 			}
+ 		} else {
 -			if err := validateRegularHeaderField(h); err != nil {
 +			if err := validateRegularHeaderField(h, isRequest); err != nil {
-@@ -132,0 +143,9 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
+ 				return header{}, err
+ 			}
+ 			readFirstRegularHeader = true
+ 			switch h.Name {
+ 			case "content-length":
 +				// Pseudo headers precede regular fields, so :status is known.
 +				// RFC 9110 section 9.3.6 requires ignoring any Content-Length
 +				// on a successful CONNECT response, including invalid values.
@@ -834,10 +953,22 @@ index 26bf168..3450275 100644
 +					hdr.Headers.Add(h.Name, h.Value)
 +					continue
 +				}
-@@ -147 +166 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
+ 				// Ignore duplicate Content-Length headers.
+ 				// Fail if the duplicates differ.
+ 				if !readContentLength {
+@@ -168,7 +187,7 @@
+ 		}
+ 	}
+ 	hdr.ContentLength = -1
 -	if len(contentLengthStr) > 0 {
 +	if readContentLength {
-@@ -158,0 +178,46 @@ func parseHeaders(decodeFn qpack.DecodeFunc, isRequest bool, sizeLimit int, head
+ 		// use ParseUint instead of ParseInt, so that parsing fails on negative values
+ 		cl, err := strconv.ParseUint(contentLengthStr, 10, 63)
+ 		if err != nil {
+@@ -180,11 +199,57 @@
+ 	return hdr, nil
+ }
+ 
 +// RFC 3986 section 3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
 +func validURIScheme(scheme string) bool {
 +	for i := range len(scheme) {
@@ -884,13 +1015,24 @@ index 26bf168..3450275 100644
 +	return httpguts.ValidTrailerHeader(name) && !isConnectionSpecificHeader(strings.ToLower(name))
 +}
 +
-@@ -164 +229 @@ func validateHeaderFieldNameAndValue(h qpack.HeaderField) error {
--	if !httpguts.ValidHeaderFieldValue(h.Value) {
-+	if !httpguts.ValidHeaderFieldValue(h.Value) || strings.Trim(h.Value, " \t") != h.Value {
-@@ -170 +235 @@ func validateHeaderFieldNameAndValue(h qpack.HeaderField) error {
+ func validateHeaderFieldNameAndValue(h qpack.HeaderField) error {
+ 	// field names need to be lowercase, see section 4.2 of RFC 9114
+ 	lowercase := strings.ToLower(h.Name) == h.Name
+ 	invalidName := !httpguts.ValidHeaderFieldName(strings.TrimPrefix(h.Name, ":")) || !lowercase
+-	invalidValue := !httpguts.ValidHeaderFieldValue(h.Value)
++	invalidValue := !httpguts.ValidHeaderFieldValue(h.Value) || strings.Trim(h.Value, " \t") != h.Value
+ 	if !lowercase {
+ 		return &headerFieldError{
+ 			error:        fmt.Errorf("header field is not lower-case: %s", h.Name),
+@@ -209,18 +274,31 @@
+ 	return nil
+ }
+ 
 -func validateRegularHeaderField(h qpack.HeaderField) error {
 +func validateRegularHeaderField(h qpack.HeaderField, isRequest bool) error {
-@@ -177,2 +242,15 @@ func validateRegularHeaderField(h qpack.HeaderField) error {
+ 	if slices.Contains(invalidHeaderFields[:], h.Name) {
+ 		return fmt.Errorf("invalid header field name: %q", h.Name)
+ 	}
 -	if h.Name == "te" && h.Value != "trailers" {
 -		return fmt.Errorf("invalid TE header field value: %q", h.Value)
 +	if h.Name == "te" {
@@ -908,120 +1050,284 @@ index 26bf168..3450275 100644
 +		if !isRequest {
 +			return errors.New("TE header field is only permitted in request headers")
 +		}
-@@ -184 +262 @@ func validateTrailerHeaderField(h qpack.HeaderField) error {
+ 	}
+ 	return nil
+ }
+ 
+ func validateTrailerHeaderField(h qpack.HeaderField) error {
 -	if err := validateRegularHeaderField(h); err != nil {
 +	if err := validateRegularHeaderField(h, false); err != nil {
-@@ -228 +306 @@ func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *
+ 		return err
+ 	}
+ 	if !httpguts.ValidTrailerHeader(h.Name) {
+@@ -264,7 +342,7 @@
+ }
+ 
+ func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField) (*http.Request, error) {
 -	hdr, err := parseHeaders(decodeFn, true, sizeLimit, headerFields)
 +	hdr, err := parseHeaders(decodeFn, true, sizeLimit, headerFields, false)
-@@ -298,0 +377,4 @@ func requestFromHeaders(decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *
-+	if !isConnect && hdr.Scheme == "" {
-+		return nil, errors.New(":scheme must not be empty")
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -333,6 +411,10 @@
+ 	validPath := strings.HasPrefix(hdr.Path, "/") || (hdr.Method == http.MethodOptions && hdr.Path == "*")
+ 	if (!isConnect || isExtendedConnected) && !validPath {
+ 		return nil, fmt.Errorf("invalid :path: %q", hdr.Path)
 +	}
 +
-@@ -350,2 +432,2 @@ func validExtendedConnectProtocol(protocol string) bool {
++	if !isConnect && hdr.Scheme == "" {
++		return nil, errors.New(":scheme must not be empty")
+ 	}
+ 
+ 	var u *url.URL
+@@ -386,8 +468,8 @@
+ // using the decoded qpack header filed.
+ // It is only called for the HTTP header (and not the HTTP trailer).
+ // It takes an http.Response as an argument to allow the caller to set the trailer later on.
 -func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField) error {
 -	hdr, err := parseHeaders(decodeFn, false, sizeLimit, headerFields)
 +func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, sizeLimit int, headerFields *[]qpack.HeaderField, isConnect bool) error {
 +	hdr, err := parseHeaders(decodeFn, false, sizeLimit, headerFields, isConnect)
-@@ -367,0 +450,3 @@ func updateResponseFromHeaders(rsp *http.Response, decodeFn qpack.DecodeFunc, si
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -403,6 +485,9 @@
+ 	status, err := strconv.Atoi(hdr.Status)
+ 	if err != nil {
+ 		return fmt.Errorf("invalid status code: %w", err)
++	}
 +	if len(hdr.Status) != 3 || status < 100 || status == http.StatusSwitchingProtocols {
 +		return fmt.Errorf("invalid status code: %q", hdr.Status)
-+	}
-@@ -400,0 +486 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+ 	}
+ 	rsp.StatusCode = status
+ 	rsp.Status = hdr.Status + " " + http.StatusText(status)
+@@ -437,9 +522,11 @@
+ // writeTrailers encodes and writes HTTP trailers as a HEADERS frame.
+ // It returns true if trailers were written, false if there were no trailers to write.
+ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, qlogger qlogwriter.Recorder) (bool, error) {
 +	hopFields := connectionHeaderFields(trailers)
-@@ -403 +489,2 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+ 	var hasValues bool
+ 	for k, vals := range trailers {
 -		if httpguts.ValidTrailerHeader(k) && len(vals) > 0 {
 +		_, hop := hopFields[strings.ToLower(k)]
 +		if validTrailerHeader(k) && !hop && len(vals) > 0 {
-@@ -423 +510,2 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+ 			hasValues = true
+ 			break
+ 		}
+@@ -459,11 +546,15 @@
+ 		if len(vals) == 0 {
+ 			continue
+ 		}
 -		if !httpguts.ValidTrailerHeader(k) {
 +		lowercaseKey := strings.ToLower(k)
 +		if _, hop := hopFields[lowercaseKey]; !validTrailerHeader(k) || hop {
-@@ -426 +513,0 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+ 			continue
+ 		}
 -		lowercaseKey := strings.ToLower(k)
-@@ -427,0 +515,4 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+ 		for _, v := range vals {
 +			v = strings.Trim(v, " \t")
 +			if !httpguts.ValidHeaderFieldValue(v) {
 +				continue
 +			}
-@@ -435,0 +527,3 @@ func writeTrailers(wr io.Writer, trailers http.Header, streamID quic.StreamID, q
+ 			if err := enc.WriteField(qpack.HeaderField{Name: lowercaseKey, Value: v}); err != nil {
+ 				return false, err
+ 			}
+@@ -471,6 +562,9 @@
+ 				headerFields = append(headerFields, qlog.HeaderField{Name: lowercaseKey, Value: v})
+ 			}
+ 		}
++	}
 +	if buf.Len() == 0 {
 +		return false, nil
-+	}
-@@ -450 +544 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
+ 	}
+ 
+ 	b := make([]byte, 0, frameHeaderLen+buf.Len())
+@@ -486,14 +580,14 @@
+ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *qpack.Decoder, qlogger qlogwriter.Recorder, streamID quic.StreamID) (http.Header, error) {
+ 	if hf.Length > uint64(maxHeaderBytes) {
+ 		maybeQlogInvalidHeadersFrame(qlogger, streamID, hf.Length)
 -		return nil, fmt.Errorf("http3: HEADERS frame too large: %d bytes (max: %d)", hf.Length, maxHeaderBytes)
 +		return nil, &trailerError{fmt.Errorf("%w: HEADERS frame too large: %d bytes (max: %d)", errHeaderTooLarge, hf.Length, maxHeaderBytes)}
-@@ -457 +551 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
+ 	}
+ 
+ 	b, err := readHeaderBlock(r, hf.Length)
+ 	if err != nil {
+ 		return nil, err
+ 	}
 -	decodeFn := decoder.Decode(b)
 +	decodeFn := decodeFieldSection(decoder, b)
-@@ -467 +561 @@ func decodeTrailers(r io.Reader, hf *headersFrame, maxHeaderBytes int, decoder *
+ 	var fields []qpack.HeaderField
+ 	var headerFields *[]qpack.HeaderField
+ 	if qlogger != nil {
+@@ -503,7 +597,7 @@
+ 	trailers, err := parseTrailers(decodeFn, maxHeaderBytes, headerFields)
+ 	if err != nil {
+ 		maybeQlogInvalidHeadersFrame(qlogger, streamID, hf.Length)
 -		return nil, err
 +		return nil, &trailerError{err}
-diff --git a/http3/headers_test.go b/http3/headers_test.go
-index ba1df9c..3f62165 100644
+ 	}
+ 	if qlogger != nil {
+ 		qlogParsedHeadersFrame(qlogger, streamID, hf, fields, nil)
 --- a/http3/headers_test.go
 +++ b/http3/headers_test.go
-@@ -9,0 +10 @@ import (
+@@ -7,6 +7,7 @@
+ 	"io"
+ 	"math"
+ 	"net/http"
 +	"strings"
-@@ -40,0 +42,2 @@ func TestRequestHeaderParsing(t *testing.T) {
+ 	"testing"
+ 
+ 	ossfuzzseeds "github.com/quic-go/go-ossfuzz-seeds"
+@@ -62,7 +63,7 @@
+ 	} {
+ 		headers := []qpack.HeaderField{{Name: ":status", Value: "200"}, {Name: field.Name, Value: field.Value}}
+ 		var fields []qpack.HeaderField
+-		_, err := parseHeaders(decodeFromSlice(headers), false, math.MaxInt, &fields)
++		_, err := parseHeaders(decodeFromSlice(headers), false, math.MaxInt, &fields, false)
+ 		require.Error(t, err)
+ 		var recorder events.Recorder
+ 		qlogParsedHeadersFrame(&recorder, 0, &headersFrame{}, fields, err)
+@@ -81,6 +82,8 @@
+ 		// see https://github.com/quic-go/quic-go/pull/1898
+ 		{name: "path starting with //", path: "//foo", scheme: "https"},
+ 		{name: "upper-case scheme", path: "/foo", scheme: "HTTPS"},
 +		{name: "single-letter scheme", path: "/foo", scheme: "a"},
 +		{name: "custom scheme", path: "/foo", scheme: "My+1.-Scheme"},
-@@ -85,0 +89 @@ func TestRequestHeadersContentLength(t *testing.T) {
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			headers := []qpack.HeaderField{
+@@ -126,6 +129,7 @@
+ func TestRequestHeadersContentLength(t *testing.T) {
+ 	t.Run("no content length", func(t *testing.T) {
+ 		headers := []qpack.HeaderField{
 +			{Name: ":scheme", Value: "https"},
-@@ -96,0 +101 @@ func TestRequestHeadersContentLength(t *testing.T) {
+ 			{Name: ":path", Value: "/"},
+ 			{Name: ":authority", Value: "quic-go.net"},
+ 			{Name: ":method", Value: http.MethodGet},
+@@ -137,6 +141,7 @@
+ 
+ 	t.Run("multiple content lengths", func(t *testing.T) {
+ 		headers := []qpack.HeaderField{
 +			{Name: ":scheme", Value: "https"},
-@@ -394,0 +400 @@ func TestCookieHeader(t *testing.T) {
+ 			{Name: ":path", Value: "/"},
+ 			{Name: ":authority", Value: "quic-go.net"},
+ 			{Name: ":method", Value: http.MethodGet},
+@@ -435,6 +440,7 @@
+ 
+ func TestCookieHeader(t *testing.T) {
+ 	headers := []qpack.HeaderField{
 +		{Name: ":scheme", Value: "https"},
-@@ -409,0 +416 @@ func TestHeadersConcatenation(t *testing.T) {
+ 		{Name: ":path", Value: "/foo"},
+ 		{Name: ":authority", Value: "quic-go.net"},
+ 		{Name: ":method", Value: http.MethodGet},
+@@ -450,6 +456,7 @@
+ 
+ func TestHeadersConcatenation(t *testing.T) {
+ 	headers := []qpack.HeaderField{
 +		{Name: ":scheme", Value: "https"},
-@@ -549 +556 @@ func TestResponseHeaderParsing(t *testing.T) {
+ 		{Name: ":path", Value: "/foo"},
+ 		{Name: ":authority", Value: "quic-go.net"},
+ 		{Name: ":method", Value: http.MethodGet},
+@@ -589,7 +596,7 @@
+ 		{Name: "content-length", Value: "42"},
+ 	}
+ 	rsp := &http.Response{}
 -	require.NoError(t, updateResponseFromHeaders(rsp, decodeFromSlice(headers), math.MaxInt, nil))
 +	require.NoError(t, updateResponseFromHeaders(rsp, decodeFromSlice(headers), math.MaxInt, nil, false))
-@@ -599 +606 @@ func TestResponseHeaderParsingValidation(t *testing.T) {
+ 	require.Equal(t, "HTTP/3.0", rsp.Proto)
+ 	require.Equal(t, 3, rsp.ProtoMajor)
+ 	require.Zero(t, rsp.ProtoMinor)
+@@ -639,7 +646,7 @@
+ 		},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
 -			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(tc.headers), math.MaxInt, nil)
 +			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(tc.headers), math.MaxInt, nil, false)
-@@ -624 +631 @@ func TestResponseHeaderParsingValidation(t *testing.T) {
+ 			if tc.errContains != "" {
+ 				require.ErrorContains(t, err, tc.errContains)
+ 			}
+@@ -664,7 +671,7 @@
+ 				{Name: ":status", Value: "404"},
+ 				{Name: tc.invalidField, Value: "some-value"},
+ 			}
 -			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil)
 +			err := updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false)
-@@ -637 +644 @@ func TestResponseTrailerFields(t *testing.T) {
+ 			require.EqualError(t, err, fmt.Sprintf("invalid header field name: %q", tc.invalidField))
+ 		})
+ 	}
+@@ -677,7 +684,7 @@
+ 		{Name: "trailer", Value: "TRAILER3"},
+ 	}
+ 	var rsp http.Response
 -	require.NoError(t, updateResponseFromHeaders(&rsp, decodeFromSlice(headers), math.MaxInt, nil))
 +	require.NoError(t, updateResponseFromHeaders(&rsp, decodeFromSlice(headers), math.MaxInt, nil, false))
-@@ -646 +653 @@ func TestResponseTrailerFields(t *testing.T) {
+ 	require.Empty(t, rsp.Header)
+ 	require.Equal(t, http.Header(map[string][]string{
+ 		"Trailer1": nil,
+@@ -686,18 +693,17 @@
+ 	}), rsp.Trailer)
+ }
+ 
 -func TestResponseTrailerParsingTE(t *testing.T) {
 +func TestResponseHeaderTEIsNotPermitted(t *testing.T) {
-@@ -651,5 +657,0 @@ func TestResponseTrailerParsingTE(t *testing.T) {
+ 	headers := []qpack.HeaderField{
+ 		{Name: ":status", Value: "404"},
+ 		{Name: "te", Value: "trailers"},
+ 	}
 -	require.NoError(t, updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil))
 -	headers = []qpack.HeaderField{
 -		{Name: ":status", Value: "404"},
 -		{Name: "te", Value: "not-trailers"},
 -	}
-@@ -657 +659,5 @@ func TestResponseTrailerParsingTE(t *testing.T) {
+ 	require.EqualError(t,
 -		updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil),
 +		updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false),
 +		"TE header field is only permitted in request headers")
 +	headers[1].Value = "not-trailers"
 +	require.EqualError(t,
 +		updateResponseFromHeaders(&http.Response{}, decodeFromSlice(headers), math.MaxInt, nil, false),
-@@ -779 +785 @@ func TestQpackError(t *testing.T) {
+ 		`invalid TE header field value: "not-trailers"`)
+ }
+ 
+@@ -819,7 +825,7 @@
+ 	t.Run("trailer parsing", func(t *testing.T) {
+ 		dec := qpack.NewDecoder()
+ 		decodeFn := dec.Decode(buf.Bytes()[:len(buf.Bytes())/2])
 -		err := updateResponseFromHeaders(&http.Response{}, decodeFn, math.MaxInt, nil)
 +		err := updateResponseFromHeaders(&http.Response{}, decodeFn, math.MaxInt, nil, false)
-@@ -914 +920 @@ func FuzzHeaderParsing(f *testing.F) {
+ 		require.ErrorAs(t, err, new(*qpackError))
+ 	})
+ }
+@@ -954,7 +960,7 @@
+ 		}
+ 
+ 		rsp := &http.Response{}
 -		if err := updateResponseFromHeaders(rsp, decodeFromSlice(headers), maxHeaderBytes, nil); err == nil {
 +		if err := updateResponseFromHeaders(rsp, decodeFromSlice(headers), maxHeaderBytes, nil, false); err == nil {
-@@ -937,0 +944 @@ func requireValidFuzzHeader(t *testing.T, h http.Header, context string) {
+ 			require.Equalf(t, "HTTP/3.0", rsp.Proto, "expected Proto HTTP/3.0, got %q", rsp.Proto)
+ 			require.Equalf(t, 3, rsp.ProtoMajor, "expected ProtoMajor 3, got %d", rsp.ProtoMajor)
+ 			require.GreaterOrEqualf(t, rsp.ContentLength, int64(-1), "invalid ContentLength: %d", rsp.ContentLength)
+@@ -978,14 +984,19 @@
+ 		require.Truef(t, httpguts.ValidHeaderFieldName(name), "%s contains invalid header field name %q", context, name)
+ 		for _, value := range values {
+ 			require.Truef(t, httpguts.ValidHeaderFieldValue(value), "%s contains invalid header field value for %q: %q", context, name, value)
 +			require.Equal(t, strings.Trim(value, " \t"), value, "field value contains edge whitespace")
-@@ -943,0 +951 @@ func requireValidFuzzHeader(t *testing.T, h http.Header, context string) {
+ 		}
+ 	}
+ 	for _, name := range invalidHeaderFields {
+ 		require.Emptyf(t, h.Get(name), "%s contains connection-specific header %q", context, name)
+ 	}
+ 	if te := h.Values("Te"); len(te) > 0 {
 +		require.Equal(t, "request", context, "TE is only permitted in request headers")
-@@ -945 +953,4 @@ func requireValidFuzzHeader(t *testing.T, h http.Header, context string) {
+ 		for _, value := range te {
 -			require.Equalf(t, "trailers", value, "%s contains invalid TE header field value: %q", context, value)
 +			for _, member := range strings.Split(value, ",") {
 +				member = strings.Trim(member, " \t")
 +				require.Truef(t, member == "" || len(member) == len("trailers") && strings.EqualFold(member, "trailers"), "%s contains invalid TE member: %q", context, member)
 +			}
-diff --git a/http3/outgoing_content_length_test.go b/http3/outgoing_content_length_test.go
-new file mode 100644
-index 0000000..b204d5e
+ 		}
+ 	}
+ }
 --- /dev/null
 +++ b/http3/outgoing_content_length_test.go
 @@ -0,0 +1,120 @@
@@ -1145,9 +1451,6 @@ index 0000000..b204d5e
 +	_, err = io.ReadAll(good)
 +	require.NoError(t, err)
 +}
-diff --git a/http3/outgoing_field_validation_test.go b/http3/outgoing_field_validation_test.go
-new file mode 100644
-index 0000000..c27e10f
 --- /dev/null
 +++ b/http3/outgoing_field_validation_test.go
 @@ -0,0 +1,121 @@
@@ -1272,9 +1575,73 @@ index 0000000..c27e10f
 +	_, err = fp.ParseNext(nil)
 +	require.ErrorIs(t, err, io.EOF)
 +}
-diff --git a/http3/qpack_field_section.go b/http3/qpack_field_section.go
-new file mode 100644
-index 0000000..948107a
+--- /dev/null
++++ b/http3/qlog/qlog_dir.go
+@@ -0,0 +1,17 @@
++package qlog
++
++import (
++	"context"
++
++	"github.com/quic-go/quic-go"
++	"github.com/quic-go/quic-go/qlog"
++	"github.com/quic-go/quic-go/qlogwriter"
++)
++
++// DefaultConnectionTracer retains the HTTP/3 tracer entry point used by Caddy.
++// HTTP/3 registers its schema at package initialization; the QUIC tracer writes
++// all registered schemas using the upstream QLOGDIR implementation.
++// Deprecated: use qlog.DefaultConnectionTracer from the QUIC qlog package.
++func DefaultConnectionTracer(ctx context.Context, isClient bool, connID quic.ConnectionID) qlogwriter.Trace {
++	return qlog.DefaultConnectionTracer(ctx, isClient, connID)
++}
+--- /dev/null
++++ b/http3/qlog/qlog_dir_test.go
+@@ -0,0 +1,44 @@
++package qlog
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/quic-go/quic-go"
++	"github.com/quic-go/quic-go/qlog"
++	"github.com/stretchr/testify/require"
++)
++
++func TestQLOGDIRSet(t *testing.T) {
++	tmpDir := t.TempDir()
++
++	connID := quic.ConnectionIDFromBytes([]byte{1, 2, 3, 4})
++	qlogDir := filepath.Join(tmpDir, "qlogs")
++	t.Setenv("QLOGDIR", qlogDir)
++
++	tracer := DefaultConnectionTracer(context.Background(), true, connID)
++	require.NotNil(t, tracer)
++
++	// adding and closing a producer makes the tracer close the file
++	recorder := tracer.AddProducer()
++	recorder.Close()
++
++	require.DirExists(t, qlogDir)
++
++	entries, err := os.ReadDir(qlogDir)
++	require.NoError(t, err)
++	require.Len(t, entries, 1)
++
++	data, err := os.ReadFile(filepath.Join(qlogDir, entries[0].Name()))
++	require.NoError(t, err)
++
++	require.Contains(t, string(data), EventSchema)
++	require.Contains(t, string(data), qlog.EventSchema)
++}
++
++func TestQLOGDIRNotSet(t *testing.T) {
++	t.Setenv("QLOGDIR", "")
++	require.Nil(t, DefaultConnectionTracer(context.Background(), false, quic.ConnectionIDFromBytes([]byte{1})))
++}
 --- /dev/null
 +++ b/http3/qpack_field_section.go
 @@ -0,0 +1,56 @@
@@ -1334,9 +1701,6 @@ index 0000000..948107a
 +	}
 +	return 0, errInvalidQPACKBase
 +}
-diff --git a/http3/qpack_field_section_test.go b/http3/qpack_field_section_test.go
-new file mode 100644
-index 0000000..ebf2db8
 --- /dev/null
 +++ b/http3/qpack_field_section_test.go
 @@ -0,0 +1,152 @@
@@ -1492,9 +1856,6 @@ index 0000000..ebf2db8
 +		}
 +	}
 +}
-diff --git a/http3/qpack_stream.go b/http3/qpack_stream.go
-new file mode 100644
-index 0000000..3e88f4b
 --- /dev/null
 +++ b/http3/qpack_stream.go
 @@ -0,0 +1,84 @@
@@ -1582,9 +1943,6 @@ index 0000000..3e88f4b
 +	}
 +	return errInvalidQPACKInstruction
 +}
-diff --git a/http3/qpack_stream_test.go b/http3/qpack_stream_test.go
-new file mode 100644
-index 0000000..fb942ea
 --- /dev/null
 +++ b/http3/qpack_stream_test.go
 @@ -0,0 +1,164 @@
@@ -1752,19 +2110,26 @@ index 0000000..fb942ea
 +	})
 +	return peer, str
 +}
-diff --git a/http3/request_writer.go b/http3/request_writer.go
-index ec362c2..0856584 100644
 --- a/http3/request_writer.go
 +++ b/http3/request_writer.go
-@@ -65 +65 @@ func (w *requestWriter) writeHeaders(wr io.Writer, req *http.Request, gzip bool,
+@@ -62,7 +62,7 @@
+ 	if len(req.Trailer) > 0 {
+ 		keys := make([]string, 0, len(req.Trailer))
+ 		for k := range req.Trailer {
 -			if httpguts.ValidTrailerHeader(k) {
 +			if validTrailerHeader(k) {
-@@ -198 +198 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
+ 				keys = append(keys, k)
+ 			}
+ 		}
+@@ -195,7 +195,7 @@
+ 			}
+ 
+ 			for _, v := range vv {
 -				f(k, v)
 +				f(k, strings.Trim(v, " \t"))
-diff --git a/http3/response_status_conformance_test.go b/http3/response_status_conformance_test.go
-new file mode 100644
-index 0000000..82579f7
+ 			}
+ 		}
+ 		if shouldSendReqContentLength(req.Method, contentLength) {
 --- /dev/null
 +++ b/http3/response_status_conformance_test.go
 @@ -0,0 +1,76 @@
@@ -1844,39 +2209,71 @@ index 0000000..82579f7
 +		})
 +	}
 +}
-diff --git a/http3/response_writer.go b/http3/response_writer.go
-index 453c2f4..a8a8ee8 100644
 --- a/http3/response_writer.go
 +++ b/http3/response_writer.go
-@@ -12,0 +13,2 @@ import (
+@@ -11,10 +11,10 @@
+ 	"strings"
+ 	"time"
+ 
 +	"golang.org/x/net/http/httpguts"
 +
-@@ -15,2 +16,0 @@ import (
+ 	"github.com/quic-go/qpack"
+ 	"github.com/quic-go/quic-go/http3/qlog"
 -
 -	"golang.org/x/net/http/httpguts"
-@@ -87,2 +87,2 @@ func (w *responseWriter) WriteHeader(status int) {
+ )
+ 
+ // HTTPStreamer allows an HTTP handler to take over an HTTP/3 stream.
+@@ -94,8 +94,8 @@
+ 		return
+ 	}
+ 
 -	// http status must be 3 digits
 -	if status < 100 || status > 999 {
 +	// HTTP status must be 3 digits; HTTP/3 does not support 101 (RFC 9114 section 4.5).
 +	if status < 100 || status > 999 || status == http.StatusSwitchingProtocols {
-@@ -100,0 +101,4 @@ func (w *responseWriter) WriteHeader(status int) {
+ 		panic(fmt.Sprintf("invalid WriteHeader code %v", status))
+ 	}
+ 	w.status = status
+@@ -111,6 +111,10 @@
+ 
+ 	// We're done with headers once we write a status >= 200.
+ 	w.headerComplete = true
 +	if w.str.isConnect && status >= 200 && status < 300 {
 +		w.str.tunnel.Store(true)
 +		w.header.Del("Content-Length")
 +	}
-@@ -131 +135 @@ func (w *responseWriter) sniffContentType(p []byte) {
+ 	// Add Date header.
+ 	// This is what the standard library does.
+ 	// Can be disabled by setting the Date header to nil.
+@@ -141,7 +145,7 @@
+ 
+ 	// If the Content-Encoding was set and is non-blank, we shouldn't sniff the body.
+ 	hasCE := w.header.Get("Content-Encoding") != ""
 -	if !hasCE && !haveType && len(p) > 0 {
 +	if !w.str.tunnel.Load() && !hasCE && !haveType && len(p) > 0 {
-@@ -137 +141 @@ func (w *responseWriter) Write(p []byte) (int, error) {
+ 		w.header.Set("Content-Type", http.DetectContentType(p))
+ 	}
+ }
+@@ -150,10 +154,10 @@
+ 	if w.hijacked {
+ 		return 0, http.ErrHijacked
+ 	}
 -	bodyAllowed := bodyAllowedForStatus(w.status)
 +	bodyAllowed := w.str.tunnel.Load() || bodyAllowedForStatus(w.status)
-@@ -139 +142,0 @@ func (w *responseWriter) Write(p []byte) (int, error) {
--		w.sniffContentType(p)
-@@ -140,0 +144 @@ func (w *responseWriter) Write(p []byte) (int, error) {
-+		w.sniffContentType(p)
-@@ -232,0 +237 @@ func (w *responseWriter) writeHeader(status int) error {
+ 	if !w.headerComplete {
++		w.WriteHeader(http.StatusOK)
+ 		w.sniffContentType(p)
+-		w.WriteHeader(http.StatusOK)
+ 		bodyAllowed = true
+ 	}
+ 	if !bodyAllowed {
+@@ -245,7 +249,20 @@
+ 		}
+ 	}
+ 
 +	hopFields := connectionHeaderFields(w.header)
-@@ -233,0 +239,12 @@ func (w *responseWriter) writeHeader(status int) error {
+ 	for k, v := range w.header {
 +		if !httpguts.ValidHeaderFieldName(k) {
 +			continue
 +		}
@@ -1889,31 +2286,69 @@ index 453c2f4..a8a8ee8 100644
 +		if strings.EqualFold(k, "Content-Length") && (w.str.tunnel.Load() || status < 200 || status == http.StatusNoContent) {
 +			continue
 +		}
-@@ -242,2 +259,4 @@ func (w *responseWriter) writeHeader(status int) error {
+ 		if _, excluded := w.trailers[k]; excluded {
+ 			continue
+ 		}
+@@ -254,8 +271,10 @@
+ 			continue
+ 		}
+ 		for index := range v {
 -			name := strings.ToLower(k)
 -			value := v[index]
 +			value := strings.Trim(v[index], " \t")
 +			if !httpguts.ValidHeaderFieldValue(value) {
 +				continue
 +			}
-@@ -295 +314 @@ func (w *responseWriter) declareTrailer(k string) {
+ 			if err := enc.WriteField(qpack.HeaderField{Name: name, Value: value}); err != nil {
+ 				return nil, err
+ 			}
+@@ -289,7 +308,7 @@
+ 	_, haveCL := w.header["Content-Length"]
+ 	// without a final status, FlushError sends a 200
+ 	bodyAllowed := !w.headerComplete || bodyAllowedForStatus(w.status)
+-	if !haveCL && !w.headerWritten && bodyAllowed {
++	if !haveCL && !w.headerWritten && bodyAllowed && !w.str.tunnel.Load() {
+ 		w.header.Set("Content-Length", strconv.FormatInt(w.numWritten, 10))
+ 	}
+ 	return w.FlushError()
+@@ -317,7 +336,7 @@
+ // declareTrailer adds a trailer to the trailer list, while also validating that the trailer has a
+ // valid name.
+ func (w *responseWriter) declareTrailer(k string) {
 -	if !httpguts.ValidTrailerHeader(k) {
 +	if !validTrailerHeader(k) {
-@@ -309,0 +329,3 @@ func (w *responseWriter) writeTrailers() error {
+ 		// Forbidden by RFC 9110, section 6.5.1.
+ 		if w.logger != nil {
+ 			w.logger.Debug("ignoring invalid trailer", slog.String("header", k))
+@@ -332,6 +351,9 @@
+ 
+ // writeTrailers will write trailers to the stream if there are any.
+ func (w *responseWriter) writeTrailers() error {
 +	if w.str.tunnel.Load() {
 +		return nil
 +	}
-@@ -321,0 +344 @@ func (w *responseWriter) writeTrailers() error {
+ 	// promote headers added via "Trailer:" convention as trailers, these can be added after
+ 	// streaming the status/headers have been written.
+ 	for k := range w.header {
+@@ -344,8 +366,12 @@
+ 		return nil
+ 	}
+ 
 +	hopFields := connectionHeaderFields(w.header)
-@@ -323,0 +347,3 @@ func (w *responseWriter) writeTrailers() error {
+ 	trailers := make(http.Header, len(w.trailers))
+ 	for trailer := range w.trailers {
 +		if _, hop := hopFields[strings.ToLower(strings.TrimPrefix(trailer, http.TrailerPrefix))]; hop {
 +			continue
 +		}
-diff --git a/http3/response_writer_test.go b/http3/response_writer_test.go
-index 8d0b2f4..efa50bb 100644
+ 		if vals, ok := w.header[trailer]; ok {
+ 			trailers[strings.TrimPrefix(trailer, http.TrailerPrefix)] = vals
+ 		}
 --- a/http3/response_writer_test.go
 +++ b/http3/response_writer_test.go
-@@ -258,0 +259,18 @@ func TestResponseWriterTrailers(t *testing.T) {
+@@ -422,3 +422,21 @@
+ 	// invalid trailers are ignored
+ 	require.NotContains(t, trailers, "content-length")
+ }
 +
 +func TestResponseWriterImplicitSuccessfulCONNECT(t *testing.T) {
 +	rw := newTestResponseWriter(t)
@@ -1932,11 +2367,12 @@ index 8d0b2f4..efa50bb 100644
 +	require.Equal(t, []byte("tunnel bytes"), rw.DecodeBody(t))
 +	require.Empty(t, rw.buf.Bytes(), "a successful CONNECT must not send trailers")
 +}
-diff --git a/http3/server.go b/http3/server.go
-index a506434..329b4c3 100644
 --- a/http3/server.go
 +++ b/http3/server.go
-@@ -135,0 +136,7 @@ type listener struct {
+@@ -133,6 +133,13 @@
+ 	createdLocally bool
+ }
+ 
 +// ConnectionConfig contains HTTP limits snapshotted when a connection opens.
 +// It does not change the QUIC transport configuration or existing connections.
 +type ConnectionConfig struct {
@@ -1944,13 +2380,25 @@ index a506434..329b4c3 100644
 +	IdleTimeout    time.Duration
 +}
 +
-@@ -188,0 +196,5 @@ type Server struct {
+ // Server is a HTTP/3 server.
+ type Server struct {
+ 	// Addr optionally specifies the UDP address for the server to listen on,
+@@ -186,6 +193,11 @@
+ 	// If zero or negative, there is no timeout.
+ 	IdleTimeout time.Duration
+ 
 +	// GetConnectionConfig optionally selects HTTP limits for each new
 +	// connection. The returned values replace MaxHeaderBytes and IdleTimeout.
 +	// This permits reloads without mutating a server used by live connections.
 +	GetConnectionConfig func(*quic.Conn) ConnectionConfig
 +
-@@ -465,0 +478,7 @@ func (s *Server) newRawServerConn(conn *quic.Conn) (*RawServerConn, *quic.SendSt
+ 	// ConnContext optionally specifies a function that modifies the context used for a new connection c.
+ 	// The provided ctx has a ServerContextKey value.
+ 	ConnContext func(ctx context.Context, c *quic.Conn) context.Context
+@@ -463,6 +475,13 @@
+ }
+ 
+ func (s *Server) newRawServerConn(conn *quic.Conn) (*RawServerConn, *quic.SendStream, error) {
 +	config := ConnectionConfig{MaxHeaderBytes: s.MaxHeaderBytes, IdleTimeout: s.IdleTimeout}
 +	if s.GetConnectionConfig != nil {
 +		config = s.GetConnectionConfig(conn)
@@ -1958,20 +2406,32 @@ index a506434..329b4c3 100644
 +	if config.MaxHeaderBytes <= 0 {
 +		config.MaxHeaderBytes = http.DefaultMaxHeaderBytes
 +	}
-@@ -483 +502 @@ func (s *Server) newRawServerConn(conn *quic.Conn) (*RawServerConn, *quic.SendSt
+ 	var qlogger qlogwriter.Recorder
+ 	if qlogTrace := conn.QlogTrace(); qlogTrace != nil {
+ 		qlogger = qlogTrace.AddProducer()
+@@ -480,17 +499,19 @@
+ 	hconn := newRawServerConn(
+ 		conn,
+ 		s.EnableDatagrams,
 -		s.IdleTimeout,
 +		config.IdleTimeout,
-@@ -488 +507 @@ func (s *Server) newRawServerConn(conn *quic.Conn) (*RawServerConn, *quic.SendSt
+ 		qlogger,
+ 		s.Logger,
+ 		connCtx,
+ 		s.Handler,
 -		s.maxHeaderBytes(),
 +		config.MaxHeaderBytes,
-@@ -493 +512,3 @@ func (s *Server) newRawServerConn(conn *quic.Conn) (*RawServerConn, *quic.SendSt
+ 	)
+ 
+ 	// open the control stream and send a SETTINGS frame, it's also used to send a GOAWAY frame later
+ 	// when the server is gracefully closed
 -	ctrlStr, err := hconn.openControlStream(s.settings())
 +	settings := s.settings()
 +	settings.MaxFieldSectionSize = int64(config.MaxHeaderBytes)
 +	ctrlStr, err := hconn.openControlStream(settings)
-diff --git a/http3/server_config_test.go b/http3/server_config_test.go
-new file mode 100644
-index 0000000..6bed417
+ 	if err != nil {
+ 		return nil, nil, fmt.Errorf("opening the control stream failed: %w", err)
+ 	}
 --- /dev/null
 +++ b/http3/server_config_test.go
 @@ -0,0 +1,53 @@
@@ -2001,7 +2461,7 @@ index 0000000..6bed417
 +	}
 +	open := func(want ConnectionConfig) *RawServerConn {
 +		client, server := newConnPair(t)
-+		conn, _, _, err := s.newRawServerConn(server)
++		conn, _, err := s.newRawServerConn(server)
 +		require.NoError(t, err)
 +		t.Cleanup(func() { _ = conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeNoError), "") })
 +		require.Equal(t, want.MaxHeaderBytes, conn.maxHeaderBytes)
@@ -2028,35 +2488,61 @@ index 0000000..6bed417
 +	open(ConnectionConfig{MaxHeaderBytes: http.DefaultMaxHeaderBytes})
 +	require.Equal(t, 3, calls)
 +}
-diff --git a/http3/server_conn.go b/http3/server_conn.go
-index 1f9e143..cf88c43 100644
 --- a/http3/server_conn.go
 +++ b/http3/server_conn.go
-@@ -139,0 +140 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
+@@ -141,11 +141,12 @@
+ 	headerBlock, err := readHeaderBlock(str, hf.Length)
+ 	if err != nil {
+ 		maybeQlogInvalidHeadersFrame(qlogger, str.StreamID(), hf.Length)
 +		truncatedFrame(conn.CloseWithError, err)
-@@ -144 +145 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
+ 		str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+ 		str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+ 		return
+ 	}
 -	decodeFn := decoder.Decode(headerBlock)
 +	decodeFn := decodeFieldSection(decoder, headerBlock)
-@@ -162 +162,0 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
+ 	var hfs []qpack.HeaderField
+ 	if qlogger != nil {
+ 		hfs = make([]qpack.HeaderField, 0, 16)
+@@ -163,12 +164,12 @@
+ 			return
+ 		}
+ 
 -		errCode := ErrCodeMessageError
-@@ -164 +164,4 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
+ 		if _, ok := errors.AsType[*qpackError](err); ok {
 -			errCode = ErrCodeQPACKDecompressionFailed
+-		}
+-		str.CancelRead(quic.StreamErrorCode(errCode))
+-		str.CancelWrite(quic.StreamErrorCode(errCode))
 +			conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeQPACKDecompressionFailed), err.Error())
 +		} else {
 +			str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
 +			str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
-@@ -166,2 +168,0 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
--		str.CancelRead(quic.StreamErrorCode(errCode))
--		str.CancelWrite(quic.StreamErrorCode(errCode))
-@@ -189,0 +191,2 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
-+	hstr.isConnect = req.Method == http.MethodConnect
++		}
+ 		return
+ 	}
+ 
+@@ -189,6 +190,8 @@
+ 		req.Trailer = trailers
+ 		return nil
+ 	}, qlogger)
 +
-@@ -257 +260 @@ func (c *RawServerConn) handleRequestStream(str *stateTrackingStream) {
--		if _, haveCL := r.header["Content-Length"]; !haveCL {
-+		if _, haveCL := r.header["Content-Length"]; !haveCL && !hstr.tunnel.Load() && bodyAllowedForStatus(r.status) {
-@@ -271,0 +275 @@ func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *framePars
++	hstr.isConnect = req.Method == http.MethodConnect
+ 
+ 	// We only use the client's priority for local scheduling.
+ 	// A Priority response header is only transmitted so that potential intermediaries can use it,
+@@ -272,6 +275,7 @@
+ func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *frameParser) {
+ 	var maxPushID uint64
+ 	var gotMaxPushID bool
 +	lastGoAwayID := quic.StreamID(1<<62 - 1)
-@@ -299 +303,7 @@ func (c *RawServerConn) handleControlStream(_ *quic.ReceiveStream, fp *framePars
+ 	for {
+ 		f, err := fp.ParseNext(c.qlogger)
+ 		if err != nil {
+@@ -299,7 +303,13 @@
+ 			urgency, incremental := parsePriority(frame.PriorityFieldValue)
+ 			c.rawConn.UpdateStreamPriority(quic.StreamID(frame.ElementID), urgency, incremental)
+ 		case *goAwayFrame:
 -			// Server push is not supported, so there is no push state to update.
 +			// Even without server push, client GOAWAY IDs cannot increase
 +			// (RFC 9114 section 5.2).
@@ -2065,39 +2551,155 @@ index 1f9e143..cf88c43 100644
 +				return
 +			}
 +			lastGoAwayID = frame.StreamID
-diff --git a/http3/stream.go b/http3/stream.go
-index 3f66e0a..176a0ee 100644
+ 		case *maxPushIDFrame:
+ 			// RFC 9114 section 7.2.7: MAX_PUSH_ID cannot reduce the maximum push ID.
+ 			if gotMaxPushID && frame.PushID < maxPushID {
+--- a/http3/server_test.go
++++ b/http3/server_test.go
+@@ -10,6 +10,7 @@
+ 	"net"
+ 	"net/http"
+ 	"net/http/httptest"
++	"os"
+ 	"runtime"
+ 	"testing"
+ 	"time"
+@@ -196,17 +197,30 @@
+ 	t.Run("POST request with fewer body bytes than announced", func(t *testing.T) {
+ 		req := httptest.NewRequest(http.MethodPost, "https://www.example.com", bytes.NewBuffer([]byte("foo")))
+ 		req.ContentLength = 6
+-		hfs, body := testServerRequestHandling(t,
+-			func(w http.ResponseWriter, r *http.Request) {
+-				_, err := io.ReadAll(r.Body)
+-				w.WriteHeader(http.StatusBadRequest)
+-				fmt.Fprint(w, err)
+-			},
+-			req,
+-			nil,
+-		)
+-		require.Equal(t, hfs[":status"], []string{"400"})
+-		require.Equal(t, []byte(io.ErrUnexpectedEOF.Error()), body)
++		client, server := newConnPair(t)
++		str, err := client.OpenStream()
++		require.NoError(t, err)
++		_, err = str.Write(encodeRequest(t, req))
++		require.NoError(t, err)
++		require.NoError(t, str.Close())
++		handled := make(chan error, 1)
++		s := &Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			_, err := io.ReadAll(r.Body)
++			handled <- err
++		})}
++		go s.ServeQUICConn(server)
++		require.NoError(t, str.SetReadDeadline(time.Now().Add(time.Second)))
++		_, err = io.ReadAll(str)
++		var streamErr *quic.StreamError
++		require.ErrorAs(t, err, &streamErr)
++		require.Equal(t, quic.StreamErrorCode(ErrCodeMessageError), streamErr.ErrorCode)
++		require.True(t, streamErr.Remote)
++		select {
++		case err := <-handled:
++			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
++		case <-time.After(time.Second):
++			t.Fatal("handler did not read the truncated body")
++		}
+ 	})
+ }
+ 
+@@ -418,9 +432,15 @@
+ 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 			defer close(done)
+ 			rc := http.NewResponseController(w)
+-			// the client doesn't read the response, so the write blocks once the flow control window is used up
+-			rc.SetWriteDeadline(time.Now().Add(scaleDuration(10 * time.Millisecond)))
+-			w.Write(make([]byte, 10<<20))
++			// Finish HEADERS before the deadline so this test actually truncates DATA.
++			require.NoError(t, rc.Flush())
++			payload := make([]byte, 10<<20)
++			// The unread response exhausts the receive window.
++			require.NoError(t, rc.SetWriteDeadline(time.Now().Add(scaleDuration(100*time.Millisecond))))
++			n, err := w.Write(payload)
++			require.ErrorIs(t, err, os.ErrDeadlineExceeded)
++			require.Greater(t, n, 0)
++			require.Less(t, n, len(payload))
+ 			// flushing succeeds, but the DATA frame is still unfinished
+ 			rc.SetWriteDeadline(time.Time{})
+ 		}),
+--- a/http3/state_tracking_stream.go
++++ b/http3/state_tracking_stream.go
+@@ -28,7 +28,7 @@
+ 	mx             sync.Mutex
+ 	sendStreamDone bool
+ 	recvErr        error
+-	// Set by the HTTP handler when the request defines no Datagram semantics.
++	// Set when the request defines no Datagram semantics.
+ 	datagramsRejected bool
+ 
+ 	clearer streamClearer
 --- a/http3/stream.go
 +++ b/http3/stream.go
-@@ -9,0 +10 @@ import (
+@@ -7,6 +7,7 @@
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptrace"
 +	"sync/atomic"
-@@ -49,0 +51,5 @@ type Stream struct {
+ 	"time"
+ 
+ 	"github.com/quic-go/quic-go"
+@@ -49,6 +50,11 @@
+ 
+ 	qlogger qlogwriter.Recorder
+ 
 +	isConnect bool
 +	// A successful CONNECT changes both directions from HTTP content to a tunnel.
 +	// The handler can write the response concurrently with reading the request.
 +	tunnel atomic.Bool
 +
-@@ -61 +67 @@ func newStream(
+ 	parseTrailer  func(io.Reader, *headersFrame) error
+ 	parsedTrailer bool
+ 
+@@ -62,7 +68,7 @@
+ 	parseTrailer func(io.Reader, *headersFrame) error,
+ 	qlogger qlogwriter.Recorder,
+ ) *Stream {
 -	return &Stream{
 +	s := &Stream{
-@@ -73,0 +80,2 @@ func newStream(
+ 		datagramStream: str,
+ 		conn:           conn,
+ 		qlogger:        qlogger,
+@@ -74,6 +80,8 @@
+ 			closeConn: conn.CloseWithError,
+ 		},
+ 	}
 +	s.frameParser.tunnel = &s.tunnel
 +	return s
-@@ -89,0 +98 @@ func (s *Stream) Read(b []byte) (int, error) {
+ }
+ 
+ func (s *Stream) Read(b []byte) (int, error) {
+@@ -93,17 +101,43 @@
+ 			switch f := frame.(type) {
+ 			case *dataFrame:
+ 				if s.parsedTrailer {
 +					s.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "DATA frame received after trailers")
-@@ -91,0 +101,4 @@ func (s *Stream) Read(b []byte) (int, error) {
+ 					return 0, errors.New("DATA frame received after trailers")
++				}
 +				// Empty DATA frames do not end the HTTP content.
 +				if f.Length == 0 {
 +					continue
-+				}
-@@ -94,0 +108,4 @@ func (s *Stream) Read(b []byte) (int, error) {
+ 				}
+ 				s.bytesRemainingInFrame = f.Length
+ 				break parseLoop
+ 			case *headersFrame:
 +				if s.tunnel.Load() {
 +					s.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "HEADERS frame on a CONNECT tunnel")
 +					return 0, errors.New("HEADERS frame on a CONNECT tunnel")
 +				}
-@@ -95,0 +113 @@ func (s *Stream) Read(b []byte) (int, error) {
+ 				if s.parsedTrailer {
 +					s.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "additional HEADERS frame received after trailers")
-@@ -100 +118,17 @@ func (s *Stream) Read(b []byte) (int, error) {
+ 					maybeQlogInvalidHeadersFrame(s.qlogger, s.StreamID(), f.Length)
+ 					return 0, errors.New("additional HEADERS frame received after trailers")
+ 				}
+ 				s.parsedTrailer = true
 -				return 0, maybeReplaceError(s.parseTrailer(s.datagramStream, f))
 +				if err := s.parseTrailer(s.datagramStream, f); err != nil {
 +					if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -2116,54 +2718,127 @@ index 3f66e0a..176a0ee 100644
 +				}
 +				// Keep reading so EOF and invalid frames after trailers are enforced.
 +				continue
-@@ -117,0 +152,3 @@ func (s *Stream) Read(b []byte) (int, error) {
+ 			default:
+ 				s.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "")
+ 				// parseNextFrame skips over unknown frame types
+@@ -121,6 +155,9 @@
+ 		n, err = s.datagramStream.Read(b)
+ 	}
+ 	s.bytesRemainingInFrame -= uint64(n)
 +	if s.bytesRemainingInFrame > 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
 +		err = truncatedFrame(s.conn.CloseWithError, err)
 +	}
-@@ -208,0 +246 @@ type RequestStream struct {
-+	isHead        bool
-@@ -341,0 +380 @@ func (s *RequestStream) sendRequestHeader(req *http.Request) error {
-+	s.isHead = req.Method == http.MethodHead
-@@ -384,0 +424 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
+ 	return n, maybeReplaceError(err)
+ }
+ 
+@@ -231,7 +268,19 @@
+ 
+ func (s *Stream) writeUnframed(b []byte) (int, error) {
+ 	n, err := s.datagramStream.Write(b)
+-	return n, maybeReplaceError(err)
++	err = maybeReplaceError(err)
++	return n, err
++}
++
++// Close sends FIN only after complete framing. Failed unframed writes or
++// incomplete DATA frames require H3_REQUEST_CANCELLED (RFC 9114 Sections 7.1
++// and 8.1), including on streams taken over by the handler.
++func (s *Stream) Close() error {
++	if s.hasUnfinishedFrame() {
++		s.datagramStream.CancelWrite(quic.StreamErrorCode(ErrCodeRequestCanceled))
++		return nil
++	}
++	return s.datagramStream.Close()
+ }
+ 
+ // addQlogProducer registers a call that may produce qlog events.
+@@ -497,47 +546,44 @@
+ 	headerBlock, err := readHeaderBlock(s.str.datagramStream, hf.Length)
+ 	if err != nil {
+ 		maybeQlogInvalidHeadersFrame(s.str.qlogger, s.str.StreamID(), hf.Length)
 +		err = truncatedFrame(s.str.conn.CloseWithError, err)
-@@ -389 +429 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
+ 		s.str.CancelRead(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+ 		s.str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestIncomplete))
+ 		return nil, fmt.Errorf("http3: failed to read response headers: %w", maybeReplaceError(err))
+ 	}
 -	decodeFn := s.decoder.Decode(headerBlock)
 +	decodeFn := decodeFieldSection(s.decoder, headerBlock)
-@@ -395 +435 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
+ 	var hfs []qpack.HeaderField
+ 	if s.str.qlogger != nil {
+ 		hfs = make([]qpack.HeaderField, 0, 16)
+ 	}
+ 	res := s.response
 -	err = updateResponseFromHeaders(res, decodeFn, s.maxHeaderBytes, &hfs)
 +	err = updateResponseFromHeaders(res, decodeFn, s.maxHeaderBytes, &hfs, s.isConnect)
-@@ -400 +439,0 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
+ 	if s.str.qlogger != nil {
+ 		qlogParsedHeadersFrame(s.str.qlogger, s.str.StreamID(), hf, hfs, err)
+ 	}
+ 	if err != nil {
 -		errCode := ErrCodeMessageError
-@@ -402 +441,4 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
+ 		if _, ok := errors.AsType[*qpackError](err); ok {
 -			errCode = ErrCodeQPACKDecompressionFailed
 +			s.str.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeQPACKDecompressionFailed), err.Error())
 +		} else {
 +			s.str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
 +			s.str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
-@@ -404,2 +445,0 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
+ 		}
 -		s.str.CancelRead(quic.StreamErrorCode(errCode))
 -		s.str.CancelWrite(quic.StreamErrorCode(errCode))
-@@ -411,2 +450,0 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
--	respBody := newResponseBody(s.str, res.ContentLength, s.reqDone)
+ 		return nil, fmt.Errorf("http3: invalid response: %w", err)
+ 	}
+ 
+ 	isInformational := res.StatusCode >= 100 && res.StatusCode < 200
+ 	isNoContent := res.StatusCode == http.StatusNoContent
+ 	isSuccessfulConnect := s.isConnect && res.StatusCode >= 200 && res.StatusCode < 300
 -
-@@ -416,0 +455,10 @@ func (s *RequestStream) ReadResponse() (*http.Response, error) {
-+	contentLength := res.ContentLength
+-	// Enforce the Content-Length (section 4.1.2 of RFC 9114).
+ 	contentLength := res.ContentLength
+-	// Responses without content may declare a non-zero Content-Length.
+-	if isInformational || isNoContent || res.StatusCode == http.StatusNotModified || s.isHead {
 +	if isSuccessfulConnect {
 +		// RFC 9110 section 9.3.6 requires ignoring Content-Length on a tunnel.
 +		s.str.tunnel.Store(true)
 +		contentLength = -1
 +	} else if s.isHead || isInformational || isNoContent || res.StatusCode == http.StatusNotModified {
 +		// Content-Length on HEAD and 304 describes a selected representation.
-+		contentLength = 0
-+	}
-+	respBody := newResponseBody(s.str, contentLength, s.reqDone)
-diff --git a/http3/stream_test.go b/http3/stream_test.go
-index b8c9739..ce00040 100644
+ 		contentLength = 0
+ 	}
+-	// A successful CONNECT response starts a tunnel, even if it's a 204.
+-	if isSuccessfulConnect {
+-		contentLength = res.ContentLength
+-	}
+ 	respBody := newResponseBody(s.str, contentLength, s.reqDone)
+-
+-	// Rules for when to set Content-Length are defined in https://tools.ietf.org/html/rfc7230#section-3.3.2.
+ 	if (isInformational || isNoContent || isSuccessfulConnect) && res.ContentLength == -1 {
+ 		res.ContentLength = 0
+ 	}
 --- a/http3/stream_test.go
 +++ b/http3/stream_test.go
-@@ -10,0 +11 @@ import (
-+	"os"
-@@ -266,0 +268,21 @@ func TestRequestStream(t *testing.T) {
+@@ -206,6 +206,9 @@
+ 			_, err = str.Write(slices.Concat(data[n:], []byte("baz")))
+ 			require.NoError(t, err)
+ 			require.Equal(t, append(getDataFrame(data), getDataFrame([]byte("baz"))...), buf.Bytes())
++			qstr.EXPECT().Close()
++			qstr.EXPECT().CancelWrite(gomock.Any()).Times(0)
++			require.NoError(t, str.Close())
+ 		})
+ 	}
+ }
+@@ -227,6 +230,9 @@
+ 	// nothing was queued, so the next call sends the same data
+ 	qstr.EXPECT().TryWriteAll(data).Return(nil)
+ 	require.NoError(t, str.TryWriteAll([]byte("obarbaz")))
++	qstr.EXPECT().Close()
++	qstr.EXPECT().CancelWrite(gomock.Any()).Times(0)
++	require.NoError(t, str.Close())
+ }
+ 
+ func TestStreamQlogWriteAfterConnectionClose(t *testing.T) {
+@@ -339,3 +345,24 @@
+ 	require.Equal(t, 6, n)
+ 	require.Equal(t, []byte("foobar"), b[:n])
+ }
 +
 +func TestStreamTrailerReadDeadline(t *testing.T) {
 +	ctrl := gomock.NewController(t)
@@ -2185,3 +2860,65 @@ index b8c9739..ce00040 100644
 +	// reset either stream direction with H3_MESSAGE_ERROR.
 +	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 +}
+--- a/integrationtests/self/http_request_parsing_test.go
++++ b/integrationtests/self/http_request_parsing_test.go
+@@ -216,11 +216,20 @@
+ 				request.Body = io.NopCloser(strings.NewReader(tc.body))
+ 			}
+ 			resp, err = h3Client.Do(request.Clone(t.Context()))
+-			require.NoError(t, err)
++			if tc.contentLength > int64(len(tc.body)) {
++				// RFC 9114 Section 4.1.2 requires H3_MESSAGE_ERROR for a short body.
++				var h3err *http3.Error
++				require.ErrorAs(t, err, &h3err)
++				require.Equal(t, http3.ErrCodeMessageError, h3err.ErrorCode)
++				require.True(t, h3err.Remote)
++				require.Equal(t, http.StatusBadRequest, h2Status)
++			} else {
++				require.NoError(t, err)
++				require.NoError(t, resp.Body.Close())
++				require.Equal(t, 3, resp.ProtoMajor)
++				require.Equal(t, h2Status, resp.StatusCode)
++			}
+ 			h3Request := <-requests
+-			require.NoError(t, resp.Body.Close())
+-			require.Equal(t, 3, resp.ProtoMajor)
+-			require.Equal(t, h2Status, resp.StatusCode)
+ 
+ 			t.Logf("HTTP/2 request: %+v", h2Request)
+ 			t.Logf("HTTP/3 request: %+v", h3Request)
+--- a/integrationtests/self/http_test.go
++++ b/integrationtests/self/http_test.go
+@@ -1082,6 +1082,7 @@
+ 		w.WriteHeader(http.StatusSwitchingProtocols)
+ 	})
+ 
++	mux.HandleFunc("/valid", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
+ 	port := startHTTPServer(t, mux)
+ 
+ 	var (
+@@ -1098,12 +1099,20 @@
+ 
+ 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://localhost:%d/101-switch-protocols", port), nil)
+ 	require.NoError(t, err)
+-	resp, err := newHTTP3Client(t).Do(req)
+-	require.NoError(t, err)
+-	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+-	require.Equal(t, "bar", resp.Header.Get("Foo"))
++	client := newHTTP3Client(t)
++	resp, err := client.Do(req)
++	// RFC 9114 Section 4.5 forbids sending 101 on HTTP/3.
++	var h3err *http3.Error
++	require.ErrorAs(t, err, &h3err)
++	require.Equal(t, http3.ErrCodeInternalError, h3err.ErrorCode)
++	require.True(t, h3err.Remote)
++	require.Nil(t, resp)
+ 	require.Zero(t, status)
+ 	require.Zero(t, cnt)
++	// Rejecting the handler's invalid response must leave the connection usable.
++	resp, err = client.Get(fmt.Sprintf("https://localhost:%d/valid", port))
++	require.NoError(t, err)
++	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+ 	require.NoError(t, resp.Body.Close())
+ }
+ 

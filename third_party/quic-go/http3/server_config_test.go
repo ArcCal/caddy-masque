@@ -24,7 +24,7 @@ func TestConnectionConfigSnapshotsLimitsAndSettings(t *testing.T) {
 	}
 	open := func(want ConnectionConfig) *RawServerConn {
 		client, server := newConnPair(t)
-		conn, _, _, err := s.newRawServerConn(server)
+		conn, _, err := s.newRawServerConn(server)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeNoError), "") })
 		require.Equal(t, want.MaxHeaderBytes, conn.maxHeaderBytes)

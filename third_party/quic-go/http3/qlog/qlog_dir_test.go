@@ -37,3 +37,8 @@ func TestQLOGDIRSet(t *testing.T) {
 	require.Contains(t, string(data), EventSchema)
 	require.Contains(t, string(data), qlog.EventSchema)
 }
+
+func TestQLOGDIRNotSet(t *testing.T) {
+	t.Setenv("QLOGDIR", "")
+	require.Nil(t, DefaultConnectionTracer(context.Background(), false, quic.ConnectionIDFromBytes([]byte{1})))
+}

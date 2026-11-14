@@ -4,6 +4,8 @@ Each version is tagged with its number; CI attaches Caddy builds to its release 
 
 ## Unreleased
 
+- Upgrade connect-ip-go to v0.7.0 and rebase the pinned QUIC/HTTP/3 fork on quic-go v0.65.0. Preserve protocol and security patches, legal notices and exact source verification. Adapt stream acquisition and Caddy qlog APIs, retain partial-write recovery with truncation resets, and preserve MTU validation and connection-ID retirement across path changes.
+
 - Answer classic CONNECT, which the module never serves, with the site's response under a non-2xx status for every HTTP version (RFC 9110 Section 9.3.6: a 2xx response announces a tunnel), and close the HTTP/1.x connection after any refused CONNECT, without reading pipelined requests (RFC 9112 as updated by RFC 9931 Section 8). Other extended CONNECT protocols, GET upgrades and ordinary web traffic are unchanged.
 - Answer an authenticated HTTP/1.1 CONNECT-IP upgrade that carries a 100-continue expectation with 417 (Expectation Failed) before reserving addresses, as masque-vpn does: RFC 9110 Section 7.8 requires 100 (Continue) before 101, and masque-vpn's HTTP library cannot send it, so both servers now answer alike. The client may repeat the request without the expectation (RFC 9110 Section 10.1.1); requests without valid credentials still get the site, and the Masque clients never send the expectation.
 - Answer a `target` name not resolved in time with 504 (Gateway Timeout) and `Proxy-Status: caddy-masque; error=dns_timeout`, the status RFC 9209 Section 2.3.1 recommends, instead of 502; a resolution error keeps 502 with `error=dns_error`.

@@ -8,8 +8,10 @@ import (
 	"github.com/quic-go/quic-go/qlogwriter"
 )
 
-const EventSchema = "urn:ietf:params:qlog:events:http3-12"
-
+// DefaultConnectionTracer retains the HTTP/3 tracer entry point used by Caddy.
+// HTTP/3 registers its schema at package initialization; the QUIC tracer writes
+// all registered schemas using the upstream QLOGDIR implementation.
+// Deprecated: use qlog.DefaultConnectionTracer from the QUIC qlog package.
 func DefaultConnectionTracer(ctx context.Context, isClient bool, connID quic.ConnectionID) qlogwriter.Trace {
-	return qlog.DefaultConnectionTracerWithSchemas(ctx, isClient, connID, []string{qlog.EventSchema, EventSchema})
+	return qlog.DefaultConnectionTracer(ctx, isClient, connID)
 }

@@ -169,8 +169,8 @@ def strip_notices(directory):
     return changes
 
 
-def prepare_upstream(source, destination):
-    """Copy the verified upstream, strip notices, then format its Go sources."""
+def prepare_upstream(source, destination, *, preserve_notices=False):
+    """Copy verified upstream and format it using the selected notice policy."""
     source = Path(source)
     destination = Path(destination)
     shutil.copytree(source, destination, symlinks=True)
@@ -178,7 +178,7 @@ def prepare_upstream(source, destination):
         if path.is_symlink():
             raise SystemExit(f"Unexpected upstream symbolic link: {path.relative_to(destination)}")
         path.chmod(path.stat().st_mode | 0o200)
-    changes = strip_notices(destination)
+    changes = {} if preserve_notices else strip_notices(destination)
     go_files = sorted(destination.rglob("*.go"))
     # Batch the formatter to stay below command-line size limits. The fork is
     # compared as shipped and receives no such formatting during verification.

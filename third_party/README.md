@@ -71,7 +71,7 @@ are unchanged.
 
 ## HTTP/3 Datagram rejection
 
-`quic-go` is the pinned `github.com/quic-go/quic-go v0.63.0`
+`quic-go` is the pinned `github.com/quic-go/quic-go v0.65.0`
 source. `http3-datagram-rejection.patch` records
 an explicit `http3.RejectDatagrams` API, request-scoped
 Datagram rejection state, and regression tests.
@@ -217,3 +217,32 @@ verification. Exact input and output hashes and strict patch application are
 required. Go string values retain identical runtime bytes. The HTML parser
 fixture uses U+00BA and exercises four hexadecimal digits, greedy
 character-reference consumption, and a missing semicolon.
+
+## QUIC v0.65 migration
+
+The five HTTP/3 and QUIC patches are rebased on v0.65.0. Verification retains
+upstream legal notices, applies each recorded patch without offsets or fuzz,
+and compares the entire shipped tree. No transport replacement is bypassed.
+
+The migration retains per-path amplification budgets, immediate retirement of
+peer-retired connection IDs, queued path-control CID references, and separate
+address and full-size MTU validation. It integrates upstream path-probe retries,
+packet-number spaces, path receive queues, and qlog registration. UDP payload
+limits also constrain capacity estimates before the MTU discoverer is initialized.
+
+HTTPStream now returns an error, which tunnel acceptance and malformed-request
+handling propagate. Interrupted DATA writes can resume with valid framing;
+closing an unfinished write still resets the stream. Short HTTP bodies retain
+H3_MESSAGE_ERROR while exposing io.ErrUnexpectedEOF to handlers. Upstream tests
+that expected continued use of retired IDs, silently ignored push frames, or
+ordinary responses to malformed bodies retain the stricter protocol assertions.
+
+Repeated responses to an undersized probe are consumed once; loss of the
+subsequent full-size probe still permits bounded-backoff retries. Regression
+tests distinguish address validation from MTU validation and accept a delayed
+response to an earlier full-size probe. Both tests fail against the intermediate
+migration without these corrections.
+
+The HTTP/3 qlog tracer entry point used by Caddy is retained as a forwarding
+function to the upstream QUIC tracer. Both event schemas are registered by the
+new upstream implementation; QLOGDIR behavior and disabled tracing are tested.

@@ -3,6 +3,7 @@ package http3
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 
@@ -20,7 +21,7 @@ type Settingser interface {
 }
 
 var errTooMuchData = errors.New("peer sent too much data")
-var errTooLittleData = errors.New("peer sent too little data")
+var errTooLittleData = fmt.Errorf("peer sent too little data: %w", io.ErrUnexpectedEOF)
 
 // The body is used in the requestBody (for a http.Request) and the responseBody (for a http.Response).
 type body struct {

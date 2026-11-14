@@ -126,6 +126,50 @@ func TestHTTPGet(t *testing.T) {
 	})
 }
 
+func TestHTTPStreamCreditRelease(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/data", func(w http.ResponseWriter, r *http.Request) {
+		w.Write(PRData)
+	})
+	port := startHTTPServer(t, mux, func(s *http3.Server) {
+		s.QUICConfig = getQuicConfig(&quic.Config{
+			MaxIncomingStreams:         1,
+			RequireStreamCreditRelease: true,
+		})
+	})
+	// The response doesn't fit into the stream flow control window,
+	// so the request stream only completes once the response body is read.
+	cl := newHTTP3Client(t, func(tr *http3.Transport) {
+		tr.QUICConfig.InitialStreamReceiveWindow = 10 * 1024
+	})
+	url := fmt.Sprintf("https://localhost:%d/data", port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	require.NoError(t, err)
+	resp, err := cl.Do(req)
+	require.NoError(t, err)
+
+	// the server only allows a single request stream at a time
+	ctx2, cancel2 := context.WithTimeout(ctx, scaleDuration(20*time.Millisecond))
+	defer cancel2()
+	req2, err := http.NewRequestWithContext(ctx2, http.MethodGet, url, nil)
+	require.NoError(t, err)
+	_, err = cl.Do(req2)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// Once the first request stream completes, HTTP/3 releases its stream credit,
+	// allowing the client to send the next request.
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, PRData, body)
+	resp, err = cl.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	resp.Body.Close()
+}
+
 func TestHTTPPost(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
@@ -772,23 +816,18 @@ func TestHTTPDeadlines(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-		body, err := io.ReadAll(&readerWithTimeout{Reader: resp.Body, Timeout: 2 * deadlineDelay})
-		// The deadline can stop a DATA frame part way, so the server resets
-		// the stream instead of ending it after a truncated frame, which the
-		// client would have to treat as a connection error (RFC 9114 Section 7.1).
-		var h3Err *http3.Error
-		require.ErrorAs(t, err, &h3Err)
-		require.Equal(t, http3.ErrCodeRequestCanceled, h3Err.ErrorCode)
-		require.True(t, h3Err.Remote)
-		require.Greater(t, time.Now(), expectedEnd)
-		require.Contains(t, string(body), "aa")
-
+		// the response body isn't read yet, so the handler's writes block on flow control
 		select {
 		case err := <-errChan:
 			require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 		case <-time.After(2 * deadlineDelay):
 			t.Fatal("handler was not called")
 		}
+		require.Greater(t, time.Now(), expectedEnd)
+
+		// the handler returned in the middle of the response body, so the stream is reset
+		_, err = io.ReadAll(&readerWithTimeout{Reader: resp.Body, Timeout: 2 * deadlineDelay})
+		require.ErrorIs(t, err, &http3.Error{ErrorCode: http3.ErrCodeRequestCanceled, Remote: true})
 	})
 }
 
@@ -1043,6 +1082,7 @@ func TestHTTP1xxTerminalResponse(t *testing.T) {
 		w.WriteHeader(http.StatusSwitchingProtocols)
 	})
 
+	mux.HandleFunc("/valid", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	port := startHTTPServer(t, mux)
 
 	var (
@@ -1059,12 +1099,20 @@ func TestHTTP1xxTerminalResponse(t *testing.T) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://localhost:%d/101-switch-protocols", port), nil)
 	require.NoError(t, err)
-	resp, err := newHTTP3Client(t).Do(req)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
-	require.Equal(t, "bar", resp.Header.Get("Foo"))
+	client := newHTTP3Client(t)
+	resp, err := client.Do(req)
+	// RFC 9114 Section 4.5 forbids sending 101 on HTTP/3.
+	var h3err *http3.Error
+	require.ErrorAs(t, err, &h3err)
+	require.Equal(t, http3.ErrCodeInternalError, h3err.ErrorCode)
+	require.True(t, h3err.Remote)
+	require.Nil(t, resp)
 	require.Zero(t, status)
 	require.Zero(t, cnt)
+	// Rejecting the handler's invalid response must leave the connection usable.
+	resp, err = client.Get(fmt.Sprintf("https://localhost:%d/valid", port))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
 	require.NoError(t, resp.Body.Close())
 }
 
@@ -1073,7 +1121,10 @@ func TestHTTPStreamer(t *testing.T) {
 	mux.HandleFunc("/httpstreamer", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 
-		str := w.(http3.HTTPStreamer).HTTPStream()
+		str, err := w.(http3.HTTPStreamer).HTTPStream()
+		if !assert.NoError(t, err) {
+			return
+		}
 		str.Write([]byte("foobar"))
 
 		// Do this in a Go routine, so that the handler returns early.

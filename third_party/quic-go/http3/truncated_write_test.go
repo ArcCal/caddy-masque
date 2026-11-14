@@ -31,9 +31,7 @@ func TestFailedWriteResetsInsteadOfClosing(t *testing.T) {
 	n, err := str.Write(payload)
 	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 	require.Equal(t, 300, n)
-	// Later writes would continue a frame the peer cannot delimit.
-	_, err = str.Write([]byte("more"))
-	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	// Without a successful retry, the incomplete frame must be reset.
 	require.NoError(t, str.Close())
 }
 

@@ -109,7 +109,7 @@ func (h *connIDManager) PromotePathConnectionID(id pathID) bool {
 	h.activeStatelessResetToken = &entry.StatelessResetToken
 	h.activeRetired = false
 	h.packetsSinceLastChange = 0
-	h.packetsPerConnectionID = protocol.PacketsPerConnectionID/2 + uint32(h.rand.Int31n(protocol.PacketsPerConnectionID))
+	h.packetsPerConnectionID = protocol.PacketsPerConnectionID/2 + h.rand.Uint32N(protocol.PacketsPerConnectionID)
 	return true // the reservation's reset token was already registered
 }
 
@@ -180,7 +180,7 @@ func (h *connIDManager) RefreshPathControlCID(cid protocol.ConnectionID) (protoc
 	}
 	entry := h.queue[0]
 	h.queue = h.queue[1:]
-	h.highestProbingID = max(h.highestProbingID, entry.SequenceNumber)
+	h.highestUsedSequenceNumber = max(h.highestUsedSequenceNumber, entry.SequenceNumber)
 	h.addStatelessResetToken(entry.StatelessResetToken)
 	h.pathControlRefs[entry.ConnectionID] = &pathControlCIDReference{entry: entry, refs: 1, valid: true, hasResetToken: true, retirePending: true}
 	reference.replacement = entry.ConnectionID

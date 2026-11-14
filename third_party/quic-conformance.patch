@@ -1,46 +1,72 @@
-diff --git a/conn_id_manager.go b/conn_id_manager.go
-index 8d08e07..7aa6742 100644
 --- a/conn_id_manager.go
 +++ b/conn_id_manager.go
-@@ -23,3 +23,6 @@ type connIDManager struct {
--	highestProbingID uint64
--	pathMx           sync.Mutex
--	pathProbing      map[pathID]newConnID // initialized lazily
-+	highestProbingID  uint64
-+	pathMx            sync.Mutex
-+	pathProbing       map[pathID]newConnID // initialized lazily
-+	pathControlRefs   map[protocol.ConnectionID]*pathControlCIDReference
-+	peerRetirePriorTo uint64
-+	activeRetired     bool
-@@ -73 +76 @@ func (h *connIDManager) Add(f *wire.NewConnectionIDFrame) error {
+@@ -20,9 +20,12 @@
+ type connIDManager struct {
+ 	queue []newConnID
+ 
+-	highestUsedSequenceNumber uint64 // the highest sequence number taken from the queue
++	highestUsedSequenceNumber uint64
+ 	pathMx                    sync.Mutex
+ 	pathProbing               map[pathID]newConnID // initialized lazily
++	pathControlRefs           map[protocol.ConnectionID]*pathControlCIDReference
++	peerRetirePriorTo         uint64
++	activeRetired             bool
+ 
+ 	handshakeComplete         bool
+ 	activeSequenceNumber      uint64
+@@ -70,7 +73,7 @@
+ 	if err := h.add(f); err != nil {
+ 		return err
+ 	}
 -	if len(h.queue) >= protocol.MaxActiveConnectionIDs {
 +	if h.activeConnectionIDCount() > protocol.MaxActiveConnectionIDs {
-@@ -86,8 +89,2 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
--	// If the NEW_CONNECTION_ID frame is reordered, such that its sequence number is smaller than the currently active
--	// connection ID or if it was already retired, send the RETIRE_CONNECTION_ID frame immediately.
--	if f.SequenceNumber < max(h.activeSequenceNumber, h.highestProbingID) || f.SequenceNumber < h.highestRetired {
--		h.queueControlFrame(&wire.RetireConnectionIDFrame{
--			SequenceNumber: f.SequenceNumber,
--		})
--		return nil
--	}
+ 		return &qerr.TransportError{ErrorCode: qerr.ConnectionIDLimitError}
+ 	}
+ 	return nil
+@@ -83,22 +86,20 @@
+ 			ErrorMessage: "received NEW_CONNECTION_ID frame but zero-length connection IDs are in use",
+ 		}
+ 	}
+-	// Retire Prior To is processed for reordered and retransmitted frames as well,
+-	// since the peer might have increased it after sending the original frame.
 +	h.peerRetirePriorTo = max(h.peerRetirePriorTo, f.RetirePriorTo)
 +	h.invalidatePathControlCIDs()
-@@ -98,4 +95 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
++
+ 	if f.RetirePriorTo != 0 && h.pathProbing != nil {
+ 		for id, entry := range h.pathProbing {
+ 			if entry.SequenceNumber < f.RetirePriorTo {
 -				h.queueControlFrame(&wire.RetireConnectionIDFrame{
 -					SequenceNumber: entry.SequenceNumber,
 -				})
 -				h.removeStatelessResetToken(entry.StatelessResetToken)
 +				h.retireConnectionID(entry, true)
-@@ -108 +102 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
+ 				delete(h.pathProbing, id)
+ 			}
+ 		}
+ 	}
+ 	// Retire elements in the queue.
+ 	// Doesn't retire the active connection ID.
 -	if f.RetirePriorTo > h.highestRetired {
 +	if f.RetirePriorTo > 0 {
-@@ -118 +112 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
+ 		var newQueue []newConnID
+ 		for _, entry := range h.queue {
+ 			if entry.SequenceNumber >= f.RetirePriorTo {
+@@ -108,28 +109,39 @@
+ 			}
+ 		}
+ 		h.queue = newQueue
 -		h.highestRetired = f.RetirePriorTo
+-	}
+-
+-	// ignore retransmissions of connection IDs that are in use, either as the active connection ID or for a path
+-	if !h.isInUse(f.SequenceNumber) {
+-		// Connection IDs are taken from the queue in order.
+-		// Any other connection ID up to the highest one taken was either retired already,
+-		// or skipped because the NEW_CONNECTION_ID frame was reordered.
+-		// Send the RETIRE_CONNECTION_ID frame immediately.
 +		h.highestRetired = max(h.highestRetired, f.RetirePriorTo)
-@@ -121,2 +115,8 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
--	if f.SequenceNumber == h.activeSequenceNumber {
--		return nil
++	}
++
 +	known := !h.activeRetired && f.SequenceNumber == h.activeSequenceNumber
 +	for _, entry := range h.pathProbing {
 +		if entry.SequenceNumber == f.SequenceNumber {
@@ -49,10 +75,7 @@ index 8d08e07..7aa6742 100644
 +			}
 +			known = true
 +		}
-@@ -124,3 +124,14 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
--
--	if err := h.addConnectionID(f.SequenceNumber, f.ConnectionID, f.StatelessResetToken); err != nil {
--		return err
++	}
 +	for _, reference := range h.pathControlRefs {
 +		if reference.valid && reference.entry.SequenceNumber == f.SequenceNumber {
 +			if err := checkKnownConnectionID(reference.entry, f); err != nil {
@@ -62,64 +85,131 @@ index 8d08e07..7aa6742 100644
 +		}
 +	}
 +	if !known {
-+		if f.SequenceNumber < max(h.activeSequenceNumber, h.highestProbingID) || f.SequenceNumber < h.highestRetired {
+ 		if f.SequenceNumber <= h.highestUsedSequenceNumber || f.SequenceNumber < h.highestRetired {
+-			h.queueControlFrame(&wire.RetireConnectionIDFrame{
+-				SequenceNumber: f.SequenceNumber,
+-			})
 +			h.queueControlFrame(&wire.RetireConnectionIDFrame{SequenceNumber: f.SequenceNumber})
-+		} else if err := h.addConnectionID(f.SequenceNumber, f.ConnectionID, f.StatelessResetToken); err != nil {
-+			return err
-+		}
-@@ -129,3 +140,5 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
+ 		} else if err := h.addConnectionID(f.SequenceNumber, f.ConnectionID, f.StatelessResetToken); err != nil {
+ 			return err
+ 		}
+ 	}
+ 
 -	// Retire the active connection ID, if necessary.
--	if h.activeSequenceNumber < f.RetirePriorTo {
--		// The queue is guaranteed to have at least one element at this point.
+-	// If this frame's connection ID is in use or was retired, the peer might not have provided a new connection ID yet.
+-	// The active connection ID is then retired once it does.
+-	if h.activeSequenceNumber < h.highestRetired && len(h.queue) > 0 {
 +	if !h.activeRetired && h.activeSequenceNumber < h.peerRetirePriorTo {
 +		h.retireActiveConnectionID()
 +		h.activeRetired = true
 +	}
 +	if h.activeRetired && len(h.queue) > 0 {
-@@ -175,6 +188,2 @@ func (h *connIDManager) updateConnectionID() {
+ 		h.updateConnectionID()
+ 	}
+ 	return nil
+@@ -187,23 +199,21 @@
+ 	h.assertNotClosed()
+ 	front := h.queue[0]
+ 	h.queue = h.queue[1:]
+-	h.highestUsedSequenceNumber = front.SequenceNumber
++	h.highestUsedSequenceNumber = max(h.highestUsedSequenceNumber, front.SequenceNumber)
+ 	h.replaceActiveConnectionID(front)
+ 	h.addStatelessResetToken(front.StatelessResetToken)
+ }
+ 
+-// replaceActiveConnectionID retires the active connection ID, and makes c the active connection ID.
+-// It doesn't add the stateless reset token of c.
++// replaceActiveConnectionID preserves references held by queued path controls.
++// The caller registers a reset token only for a newly allocated connection ID.
+ func (h *connIDManager) replaceActiveConnectionID(c newConnID) {
 -	h.queueControlFrame(&wire.RetireConnectionIDFrame{
 -		SequenceNumber: h.activeSequenceNumber,
 -	})
--	h.highestRetired = max(h.highestRetired, h.activeSequenceNumber)
 -	if h.activeStatelessResetToken != nil {
 -		h.removeStatelessResetToken(*h.activeStatelessResetToken)
 +	if !h.activeRetired {
 +		h.retireActiveConnectionID()
-@@ -187,0 +197 @@ func (h *connIDManager) updateConnectionID() {
+ 	}
+ 	h.activeSequenceNumber = c.SequenceNumber
+ 	h.activeConnectionID = c.ConnectionID
+ 	h.activeStatelessResetToken = &c.StatelessResetToken
 +	h.activeRetired = false
-@@ -198 +208 @@ func (h *connIDManager) Close() {
+ 	h.packetsSinceLastChange = 0
+ 	h.packetsPerConnectionID = protocol.PacketsPerConnectionID/2 + h.rand.Uint32N(protocol.PacketsPerConnectionID)
+ }
+@@ -213,13 +223,19 @@
+ 	defer h.pathMx.Unlock()
+ 
+ 	h.closed = true
 -	if h.activeStatelessResetToken != nil {
 +	if !h.activeRetired && h.activeStatelessResetToken != nil {
-@@ -203,0 +214,5 @@ func (h *connIDManager) Close() {
+ 		h.removeStatelessResetToken(*h.activeStatelessResetToken)
+ 	}
+ 	for _, entry := range h.pathProbing {
+ 		h.removeStatelessResetToken(entry.StatelessResetToken)
+ 	}
 +	for _, reference := range h.pathControlRefs {
 +		if reference.valid && reference.retirePending && reference.hasResetToken {
 +			h.removeStatelessResetToken(reference.entry.StatelessResetToken)
 +		}
 +	}
-@@ -204,0 +220 @@ func (h *connIDManager) Close() {
+ 	clear(h.pathProbing)
 +	clear(h.pathControlRefs)
-@@ -230,0 +247,3 @@ func (h *connIDManager) shouldUpdateConnID() bool {
+ }
+ 
+ // is called when the server performs a Retry
+@@ -246,6 +262,9 @@
+ }
+ 
+ func (h *connIDManager) shouldUpdateConnID() bool {
 +	if h.activeRetired {
 +		return len(h.queue) > 0
 +	}
-@@ -297,4 +316 @@ func (h *connIDManager) RetireConnIDForPath(pathID pathID) {
+ 	if !h.handshakeComplete {
+ 		return false
+ 	}
+@@ -299,7 +318,7 @@
+ 	front := h.queue[0]
+ 	h.queue = h.queue[1:]
+ 	h.pathProbing[id] = front
+-	h.highestUsedSequenceNumber = front.SequenceNumber
++	h.highestUsedSequenceNumber = max(h.highestUsedSequenceNumber, front.SequenceNumber)
+ 	h.addStatelessResetToken(front.StatelessResetToken)
+ 	return front.ConnectionID, true
+ }
+@@ -312,10 +331,7 @@
+ 	if !ok {
+ 		return
+ 	}
 -	h.queueControlFrame(&wire.RetireConnectionIDFrame{
 -		SequenceNumber: entry.SequenceNumber,
 -	})
 -	h.removeStatelessResetToken(entry.StatelessResetToken)
 +	h.retireConnectionID(entry, true)
-@@ -308 +324 @@ func (h *connIDManager) IsActiveStatelessResetToken(token protocol.StatelessRese
+ 	delete(h.pathProbing, pathID)
+ }
+ 
+@@ -345,7 +361,7 @@
+ 	h.pathMx.Lock()
+ 	defer h.pathMx.Unlock()
+ 
 -	if h.activeStatelessResetToken != nil {
 +	if !h.activeRetired && h.activeStatelessResetToken != nil {
-@@ -319,0 +336,5 @@ func (h *connIDManager) IsActiveStatelessResetToken(token protocol.StatelessRese
+ 		if *h.activeStatelessResetToken == token {
+ 			return true
+ 		}
+@@ -355,6 +371,11 @@
+ 			if entry.StatelessResetToken == token {
+ 				return true
+ 			}
++		}
++	}
 +	for _, reference := range h.pathControlRefs {
 +		if reference.valid && reference.hasResetToken && reference.entry.StatelessResetToken == token {
 +			return true
-+		}
-+	}
-diff --git a/conn_id_manager_path.go b/conn_id_manager_path.go
-new file mode 100644
-index 0000000..a25d63b
+ 		}
+ 	}
+ 	return false
 --- /dev/null
 +++ b/conn_id_manager_path.go
 @@ -0,0 +1,188 @@
@@ -234,7 +324,7 @@ index 0000000..a25d63b
 +	h.activeStatelessResetToken = &entry.StatelessResetToken
 +	h.activeRetired = false
 +	h.packetsSinceLastChange = 0
-+	h.packetsPerConnectionID = protocol.PacketsPerConnectionID/2 + uint32(h.rand.Int31n(protocol.PacketsPerConnectionID))
++	h.packetsPerConnectionID = protocol.PacketsPerConnectionID/2 + h.rand.Uint32N(protocol.PacketsPerConnectionID)
 +	return true // the reservation's reset token was already registered
 +}
 +
@@ -305,15 +395,12 @@ index 0000000..a25d63b
 +	}
 +	entry := h.queue[0]
 +	h.queue = h.queue[1:]
-+	h.highestProbingID = max(h.highestProbingID, entry.SequenceNumber)
++	h.highestUsedSequenceNumber = max(h.highestUsedSequenceNumber, entry.SequenceNumber)
 +	h.addStatelessResetToken(entry.StatelessResetToken)
 +	h.pathControlRefs[entry.ConnectionID] = &pathControlCIDReference{entry: entry, refs: 1, valid: true, hasResetToken: true, retirePending: true}
 +	reference.replacement = entry.ConnectionID
 +	return entry.ConnectionID, true
 +}
-diff --git a/conn_id_manager_path_test.go b/conn_id_manager_path_test.go
-new file mode 100644
-index 0000000..bfa3fe0
 --- /dev/null
 +++ b/conn_id_manager_path_test.go
 @@ -0,0 +1,156 @@
@@ -473,15 +560,67 @@ index 0000000..bfa3fe0
 +	require.NoError(t, err)
 +	require.Empty(t, packet)
 +}
-diff --git a/connection.go b/connection.go
-index a1f327b..f0da63e 100644
+--- a/conn_id_manager_test.go
++++ b/conn_id_manager_test.go
+@@ -363,13 +363,14 @@
+ 		RetirePriorTo:  2,
+ 		ConnectionID:   protocol.ParseConnectionID([]byte{2, 2, 2, 2}),
+ 	}))
+-	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 2}}, frameQueue)
+-	require.Equal(t, protocol.ParseConnectionID([]byte{1, 1, 1, 1}), m.Get())
+-	frameQueue = nil
+-	// connection ID 1 is retired once the peer provides a new connection ID,
+-	// even if that frame was sent before Retire Prior To was increased
++	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 2}, &wire.RetireConnectionIDFrame{SequenceNumber: 1}}, frameQueue)
++	require.False(t, m.HasActiveConnectionID())
++	frameQueue = nil
++	// A retired active ID must not be used while waiting for its replacement.
++	// A reordered frame can supply that replacement without retiring it again.
+ 	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{SequenceNumber: 4, ConnectionID: protocol.ParseConnectionID([]byte{4, 4, 4, 4})}))
+-	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 1}}, frameQueue)
++	require.Empty(t, frameQueue)
++	require.True(t, m.HasActiveConnectionID())
+ 	require.Equal(t, protocol.ParseConnectionID([]byte{4, 4, 4, 4}), m.Get())
+ }
+ 
+@@ -409,15 +410,18 @@
+ 	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{SequenceNumber: 2, RetirePriorTo: 2, ConnectionID: f2.ConnectionID}))
+ 	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 1}}, frameQueue)
+ 	frameQueue = nil
+-	// the active connection ID is retired once the peer provides a new connection ID
++	// Retire the active ID immediately, even while a replacement is unavailable.
+ 	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{SequenceNumber: 3, RetirePriorTo: 3, ConnectionID: f3.ConnectionID}))
+-	require.Empty(t, frameQueue)
++	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 2}}, frameQueue)
++	require.False(t, m.HasActiveConnectionID())
++	frameQueue = nil
+ 	require.NoError(t, m.Add(&wire.NewConnectionIDFrame{
+ 		SequenceNumber: 4,
+ 		RetirePriorTo:  3,
+ 		ConnectionID:   protocol.ParseConnectionID([]byte{4, 4, 4, 4}),
+ 	}))
+-	require.Equal(t, []wire.Frame{&wire.RetireConnectionIDFrame{SequenceNumber: 2}}, frameQueue)
++	require.Empty(t, frameQueue)
++	require.True(t, m.HasActiveConnectionID())
+ 	require.Equal(t, protocol.ParseConnectionID([]byte{4, 4, 4, 4}), m.Get())
+ 	frameQueue = nil
+ 
 --- a/connection.go
 +++ b/connection.go
-@@ -56,0 +57,3 @@ type receivedPacket struct {
+@@ -55,6 +55,9 @@
+ 	ecn protocol.ECN
+ 
+ 	info packetInfo // only valid if the contained IP address is valid
 +	// Retrying buffered packets must not create another UDP receipt or
 +	// amplification allowance. Coalesced packet clones inherit this state.
 +	bytesAccounted bool
-@@ -68,6 +71,7 @@ func (p *receivedPacket) Clone() *receivedPacket {
+ }
+ 
+ type receivedPacketWithChecksum struct {
+@@ -66,12 +69,13 @@
+ 
+ func (p *receivedPacket) Clone() *receivedPacket {
+ 	return &receivedPacket{
 -		remoteAddr: p.remoteAddr,
 -		rcvTime:    p.rcvTime,
 -		data:       p.data,
@@ -495,7 +634,13 @@ index a1f327b..f0da63e 100644
 +		ecn:            p.ecn,
 +		info:           p.info,
 +		bytesAccounted: p.bytesAccounted,
-@@ -142,3 +146,8 @@ type Conn struct {
+ 	}
+ }
+ 
+@@ -152,9 +156,14 @@
+ 	sendQueue sender
+ 
+ 	// lazily initialzed: most connections never migrate
 -	pathManager         *pathManager
 -	largestRcvdAppData  protocol.PacketNumber
 -	pathManagerOutgoing atomic.Pointer[pathManagerOutgoing]
@@ -507,25 +652,51 @@ index a1f327b..f0da63e 100644
 +	boundPathControls            []boundPathControl
 +	pathControlCredits           []*pathControlCredit
 +	previousPathProbes           []*previousPathProbe
-@@ -512,0 +522 @@ func (c *Conn) preSetup() {
+ 
+ 	streamsMap      *streamsMap
+ 	connIDManager   *connIDManager
+@@ -521,6 +530,7 @@
+ // r is the pathReceiver for the Transport that the connection was dialed or accepted on.
+ func (c *Conn) preSetup(r *pathReceiver) {
+ 	c.largestRcvdAppData = protocol.InvalidPacketNumber
 +	c.largestRcvdNonProbingAppData = protocol.InvalidPacketNumber
-@@ -915 +924,0 @@ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
--	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
-@@ -919,0 +929,2 @@ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
-+	initialPacketSize = min(initialPacketSize, maxPacketSize)
-+	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
-@@ -920,0 +932 @@ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
-+	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(c.mtuDiscoverer.CurrentSize())))
-@@ -1048 +1060,4 @@ func (c *Conn) handleOnePacket(rp receivedPacket, datagramPayloadChecksum qlog.D
+ 	c.initialStream = newInitialCryptoStream(c.perspective == protocol.PerspectiveClient)
+ 	c.handshakeStream = newCryptoStream()
+ 	c.sendQueue = newSendQueue(c.conn)
+@@ -933,7 +943,7 @@
+ 		}
+ 	}
+ 
+-	initialPacketSize := protocol.ByteCount(cmp.Or(c.config.InitialPacketSize, protocol.MinInitialPacketSize))
++	initialPacketSize := min(protocol.ByteCount(cmp.Or(c.config.InitialPacketSize, protocol.MinInitialPacketSize)), c.maxMTU())
+ 	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
+ 	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
+ 	c.mtuDiscoverer.Reset(initialPacketSize, c.maxMTU())
+@@ -1061,7 +1071,10 @@
+ 	datagramPayloadChecksum qlog.DatagramPayloadChecksum, // only for logging
+ 	path pathID, // only for logging
+ ) (wasProcessed bool, _ error) {
 -	c.sentPacketHandler.ReceivedBytes(rp.Size(), rp.rcvTime)
 +	if !rp.bytesAccounted {
 +		c.sentPacketHandler.ReceivedBytes(rp.Size(), rp.rcvTime)
 +		rp.bytesAccounted = true
 +	}
-@@ -1253 +1268 @@ func (c *Conn) handleShortHeaderPacket(
+ 
+ 	if wire.IsVersionNegotiationPacket(rp.data) {
+ 		return false, c.handleVersionNegotiationPacket(rp)
+@@ -1291,38 +1304,60 @@
+ 			})
+ 		}
+ 	}
 -	isNonProbing, pathChallenge, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log)
 +	isNonProbing, pathChallenges, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log)
-@@ -1256,0 +1272,8 @@ func (c *Conn) handleShortHeaderPacket(
+ 	if err != nil {
+ 		return false, err
+ 	}
+-	if pathChallenge != nil && c.perspective == protocol.PerspectiveClient {
+-		if err := c.handlePathChallengeFrame(pathChallenge, path, p.rcvTime); err != nil {
+-			return true, err
+-		}
 +	if isNonProbing && pn > c.largestRcvdNonProbingAppData {
 +		c.largestRcvdNonProbingAppData = pn
 +		c.latestNonProbingRemoteAddr = p.remoteAddr
@@ -534,11 +705,24 @@ index a1f327b..f0da63e 100644
 +	if err := c.flushPathMTUProbes(p.rcvTime); err != nil {
 +		return true, err
 +	}
-@@ -1263 +1286,2 @@ func (c *Conn) handleShortHeaderPacket(
--		return true, nil
++
++	// In RFC 9000, only the client can migrate between paths.
++	if c.perspective == protocol.PerspectiveClient {
++		for _, challenge := range pathChallenges {
++			if err := c.handlePathChallengeFrame(challenge, path, p.rcvTime); err != nil {
++				return true, err
++			}
++		}
++		return true, nil
++	}
++	if addrsEqual(p.remoteAddr, c.RemoteAddr()) {
 +		c.queueBoundPathResponses(pathChallenges, p.remoteAddr, p.info)
 +		return true, c.flushBoundPathControls(p.rcvTime)
-@@ -1274,10 +1298,9 @@ func (c *Conn) handleShortHeaderPacket(
+ 	}
+ 
+ 	if !checkPath {
+ 		return true, nil
+ 	}
 -	destConnID, frames, shouldSwitchPath := c.pathManager.HandlePacket(p.remoteAddr, p.rcvTime, pathChallenge, isNonProbing)
 -	if len(frames) > 0 {
 -		probe, buf, err := c.packer.PackPathProbePacket(destConnID, frames, c.version)
@@ -546,7 +730,7 @@ index a1f327b..f0da63e 100644
 -			return true, err
 -		}
 -		c.logger.Debugf("sending path probe packet to %s", p.remoteAddr)
--		c.logShortHeaderPacketWithDatagramPayloadChecksum(probe, protocol.ECNNon, buf.Len(), false, datagramPayloadChecksum)
+-		c.logShortHeaderPacketWithDatagramPayloadChecksum(probe, protocol.ECNNon, buf.Len(), false, datagramPayloadChecksum, strconv.FormatInt(int64(path), 10))
 -		c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, p.rcvTime)
 -		c.sendQueue.SendProbe(buf, p.remoteAddr, p.info)
 +	destConnID, frames, shouldSwitchPath := c.pathManager.HandlePacket(p.remoteAddr, p.rcvTime, pathChallenges, isNonProbing, p.Size(), p.info)
@@ -558,106 +742,228 @@ index a1f327b..f0da63e 100644
 +	}
 +	if err := c.sendPathProbeFrames(destConnID, frames, p.remoteAddr, p.info, p.rcvTime, datagramPayloadChecksum); err != nil {
 +		return true, err
-@@ -1287 +1310,5 @@ func (c *Conn) handleShortHeaderPacket(
+ 	}
+ 	// We only switch paths in response to the highest-numbered non-probing packet,
+ 	// see section 9.3 of RFC 9000.
 -	if !shouldSwitchPath || pn != c.largestRcvdAppData {
 +	if !shouldSwitchPath || !addrsEqual(p.remoteAddr, c.latestNonProbingRemoteAddr) {
-+		return true, nil
-+	}
+ 		return true, nil
+ 	}
 +	pathID, ok := c.pathManager.IDForPath(p.remoteAddr)
 +	if !ok || !c.connIDManager.PromotePathConnectionID(pathID) {
-@@ -1291 +1318,3 @@ func (c *Conn) handleShortHeaderPacket(
--	c.sentPacketHandler.MigratedPath(p.rcvTime, protocol.ByteCount(c.config.InitialPacketSize))
++		return true, nil
++	}
+ 	c.pathManager.SwitchToPath(p.remoteAddr)
+-	c.connIDManager.SwitchToPath(path)
+-	initialPacketSize := protocol.ByteCount(cmp.Or(c.config.InitialPacketSize, protocol.MinInitialPacketSize))
 +	for _, credit := range c.pathControlCredits {
 +		credit.inFlight = false // migration discards old probe history
 +	}
-@@ -1296,5 +1325,4 @@ func (c *Conn) handleShortHeaderPacket(
--	c.mtuDiscoverer.Reset(
--		p.rcvTime,
--		protocol.ByteCount(c.config.InitialPacketSize),
--		maxPacketSize,
--	)
-+	initialPacketSize := min(protocol.ByteCount(c.config.InitialPacketSize), maxPacketSize)
-+	c.sentPacketHandler.MigratedPath(p.rcvTime, initialPacketSize)
-+	c.mtuDiscoverer.Reset(p.rcvTime, initialPacketSize, maxPacketSize)
-+	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(c.mtuDiscoverer.CurrentSize())))
-@@ -1747 +1775 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
++	initialPacketSize := min(protocol.ByteCount(cmp.Or(c.config.InitialPacketSize, protocol.MinInitialPacketSize)), c.maxMTU())
+ 	c.sentPacketHandler.MigratedPath(p.rcvTime, initialPacketSize)
+ 	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
+ 	c.mtuDiscoverer.Reset(initialPacketSize, c.maxMTU())
+@@ -1816,12 +1851,12 @@
+ 	ecn protocol.ECN,
+ 	rcvTime monotime.Time,
+ 	log func([]qlog.Frame),
 -) (isNonProbing bool, pathChallenge *wire.PathChallengeFrame, _ error) {
 +) (isNonProbing bool, pathChallenges []*wire.PathChallengeFrame, _ error) {
-@@ -1752 +1780 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
+ 	c.lastPacketReceivedTime = rcvTime
+ 	c.firstAckElicitingPacketAfterIdleSentTime = 0
+ 	c.keepAlivePingSent = false
+ 
 -	isAckEliciting, isNonProbing, pathChallenge, err := c.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
 +	isAckEliciting, isNonProbing, pathChallenges, err := c.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
-@@ -1760 +1788 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
+ 	if err != nil {
+ 		return false, nil, err
+ 	}
+@@ -1829,18 +1864,18 @@
+ 	if err := c.receivedPacketHandler.ReceivedPacket(pn, ecn, protocol.Encryption1RTT, rcvTime, isAckEliciting); err != nil {
+ 		return false, nil, err
+ 	}
 -	return isNonProbing, pathChallenge, nil
 +	return isNonProbing, pathChallenges, nil
-@@ -1764 +1792 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
+ }
+ 
+ // handleFrames parses the frames, one after the other, and handles them.
 -// It returns the last PATH_CHALLENGE frame contained in the packet, if any.
 +// It returns the PATH_CHALLENGE frames contained in the packet, if any.
-@@ -1771 +1799 @@ func (c *Conn) handleFrames(
+ func (c *Conn) handleFrames(
+ 	data []byte,
+ 	destConnID protocol.ConnectionID,
+ 	encLevel protocol.EncryptionLevel,
+ 	log func([]qlog.Frame),
+ 	rcvTime monotime.Time,
 -) (isAckEliciting, isNonProbing bool, pathChallenge *wire.PathChallengeFrame, _ error) {
 +) (isAckEliciting, isNonProbing bool, pathChallenges []*wire.PathChallengeFrame, _ error) {
-@@ -1866 +1894 @@ func (c *Conn) handleFrames(
+ 	// Only used for tracing.
+ 	// If we're not tracing, this slice will always remain empty.
+ 	var frames []qlog.Frame
+@@ -1935,7 +1970,7 @@
+ 			}
+ 			pc, err := c.handleFrame(frame, encLevel, destConnID, rcvTime)
+ 			if pc != nil {
 -				pathChallenge = pc
 +				pathChallenges = append(pathChallenges, pc)
-@@ -2078,0 +2107,6 @@ func (c *Conn) handlePathResponseFrameServer(f *wire.PathResponseFrame) error {
+ 			}
+ 			handleErr = err
+ 		}
+@@ -2140,7 +2175,7 @@
+ 	if !ok {
+ 		return nil
+ 	}
+-	probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{{Frame: resp, Handler: emptyHandler{}}}, c.version)
++	probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{{Frame: resp, Handler: emptyHandler{}}}, protocol.MinInitialPacketSize, c.version)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -2174,6 +2209,12 @@
+ }
+ 
+ func (c *Conn) handlePathResponseFrameServer(f *wire.PathResponseFrame) error {
 +	for _, probe := range c.previousPathProbes {
 +		if f.Data == probe.data {
 +			probe.validated = true
 +			return nil
 +		}
 +	}
-@@ -2301,0 +2336,5 @@ func (c *Conn) handleCloseError(closeErr *closeError) {
+ 	if c.pathManager == nil {
+ 		// since we didn't send PATH_CHALLENGEs yet, we don't expect PATH_RESPONSEs
+ 		return &qerr.TransportError{
+@@ -2396,6 +2437,11 @@
+ 	if err != nil {
+ 		c.logger.Debugf("Error sending CONNECTION_CLOSE: %s", err)
+ 	}
 +	// The closed handler does not retain address-validation byte accounting.
 +	// Do not give it a retransmittable close packet for an unvalidated address.
 +	if c.sentPacketHandler.AmplificationBudget() != protocol.MaxByteCount {
 +		connClosePacket = nil
 +	}
-@@ -2442,0 +2482 @@ func (c *Conn) applyTransportParameters() {
-+	initialPacketSize := min(protocol.ByteCount(c.config.InitialPacketSize), maxPacketSize)
-@@ -2445 +2485 @@ func (c *Conn) applyTransportParameters() {
--		protocol.ByteCount(c.config.InitialPacketSize),
-+		initialPacketSize,
-@@ -2448,0 +2489,4 @@ func (c *Conn) applyTransportParameters() {
-+	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
-+	if initialPacketSize < protocol.ByteCount(c.config.InitialPacketSize) {
-+		c.sentPacketHandler.SetMaxDatagramSize(initialPacketSize)
+ 	c.connIDGenerator.ReplaceWithClosed(connClosePacket, 3*c.rttStats.PTO(false))
+ }
+ 
+@@ -2521,8 +2567,17 @@
+ 		// Retire the connection ID.
+ 		c.connIDManager.AddFromPreferredAddress(params.PreferredAddress.ConnectionID, params.PreferredAddress.StatelessResetToken)
+ 	}
++	oldSize := c.config.initialPacketSize()
+ 	if c.mtuDiscoverer != nil {
+-		c.mtuDiscoverer = newMTUDiscoverer(c.rttStats, c.mtuDiscoverer.CurrentSize(), c.maxMTU(), c.qlogger)
++		oldSize = c.mtuDiscoverer.CurrentSize()
 +	}
-@@ -2452,0 +2497,4 @@ func (c *Conn) triggerSending(now monotime.Time) error {
++	initialPacketSize := min(oldSize, c.maxMTU())
++	if c.mtuDiscoverer != nil {
++		c.mtuDiscoverer = newMTUDiscoverer(c.rttStats, initialPacketSize, c.maxMTU(), c.qlogger)
++	}
++	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
++	if initialPacketSize < oldSize {
++		c.sentPacketHandler.SetMaxDatagramSize(initialPacketSize)
+ 	}
+ }
+ 
+@@ -2535,6 +2590,10 @@
+ 
+ func (c *Conn) triggerSending(now monotime.Time) error {
+ 	c.pacingDeadline = 0
 +	if !c.connIDManager.HasActiveConnectionID() {
 +		c.blocked = blockModeHardBlocked
 +		return c.flushBoundPathControls(now)
 +	}
-@@ -2491,0 +2540,3 @@ func (c *Conn) sendPackets(now monotime.Time) error {
+ 
+ 	sendMode := c.sentPacketHandler.SendMode(now)
+ 	switch sendMode {
+@@ -2574,11 +2633,14 @@
+ }
+ 
+ func (c *Conn) sendPackets(now monotime.Time) error {
 +	if err := c.flushBoundPathControls(now); err != nil {
 +		return err
 +	}
-@@ -2496 +2547 @@ func (c *Conn) sendPackets(now monotime.Time) error {
+ 	if c.perspective == protocol.PerspectiveClient && c.handshakeConfirmed {
+ 		if pm := c.pathManagerOutgoing.Load(); pm != nil {
+ 			connID, frame, tr, ok := pm.NextPathToProbe()
+ 			if ok {
 -				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, c.version)
 +				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, protocol.MinInitialPacketSize, c.version)
-@@ -2515 +2566 @@ func (c *Conn) sendPackets(now monotime.Time) error {
+ 				if err != nil {
+ 					return err
+ 				}
+@@ -2598,7 +2660,7 @@
+ 	// Can't use GSO, since we need to send a single packet that's larger than our current maximum size.
+ 	// Performance-wise, this doesn't matter, since we only send a very small (<10) number of
+ 	// MTU probe packets per connection.
 -	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.mtuDiscoverer.ShouldSendProbe(now) {
 +	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.mtuDiscoverer.ShouldSendProbe(now) && c.sentPacketHandler.HasCongestionBudget(c.mtuDiscoverer.nextProbeSize()) {
-@@ -2538 +2589 @@ func (c *Conn) sendPackets(now monotime.Time) error {
+ 		ping, size := c.mtuDiscoverer.GetPing(now)
+ 		p, buf, err := c.packer.PackMTUProbePacket(ping, size, c.version)
+ 		if err != nil {
+@@ -2617,7 +2679,7 @@
+ 		c.framer.QueueControlFrame(&wire.MaxDataFrame{MaximumData: offset})
+ 	}
+ 	if !c.handshakeConfirmed {
 -		packet, err := c.packer.PackCoalescedPacket(false, c.maxPacketSize(), now, c.version)
 +		packet, err := c.packer.PackCoalescedPacket(false, c.maxSendPacketSize(), now, c.version)
-@@ -2566 +2617 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
+ 		if err != nil || packet == nil {
+ 			return err
+ 		}
+@@ -2648,7 +2710,7 @@
+ 	for {
+ 		buf := getPacketBuffer()
+ 		ecn := c.sentPacketHandler.ECNMode(true)
 -		if _, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now); err != nil {
 +		if _, err := c.appendOneShortHeaderPacket(buf, c.maxSendPacketSize(), ecn, now); err != nil {
-@@ -2600 +2651 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
+ 			if err == errNothingToPack {
+ 				buf.Release()
+ 				return nil
+@@ -2679,7 +2741,7 @@
+ 
+ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
+ 	buf := getLargePacketBuffer()
 -	maxSize := c.maxPacketSize()
 +	maxSize := c.maxSendPacketSize()
-@@ -2673 +2724 @@ func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
+ 
+ 	ecn := c.sentPacketHandler.ECNMode(true)
+ 	for {
+@@ -2749,7 +2811,7 @@
+ func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
+ 	if !c.handshakeConfirmed {
+ 		ecn := c.sentPacketHandler.ECNMode(false)
 -		packet, err := c.packer.PackCoalescedPacket(true, c.maxPacketSize(), now, c.version)
 +		packet, err := c.packer.PackCoalescedPacket(true, c.maxSendPacketSize(), now, c.version)
-@@ -2684 +2735 @@ func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -2760,7 +2822,7 @@
+ 	}
+ 
+ 	ecn := c.sentPacketHandler.ECNMode(true)
 -	p, buf, err := c.packer.PackAckOnlyPacket(c.maxPacketSize(), now, c.version)
 +	p, buf, err := c.packer.PackAckOnlyPacket(c.maxSendPacketSize(), now, c.version)
-@@ -2718 +2769 @@ func (c *Conn) sendProbePacket(sendMode ackhandler.SendMode, now monotime.Time)
+ 	if err != nil {
+ 		if err == errNothingToPack {
+ 			return nil
+@@ -2794,14 +2856,14 @@
+ 			break
+ 		}
+ 		var err error
 -		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxPacketSize(), false, now, c.version)
 +		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxSendPacketSize(), false, now, c.version)
-@@ -2725 +2776 @@ func (c *Conn) sendProbePacket(sendMode ackhandler.SendMode, now monotime.Time)
+ 		if err != nil {
+ 			return err
+ 		}
+ 	}
+ 	if packet == nil {
+ 		var err error
 -		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxPacketSize(), true, now, c.version)
 +		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxSendPacketSize(), true, now, c.version)
-@@ -2844,0 +2896,7 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -2945,24 +3007,41 @@
+ }
+ 
+ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
 +	if !c.connIDManager.HasActiveConnectionID() {
 +		return nil, nil
 +	}
@@ -665,65 +971,129 @@ index a1f327b..f0da63e 100644
 +	if maxSize < protocol.MinCoalescedPacketSize {
 +		return nil, nil
 +	}
-@@ -2848 +2906 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
+ 	var packet *coalescedPacket
+ 	var err error
+ 	if transportErr, ok := errors.AsType[*qerr.TransportError](e); ok {
 -		packet, err = c.packer.PackConnectionClose(transportErr, c.maxPacketSize(), c.version)
 +		packet, err = c.packer.PackConnectionClose(transportErr, maxSize, c.version)
-@@ -2850 +2908 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
+ 	} else if applicationErr, ok := errors.AsType[*qerr.ApplicationError](e); ok {
 -		packet, err = c.packer.PackApplicationClose(applicationErr, c.maxPacketSize(), c.version)
 +		packet, err = c.packer.PackApplicationClose(applicationErr, maxSize, c.version)
-@@ -2855 +2913 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
+ 	} else {
+ 		packet, err = c.packer.PackConnectionClose(&qerr.TransportError{
+ 			ErrorCode:    qerr.InternalError,
+ 			ErrorMessage: fmt.Sprintf("connection BUG: unspecified error type (msg: %s)", e.Error()),
 -		}, c.maxPacketSize(), c.version)
 +		}, maxSize, c.version)
-@@ -2859,0 +2918,4 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
+ 	}
+ 	if err != nil {
+ 		return nil, err
++	}
 +	if packet.buffer.Len() > maxSize {
 +		packet.buffer.Release()
 +		return nil, nil
-+	}
-@@ -2864,0 +2927,6 @@ func (c *Conn) sendConnectionClose(e error) ([]byte, error) {
+ 	}
+ 	ecn := c.sentPacketHandler.ECNMode(packet.IsOnlyShortHeaderPacket())
+ 	c.logCoalescedPacket(packet, ecn)
+ 	return packet.buffer.Data, c.conn.Write(packet.buffer.Data, 0, ecn)
++}
++
 +// maxSendPacketSize also applies the unvalidated-address byte budget to the
 +// complete UDP datagram, including coalesced packets and Initial padding.
 +func (c *Conn) maxSendPacketSize() protocol.ByteCount {
 +	return min(c.maxPacketSize(), c.sentPacketHandler.AmplificationBudget())
-+}
-+
-@@ -3164,2 +3232,3 @@ func (c *Conn) NextConnection(ctx context.Context) (*Conn, error) {
+ }
+ 
+ func (c *Conn) maxPacketSize() protocol.ByteCount {
+@@ -2971,7 +3050,7 @@
+ 		return protocol.MinInitialPacketSize
+ 	}
+ 	if c.mtuDiscoverer == nil {
+-		return c.config.initialPacketSize()
++		return min(c.config.initialPacketSize(), c.maxMTU())
+ 	}
+ 	return c.mtuDiscoverer.CurrentSize()
+ }
+@@ -3258,8 +3337,10 @@
+ }
+ 
+ // estimateMaxPayloadSize estimates the maximum payload size for short header packets.
 -// It is not very sophisticated: it just subtracts the size of header (assuming the maximum
 -// connection ID length), and the size of the encryption tag.
 +// It reserves the largest short header and encryption tag, then subtracts
 +// the DATAGRAM frame type and length field. The result is conservative even
 +// after a connection ID or packet-number-length change.
-@@ -3167 +3236,2 @@ func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
+ func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
 -	return mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 16 /* tag size */
+-}
 +	packetPayload := mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 4 /* packet number */ - 16 /* tag size */
 +	return (&wire.DatagramFrame{DataLenPresent: true}).MaxDataLen(packetPayload, protocol.Version1)
-diff --git a/connection_test.go b/connection_test.go
-index 6d3aa31..ce6cba7 100644
++}
 --- a/connection_test.go
 +++ b/connection_test.go
-@@ -27,0 +28 @@ import (
+@@ -26,6 +26,7 @@
+ 	"github.com/quic-go/quic-go/internal/wire"
+ 	"github.com/quic-go/quic-go/qlog"
+ 	"github.com/quic-go/quic-go/qlogwriter"
 +	"github.com/quic-go/quic-go/quicvarint"
-@@ -49,0 +51,4 @@ func connectionOptSentPacketHandler(sph ackhandler.SentPacketHandler) testConnec
+ 	"github.com/quic-go/quic-go/testutils/events"
+ 
+ 	"github.com/stretchr/testify/assert"
+@@ -48,6 +49,10 @@
+ }
+ 
+ func connectionOptSentPacketHandler(sph ackhandler.SentPacketHandler) testConnectionOpt {
 +	if mock, ok := sph.(*mockackhandler.MockSentPacketHandler); ok {
 +		mock.EXPECT().AmplificationBudget().Return(protocol.MaxByteCount).AnyTimes()
 +		mock.EXPECT().HasCongestionBudget(gomock.Any()).Return(true).AnyTimes()
 +	}
-@@ -133 +138 @@ func newServerTestConnection(
+ 	return func(conn *Conn) { conn.sentPacketHandler = sph }
+ }
+ 
+@@ -132,7 +137,7 @@
+ 		populateConfig(config),
+ 		&tls.Config{},
+ 		handshake.NewTokenGenerator(handshake.TokenProtectorKey{}),
 -		false,
 +		true, // address validation is tested separately with real packet handlers
-@@ -1424,0 +1430,4 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
+ 		1337*time.Millisecond,
+ 		nil,
+ 		utils.DefaultLogger,
+@@ -1479,6 +1484,10 @@
+ 	data, err = (&wire.HandshakeDoneFrame{}).Append(nil, protocol.Version1)
+ 	require.NoError(t, err)
+ 	done := make(chan struct{})
 +	var nextConnID protocol.ConnectionID
 +	if usePreferredAddress {
 +		tc.connRunner.EXPECT().AddResetToken(preferredAddressResetToken, gomock.Any())
 +	}
-@@ -1433,0 +1443,2 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
+ 	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).Return(nil, nil).AnyTimes()
+ 	gomock.InOrder(
+ 		unpacker.EXPECT().UnpackLongHeader(gomock.Any(), gomock.Any()).Return(
+@@ -1488,6 +1497,8 @@
+ 		cs.EXPECT().SetHandshakeConfirmed(),
+ 		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+ 			func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version) (shortHeaderPacket, error) {
 +				// CID selection mutates the manager and belongs to the connection run loop.
 +				nextConnID = tc.conn.connIDManager.Get()
-@@ -1449,4 +1459,0 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
+ 				close(done)
+ 				return shortHeaderPacket{}, errNothingToPack
+ 			},
+@@ -1503,10 +1514,6 @@
+ 		t.Fatal("timeout")
+ 	}
+ 
 -	if usePreferredAddress {
 -		tc.connRunner.EXPECT().AddResetToken(preferredAddressResetToken, gomock.Any())
 -	}
 -	nextConnID := tc.conn.connIDManager.Get()
-@@ -2034,0 +2042,70 @@ func TestConnectionIdleTimeout(t *testing.T) {
+ 	if usePreferredAddress {
+ 		require.Equal(t, preferredAddressConnID, nextConnID)
+ 	}
+@@ -2135,6 +2142,76 @@
+ 	})
+ }
+ 
 +func TestConnectionDecodedPeerIdleTimeout(t *testing.T) {
 +	for _, tc := range []struct {
 +		name    string
@@ -794,7 +1164,13 @@ index 6d3aa31..ce6cba7 100644
 +	require.Equal(t, protocol.ByteCount(1185), pm.ProbeSize(addr))
 +}
 +
-@@ -3263,0 +3341,14 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
+ func TestConnectionKeepAlive(t *testing.T) {
+ 	t.Run("enabled", func(t *testing.T) {
+ 		testConnectionKeepAlive(t, true, true)
+@@ -3393,26 +3470,41 @@
+ 		if isNATRebinding {
+ 			payload = []byte{1} // PING frame
+ 		}
 +		var packedFrames []ackhandler.Frame
 +		var nextPackedPN protocol.PacketNumber
 +		tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
@@ -807,69 +1183,170 @@ index 6d3aa31..ce6cba7 100644
 +				return packet, buf, nil
 +			},
 +		).AnyTimes()
-+		// Revalidation of the previously active path is covered separately.
-+		tc.sendConn.EXPECT().WriteTo(gomock.Any(), tc.remoteAddr, packetInfo{}).AnyTimes()
-@@ -3268,6 +3358,0 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
++		tc.sendConn.EXPECT().WriteTo(gomock.Any(), gomock.Any(), packetInfo{}).DoAndReturn(
++			func(_ []byte, addr net.Addr, _ packetInfo) error {
++				if addrsEqual(addr, tc.remoteAddr) {
++					return nil
++				}
++				require.Equal(t, newRemoteAddr, addr)
++				pathChallenge = packedFrames[0].Frame.(*wire.PathChallengeFrame)
++				close(probeSent)
++				return nil
++			},
++		).AnyTimes()
+ 		gomock.InOrder(
+ 			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
+ 				protocol.PacketNumber(10), protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
+ 			),
 -			tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
 -				func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
 -					pathChallenge = frames[0].Frame.(*wire.PathChallengeFrame)
 -					return shortHeaderPacket{IsPathProbePacket: true}, getPacketBuffer(), nil
 -				},
 -			),
-@@ -3275 +3360,5 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
+-			tc.sendConn.EXPECT().WriteTo(gomock.Any(), newRemoteAddr, packetInfo{}).DoAndReturn(
 -				func([]byte, net.Addr, packetInfo) error { close(probeSent); return nil },
-+				func([]byte, net.Addr, packetInfo) error {
-+					pathChallenge = packedFrames[0].Frame.(*wire.PathChallengeFrame)
-+					close(probeSent)
-+					return nil
-+				},
-@@ -3279 +3368 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
+-			),
++
+ 			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+ 				shortHeaderPacket{}, errNothingToPack,
 -			),
 +			).AnyTimes(),
-@@ -3283 +3372 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
+ 		)
+ 
+ 		tc.conn.handlePacket(receivedPacket{
 -			data:       make([]byte, 10),
 +			data:       make([]byte, protocol.MinInitialPacketSize),
-@@ -3431,2 +3520,2 @@ func testConnectionMigration(t *testing.T, enabled bool) {
+ 			buffer:     getPacketBuffer(),
+ 			remoteAddr: newRemoteAddr,
+ 			rcvTime:    monotime.Now(),
+@@ -3447,7 +3539,7 @@
+ 		calls = append(calls,
+ 			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+ 				shortHeaderPacket{}, errNothingToPack,
+-			).MaxTimes(1),
++			).AnyTimes(),
+ 		)
+ 		gomock.InOrder(calls...)
+ 		require.Equal(t, tc.remoteAddr, tc.conn.RemoteAddr())
+@@ -3486,7 +3578,7 @@
+ 				),
+ 				tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+ 					shortHeaderPacket{}, errNothingToPack,
+-				).MaxTimes(1),
++				).AnyTimes(),
+ 			)
+ 			tc.conn.handlePacket(receivedPacket{
+ 				data:       make([]byte, 100),
+@@ -3633,8 +3725,8 @@
+ 		shortHeaderPacket{}, errNothingToPack,
+ 	).AnyTimes()
+ 	packedProbe := make(chan struct{})
 -	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
 -		func(protocol.ConnectionID, []ackhandler.Frame, protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
 +	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
 +		func(protocol.ConnectionID, []ackhandler.Frame, protocol.ByteCount, protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
-@@ -3493 +3582 @@ func testConnectionDatagrams(t *testing.T, enabled bool) {
+ 			defer close(packedProbe)
+ 			return shortHeaderPacket{IsPathProbePacket: true}, getPacketBuffer(), nil
+ 		},
+@@ -3714,7 +3806,7 @@
+ 	_, _, _, err = tc.conn.handleFrames(data, protocol.ConnectionID{}, protocol.Encryption1RTT, nil, monotime.Now())
+ 
+ 	if !enabled {
 -		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.FrameEncodingError, FrameType: uint64(wire.FrameTypeDatagramWithLength)})
 +		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation, FrameType: uint64(wire.FrameTypeDatagramWithLength)})
-diff --git a/integrationtests/self/mtu_test.go b/integrationtests/self/mtu_test.go
-index fc37635..8226711 100644
+ 		return
+ 	}
+ 
+--- a/integrationtests/self/connection_migration_test.go
++++ b/integrationtests/self/connection_migration_test.go
+@@ -18,6 +18,7 @@
+ 	"github.com/quic-go/quic-go/qlogwriter"
+ 	"github.com/quic-go/quic-go/testutils/events"
+ 
++	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ )
+ 
+@@ -86,11 +87,18 @@
+ 		}
+ 		return slices.Compact(tuples)
+ 	}
+-	// sentTuples returns the tuples of the packets sent, starting at the given event index.
++	// sentTuples excludes path-validation responses sent on their challenged path.
++	// Application data and other traffic must still use the active tuple.
+ 	sentTuples := func(since int) []string {
+ 		var tuples []string
+ 		for _, ev := range clientEvents.Events()[since:] {
+ 			if e, ok := ev.(qlog.PacketSent); ok {
++				if e.Tuple != "" && hasFrame[*qlog.PathResponseFrame](e.Frames) {
++					for _, frame := range e.Frames {
++						require.IsType(t, &qlog.PathResponseFrame{}, frame.Frame)
++					}
++					continue
++				}
+ 				tuples = append(tuples, e.Tuple)
+ 			}
+ 		}
+@@ -217,8 +225,13 @@
+ 	sendAndReceiveFile(t) // stream 14
+ 	require.Equal(t, []string{"1", "0", "", "1", ""}, assignedTuples(&clientEvents))
+ 	require.Equal(t, []string{""}, sentTuples(n))
+-	require.Eventually(t, func() bool {
+-		return slices.Equal([]string{"0", "", "1", ""}, assignedTuples(&serverEvents))
++	require.EventuallyWithT(t, func(collect *assert.CollectT) {
++		tuples := assignedTuples(&serverEvents)
++		require.GreaterOrEqual(collect, len(tuples), 4)
++		if len(tuples) >= 4 {
++			require.Equal(collect, []string{"0", "", "1", ""}, tuples[:4])
++		}
++		// A late response to old-path revalidation can allocate a new probe tuple.
+ 	}, time.Second, 5*time.Millisecond)
+ 	require.Greater(t, packetsPath1.Load(), c1BeforeSwitch)
+ 	// some path probing might have happened
 --- a/integrationtests/self/mtu_test.go
 +++ b/integrationtests/self/mtu_test.go
-@@ -181 +181 @@ func TestPathMTUDiscovery(t *testing.T) {
+@@ -186,7 +186,7 @@
+ 	t.Logf("max server packet size: %d, MTU: %d", maxPacketSizeServer, mtu)
+ 
+ 	require.GreaterOrEqual(t, maxPacketSizeClient, mtu-25)
 -	const maxDiff = 40 // this includes the 21 bytes for the short header, 16 bytes for the encryption tag, and framing overhead
 +	const maxDiff = 44 // flags (1), maximum CID (20), packet number (4), tag (16), and DATAGRAM framing (3)
-diff --git a/integrationtests/self/nat_rebinding_test.go b/integrationtests/self/nat_rebinding_test.go
-index 79f273b..2c670b8 100644
+ 	require.GreaterOrEqual(t, int(initialMaxDatagramSize), protocol.MinInitialPacketSize-maxDiff)
+ 	require.GreaterOrEqual(t, int(finalMaxDatagramSize), maxPacketSizeClient-maxDiff)
+ 	// MTU discovery was disabled on the server side
 --- a/integrationtests/self/nat_rebinding_test.go
 +++ b/integrationtests/self/nat_rebinding_test.go
-@@ -9,0 +10 @@ import (
+@@ -7,6 +7,7 @@
+ 	"net"
+ 	"os"
+ 	"sync"
 +	"sync/atomic"
-@@ -24 +25 @@ func TestNATRebinding(t *testing.T) {
+ 	"testing"
+ 	"time"
+ 
+@@ -22,7 +23,7 @@
+ func TestNATRebinding(t *testing.T) {
+ 	tr, tracer := newPacketTracer()
+ 	tlsConf := getTLSConfig()
 -	f, err := os.Create("keylog.txt")
 +	f, err := os.CreateTemp(t.TempDir(), "keylog-")
-@@ -101,2 +102 @@ func TestNATRebinding(t *testing.T) {
--	var pathChallenge [8]byte
--	var foundPathChallenge bool
-+	var pathChallenges [][8]byte
-@@ -107,2 +107 @@ func TestNATRebinding(t *testing.T) {
--				pathChallenge = fr.Data
--				foundPathChallenge = true
-+				pathChallenges = append(pathChallenges, fr.Data)
-@@ -112 +111 @@ func TestNATRebinding(t *testing.T) {
--	require.True(t, foundPathChallenge)
-+	require.NotEmpty(t, pathChallenges)
-@@ -120 +119,3 @@ func TestNATRebinding(t *testing.T) {
--				require.Equal(t, pathChallenge, fr.Data)
+ 	require.NoError(t, err)
+ 	defer f.Close()
+ 	tlsConf.KeyLogWriter = f
+@@ -116,12 +117,204 @@
+ 		for _, f := range p.frames {
+ 			switch fr := f.Frame.(type) {
+ 			case *qlog.PathResponseFrame:
 +				// A small first probe is followed by a distinct full-size MTU
 +				// probe. Every response must match a challenge actually sent.
-+				require.Contains(t, pathChallenges, fr.Data)
-@@ -126,0 +128,190 @@ func TestNATRebinding(t *testing.T) {
+ 				require.Contains(t, pathChallenges, fr.Data)
+ 				foundPathResponse = true
+ 			}
+ 		}
+ 	}
+ 	require.True(t, foundPathResponse)
++}
 +
 +func TestNATRebindingAmplificationLimit(t *testing.T) {
 +	server, err := quic.Listen(newUDPConnLocalhost(t), getTLSConfig(), getQuicConfig(&quic.Config{EnableDatagrams: true, DisablePathMTUDiscovery: true}))
@@ -1059,28 +1536,32 @@ index 79f273b..2c670b8 100644
 +			require.Equal(t, []byte("return traffic"), got)
 +		})
 +	}
-+}
-diff --git a/internal/ackhandler/interfaces.go b/internal/ackhandler/interfaces.go
-index 620a5e1..b3258cb 100644
+ }
+ 
+ // Probing the new path after a NAT rebinding uses one of the client's connection IDs.
 --- a/internal/ackhandler/interfaces.go
 +++ b/internal/ackhandler/interfaces.go
-@@ -22,0 +23,4 @@ type SentPacketHandler interface {
+@@ -20,6 +20,10 @@
+ 
+ 	// The SendMode determines if and what kind of packets can be sent.
+ 	SendMode(now monotime.Time) SendMode
 +	// AmplificationBudget is the remaining byte allowance before address validation.
 +	AmplificationBudget() protocol.ByteCount
 +	// HasCongestionBudget checks a packet size, including larger PMTU probes.
 +	HasCongestionBudget(protocol.ByteCount) bool
-diff --git a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sent_packet_handler.go
-index 9b539ea..8016870 100644
+ 	// TimeUntilSend is the time when the next packet should be sent.
+ 	// It is used for pacing packets.
+ 	TimeUntilSend() monotime.Time
 --- a/internal/ackhandler/sent_packet_handler.go
 +++ b/internal/ackhandler/sent_packet_handler.go
-@@ -1034 +1034 @@ func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
--func (h *sentPacketHandler) isAmplificationLimited() bool {
+@@ -1153,11 +1153,21 @@
+ 	h.congestion.SetMaxDatagramSize(s)
+ }
+ 
 +func (h *sentPacketHandler) AmplificationBudget() protocol.ByteCount {
-@@ -1036 +1036 @@ func (h *sentPacketHandler) isAmplificationLimited() bool {
--		return false
++	if h.peerAddressValidated {
 +		return protocol.MaxByteCount
-@@ -1038 +1038,11 @@ func (h *sentPacketHandler) isAmplificationLimited() bool {
--	return h.bytesSent >= amplificationFactor*h.bytesReceived
++	}
 +	return max(0, amplificationFactor*h.bytesReceived-h.bytesSent)
 +}
 +
@@ -1088,40 +1569,61 @@ index 9b539ea..8016870 100644
 +	return size <= max(0, h.congestion.GetCongestionWindow()-h.bytesInFlight)
 +}
 +
-+func (h *sentPacketHandler) isAmplificationLimited() bool {
+ func (h *sentPacketHandler) isAmplificationLimited() bool {
+-	if h.peerAddressValidated {
+-		return false
+-	}
+-	return h.bytesSent >= amplificationFactor*h.bytesReceived
 +	// Avoid trying to construct packets too small for the packer's headers.
 +	budget := h.AmplificationBudget()
 +	return budget < protocol.MinCoalescedPacketSize || (h.numProbesToSend > 0 && h.ptoMode == SendPTOInitial && budget < protocol.MinInitialPacketSize)
-diff --git a/internal/ackhandler/sent_packet_handler_test.go b/internal/ackhandler/sent_packet_handler_test.go
-index fedb5ef..16b59f8 100644
+ }
+ 
+ func (h *sentPacketHandler) QueueProbePacket(space protocol.PacketNumberSpace) bool {
 --- a/internal/ackhandler/sent_packet_handler_test.go
 +++ b/internal/ackhandler/sent_packet_handler_test.go
-@@ -472,2 +472 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
+@@ -528,14 +528,15 @@
+ 	require.Zero(t, sph.GetLossDetectionTimeout())
+ 
+ 	// Receive 1000 bytes from the client.
 -	// As long as we haven't sent out 3x the amount of bytes received, we can send out new packets,
 -	// even if we go above the 3x limit by sending the last packet.
 +	// The packer must limit the last datagram to the exact remaining allowance.
-@@ -475 +474 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
+ 	sph.ReceivedBytes(1000, monotime.Now())
 -	for i := range 4 {
 +	for i := range 3 {
-@@ -476,0 +476,2 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
+ 		require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
 +		size := min(protocol.ByteCount(999), sph.AmplificationBudget())
 +		require.Equal(t, protocol.ByteCount(3000-i*999), sph.AmplificationBudget())
-@@ -478,2 +479,2 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
+ 		pn := sph.PopPacketNumber(protocol.PacketNumberSpaceInitial)
 -		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, 999, false, false)
 -		if i != 3 {
 +		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, size, false, false)
 +		if i != 2 {
-@@ -490 +491 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
+ 			require.NotZero(t, sph.GetLossDetectionTimeout())
+ 		}
+ 	}
+@@ -546,10 +547,14 @@
+ 	// receiving more data allows us to send out more packets
+ 	sph.ReceivedBytes(1000, monotime.Now())
+ 	require.NotZero(t, sph.GetLossDetectionTimeout())
 -	for range 3 {
 +	for i := range 3 {
-@@ -493 +494,5 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
+ 		require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+ 		pn := sph.PopPacketNumber(protocol.PacketNumberSpaceInitial)
 -		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, 1000, false, false)
 +		size := protocol.ByteCount(1000)
 +		if i == 2 {
 +			size = sph.AmplificationBudget()
 +		}
 +		sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionInitial, protocol.ECNNon, size, false, false)
-@@ -1772,0 +1778,49 @@ func benchmarkSendAndAcknowledge(b *testing.B, ackEvery, inFlight int) {
+ 	}
+ 	require.Equal(t, SendNone, sph.SendMode(monotime.Now()))
+ 	require.Zero(t, sph.GetLossDetectionTimeout())
+@@ -2113,3 +2118,52 @@
+ 		}
+ 	}
+ }
 +
 +func TestSentPacketHandlerExactAmplificationBudget(t *testing.T) {
 +	h := NewSentPacketHandler(0, 1397, utils.NewRTTStats(), &utils.ConnectionStats{}, false, false, nil, protocol.PerspectiveServer, nil, utils.DefaultLogger).(*sentPacketHandler)
@@ -1130,7 +1632,7 @@ index fedb5ef..16b59f8 100644
 +	for _, size := range []protocol.ByteCount{1397, 1397, 806} {
 +		require.Equal(t, SendAny, h.SendMode(now))
 +		require.GreaterOrEqual(t, h.AmplificationBudget(), size)
-+		pn := h.PopPacketNumber(protocol.EncryptionHandshake)
++		pn := h.PopPacketNumber(protocol.PacketNumberSpaceHandshake)
 +		h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.EncryptionHandshake, protocol.ECNNon, size, false, false)
 +		now = now.Add(time.Millisecond)
 +	}
@@ -1160,7 +1662,7 @@ index fedb5ef..16b59f8 100644
 +	window := h.congestion.GetCongestionWindow()
 +	for h.bytesInFlight < window-1 {
 +		size := min(protocol.ByteCount(1400), window-1-h.bytesInFlight)
-+		pn := h.PopPacketNumber(protocol.Encryption1RTT)
++		pn := h.PopPacketNumber(protocol.PacketNumberSpaceAppData)
 +		h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, size, false, false)
 +		now = now.Add(time.Second)
 +	}
@@ -1171,46 +1673,60 @@ index fedb5ef..16b59f8 100644
 +	h.ptoMode = SendPTOAppData
 +	require.Equal(t, SendPTOAppData, h.SendMode(now))
 +}
-diff --git a/internal/congestion/cubic_sender.go b/internal/congestion/cubic_sender.go
-index e5457dd..52e6799 100644
 --- a/internal/congestion/cubic_sender.go
 +++ b/internal/congestion/cubic_sender.go
-@@ -4,2 +3,0 @@ import (
--	"fmt"
--
-@@ -159 +157,2 @@ func (c *cubicSender) CanSend(bytesInFlight protocol.ByteCount) bool {
+@@ -177,7 +177,8 @@
+ }
+ 
+ func (c *cubicSender) CanSend(bytesInFlight protocol.ByteCount) bool {
 -	return bytesInFlight < c.GetCongestionWindow()
 +	// Reserve room for the entire next packet, as required by RFC 9002, section 7.
 +	return c.maxDatagramSize <= c.GetCongestionWindow()-bytesInFlight
-@@ -321,3 +320 @@ func (c *cubicSender) SetMaxDatagramSize(s protocol.ByteCount) {
--	if s < c.maxDatagramSize {
--		panic(fmt.Sprintf("congestion BUG: decreased max datagram size from %d to %d", c.maxDatagramSize, s))
--	}
+ }
+ 
+ func (c *cubicSender) InRecovery() bool {
+@@ -402,6 +403,7 @@
+ }
+ 
+ func (c *cubicSender) SetMaxDatagramSize(s protocol.ByteCount) {
 +	// The peer may advertise a receiver limit below the configured initial size.
-diff --git a/internal/congestion/cubic_sender_test.go b/internal/congestion/cubic_sender_test.go
-index ea59b70..e90423f 100644
+ 	cwndIsMinCwnd := c.congestionWindow == c.minCongestionWindow()
+ 	c.maxDatagramSize = s
+ 	if cwndIsMinCwnd {
 --- a/internal/congestion/cubic_sender_test.go
 +++ b/internal/congestion/cubic_sender_test.go
-@@ -515 +515,6 @@ func TestCubicSenderMaximumPacketSizeReduction(t *testing.T) {
--	require.Panics(t, func() { sender.sender.SetMaxDatagramSize(initialMaxDatagramSize - 1) })
+@@ -603,6 +603,12 @@
+ 
+ func TestCubicSenderMaximumPacketSizeReduction(t *testing.T) {
+ 	sender := newTestCubicSender(false)
 +	originalWindow := sender.sender.GetCongestionWindow()
 +	sender.sender.SetMaxDatagramSize(initialMaxDatagramSize - 1)
 +	require.Equal(t, initialMaxDatagramSize-1, sender.sender.maxDatagramSize)
 +	require.Equal(t, originalWindow, sender.sender.GetCongestionWindow())
 +	require.True(t, sender.sender.CanSend(originalWindow-initialMaxDatagramSize+1))
 +	require.False(t, sender.sender.CanSend(originalWindow-initialMaxDatagramSize+2))
-@@ -583,3 +588,3 @@ func TestCubicSenderLimitCwndIncreaseInCongestionAvoidance(t *testing.T) {
+ 	require.NotPanics(t, func() { sender.sender.SetMaxDatagramSize(protocol.MinInitialPacketSize) })
+ }
+ 
+@@ -671,9 +677,9 @@
+ 		testSender.AckNPackets(1)
+ 		testSender.SendAvailableSendWindow()
+ 	}
 -	// Bytes in flight may be larger than the CWND if the CWND isn't an exact
 -	// multiple of the packet sizes being sent.
 -	require.GreaterOrEqual(t, testSender.bytesInFlight, sender.GetCongestionWindow())
 +	// A fractional final packet of credit cannot permit a full packet.
 +	require.LessOrEqual(t, testSender.bytesInFlight, sender.GetCongestionWindow())
 +	require.Less(t, sender.GetCongestionWindow()-testSender.bytesInFlight, maxDatagramSize)
-diff --git a/internal/handshake/crypto_setup_test.go b/internal/handshake/crypto_setup_test.go
-index 80c67e9..7b80baf 100644
+ 	savedCwnd = sender.GetCongestionWindow()
+ 
+ 	// Advance time 2 seconds waiting for an ack.
 --- a/internal/handshake/crypto_setup_test.go
 +++ b/internal/handshake/crypto_setup_test.go
-@@ -336,0 +337,32 @@ func TestTransportParameters(t *testing.T) {
+@@ -334,6 +334,38 @@
+ 	require.Equal(t, 42*time.Second, serverReceivedTransportParameters.MaxIdleTimeout)
+ }
+ 
 +func TestHandshakeZeroIdleTimeoutTransportParameter(t *testing.T) {
 +	clientConf, serverConf := getTLSConfigs()
 +	_, clientEvents, clientErr, _, serverEvents, serverErr := handshakeWithTLSConf(
@@ -1243,11 +1759,15 @@ index 80c67e9..7b80baf 100644
 +	}
 +}
 +
-diff --git a/internal/mocks/ackhandler/sent_packet_handler.go b/internal/mocks/ackhandler/sent_packet_handler.go
-index d4dc26e..38234b2 100644
+ func TestNewSessionTicketAtWrongEncryptionLevel(t *testing.T) {
+ 	clientConf, serverConf := getTLSConfigs()
+ 	client, _, clientErr, _, _, serverErr := handshakeWithTLSConf(
 --- a/internal/mocks/ackhandler/sent_packet_handler.go
 +++ b/internal/mocks/ackhandler/sent_packet_handler.go
-@@ -45,0 +46,38 @@ func (m *MockSentPacketHandler) EXPECT() *MockSentPacketHandlerMockRecorder {
+@@ -43,6 +43,44 @@
+ 	return m.recorder
+ }
+ 
 +// AmplificationBudget mocks base method.
 +func (m *MockSentPacketHandler) AmplificationBudget() protocol.ByteCount {
 +	m.ctrl.T.Helper()
@@ -1286,7 +1806,17 @@ index d4dc26e..38234b2 100644
 +	return c
 +}
 +
-@@ -157,0 +196,38 @@ func (c *MockSentPacketHandlerGetLossDetectionTimeoutCall) DoAndReturn(f func()
+ // DropPackets mocks base method.
+ func (m *MockSentPacketHandler) DropPackets(arg0 protocol.EncryptionLevel, rcvTime monotime.Time) {
+ 	m.ctrl.T.Helper()
+@@ -151,6 +189,44 @@
+ 
+ // DoAndReturn rewrite *gomock.Call.DoAndReturn
+ func (c *MockSentPacketHandlerGetLossDetectionTimeoutCall) DoAndReturn(f func() monotime.Time) *MockSentPacketHandlerGetLossDetectionTimeoutCall {
++	c.Call = c.Call.DoAndReturn(f)
++	return c
++}
++
 +// HasCongestionBudget mocks base method.
 +func (m *MockSentPacketHandler) HasCongestionBudget(arg0 protocol.ByteCount) bool {
 +	m.ctrl.T.Helper()
@@ -1321,15 +1851,15 @@ index d4dc26e..38234b2 100644
 +
 +// DoAndReturn rewrite *gomock.Call.DoAndReturn
 +func (c *MockSentPacketHandlerHasCongestionBudgetCall) DoAndReturn(f func(protocol.ByteCount) bool) *MockSentPacketHandlerHasCongestionBudgetCall {
-+	c.Call = c.Call.DoAndReturn(f)
-+	return c
-+}
-+
-diff --git a/internal/wire/frame_parser.go b/internal/wire/frame_parser.go
-index afc3bed..80fd68c 100644
+ 	c.Call = c.Call.DoAndReturn(f)
+ 	return c
+ }
 --- a/internal/wire/frame_parser.go
 +++ b/internal/wire/frame_parser.go
-@@ -54,0 +55,7 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
+@@ -52,6 +52,13 @@
+ 			continue
+ 		}
+ 		ft := FrameType(typ)
 +		if ft.IsDatagramFrameType() && !p.supportsDatagrams {
 +			return 0, parsed, &qerr.TransportError{
 +				ErrorCode:    qerr.ProtocolViolation,
@@ -1337,17 +1867,38 @@ index afc3bed..80fd68c 100644
 +				ErrorMessage: "DATAGRAM support not advertised",
 +			}
 +		}
-@@ -68 +75 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
+ 		valid := ft.isValidRFC9000() ||
+ 			(p.supportsDatagrams && ft.IsDatagramFrameType()) ||
+ 			(p.supportsResetStreamAt && ft == FrameTypeResetStreamAt) ||
+@@ -65,7 +72,7 @@
+ 		}
+ 		if !ft.isAllowedAtEncLevel(encLevel) {
+ 			return 0, parsed, &qerr.TransportError{
 -				ErrorCode:    qerr.FrameEncodingError,
 +				ErrorCode:    qerr.ProtocolViolation,
-diff --git a/internal/wire/frame_parser_test.go b/internal/wire/frame_parser_test.go
-index c7aec86..4d86c03 100644
+ 				FrameType:    typ,
+ 				ErrorMessage: fmt.Sprintf("%d not allowed at encryption level %s", ft, encLevel),
+ 			}
 --- a/internal/wire/frame_parser_test.go
 +++ b/internal/wire/frame_parser_test.go
-@@ -398 +398 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
+@@ -396,7 +396,7 @@
+ 			frame:            &ConnectionCloseFrame{IsApplicationError: false, ReasonPhrase: "err"},
+ 			allowedInitial:   true,
+ 			allowedHandshake: true,
 -			allowedZeroRTT:   false,
 +			allowedZeroRTT:   true,
-@@ -454,0 +455,18 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
+ 			allowedOneRTT:    true,
+ 		},
+ 		{
+@@ -448,6 +448,24 @@
+ 			name:             "STREAM_FRAME",
+ 			frameType:        FrameType(0x8),
+ 			frame:            &StreamFrame{StreamID: 1, Data: []byte("foobar")},
++			allowedInitial:   false,
++			allowedHandshake: false,
++			allowedZeroRTT:   true,
++			allowedOneRTT:    true,
++		},
 +		{
 +			name:             "DATAGRAM_WITHOUT_LENGTH",
 +			frameType:        FrameTypeDatagramNoLength,
@@ -1361,18 +1912,25 @@ index c7aec86..4d86c03 100644
 +			name:             "DATAGRAM_WITH_LENGTH",
 +			frameType:        FrameTypeDatagramWithLength,
 +			frame:            &DatagramFrame{DataLenPresent: true, Data: []byte("datagram")},
-+			allowedInitial:   false,
-+			allowedHandshake: false,
-+			allowedZeroRTT:   true,
-+			allowedOneRTT:    true,
-+		},
-@@ -494 +512,4 @@ func TestFrameAllowedAtEncLevel(t *testing.T) {
+ 			allowedInitial:   false,
+ 			allowedHandshake: false,
+ 			allowedZeroRTT:   true,
+@@ -492,7 +510,10 @@
+ 				} else {
+ 					var transportErr *qerr.TransportError
+ 					require.ErrorAs(t, err, &transportErr)
 -					require.Equal(t, qerr.FrameEncodingError, transportErr.ErrorCode)
 +					// RFC 9000, section 12.4 distinguishes forbidden packet
 +					// types from malformed or unknown frame encodings.
 +					require.Equal(t, qerr.ProtocolViolation, transportErr.ErrorCode)
 +					require.Equal(t, uint64(tc.frameType), transportErr.FrameType)
-@@ -526,7 +547,8 @@ func TestFrameParserDatagramUnsupported(t *testing.T) {
+ 				}
+ 			})
+ 		}
+@@ -524,13 +545,14 @@
+ }
+ 
+ func TestFrameParserDatagramUnsupported(t *testing.T) {
 -	parser := NewFrameParser(false, true, true)
 -	f := &DatagramFrame{Data: []byte("foobar")}
 -	b, err := f.Append(nil, protocol.Version1)
@@ -1388,18 +1946,28 @@ index c7aec86..4d86c03 100644
 +		_, _, err = parser.ParseType(b, protocol.Encryption1RTT)
 +		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation, FrameType: uint64(b[0])})
 +	}
-diff --git a/internal/wire/frame_type.go b/internal/wire/frame_type.go
-index 597523f..ddb5150 100644
+ }
+ 
+ func TestFrameParserResetStreamAtUnsupported(t *testing.T) {
 --- a/internal/wire/frame_type.go
 +++ b/internal/wire/frame_type.go
-@@ -71 +71 @@ func (t FrameType) isAllowedAtEncLevel(encLevel protocol.EncryptionLevel) bool {
+@@ -68,7 +68,7 @@
+ 		}
+ 	case protocol.Encryption0RTT:
+ 		switch t {
 -		case FrameTypeCrypto, FrameTypeAck, FrameTypeAckECN, FrameTypeConnectionClose, FrameTypeNewToken, FrameTypePathResponse, FrameTypeRetireConnectionID:
 +		case FrameTypeCrypto, FrameTypeAck, FrameTypeAckECN, FrameTypeNewToken, FrameTypePathResponse, FrameTypeRetireConnectionID:
-diff --git a/internal/wire/transport_parameter_test.go b/internal/wire/transport_parameter_test.go
-index 22699fe..9006c9e 100644
+ 			return false
+ 		default:
+ 			return true
 --- a/internal/wire/transport_parameter_test.go
 +++ b/internal/wire/transport_parameter_test.go
-@@ -250,0 +251,28 @@ func TestTransportParameterSetsDefaultValuesWhenNotSent(t *testing.T) {
+@@ -244,6 +244,34 @@
+ 	require.NoError(t, p.Unmarshal(data, protocol.PerspectiveServer))
+ 	require.EqualValues(t, protocol.DefaultAckDelayExponent, p.AckDelayExponent)
+ 	require.EqualValues(t, protocol.DefaultActiveConnectionIDLimit, p.ActiveConnectionIDLimit)
++}
++
 +func TestTransportParameterIdleTimeoutMilliseconds(t *testing.T) {
 +	const maxMilliseconds = uint64(math.MaxInt64 / int64(time.Millisecond))
 +	for _, tc := range []struct {
@@ -1426,13 +1994,15 @@ index 22699fe..9006c9e 100644
 +			require.Equal(t, tc.want, p.MaxIdleTimeout)
 +		})
 +	}
-+}
-+
-diff --git a/internal/wire/transport_parameters.go b/internal/wire/transport_parameters.go
-index 8a32c1c..84c925f 100644
+ }
+ 
+ func TestTransportParameterErrors(t *testing.T) {
 --- a/internal/wire/transport_parameters.go
 +++ b/internal/wire/transport_parameters.go
-@@ -322 +322,7 @@ func (p *TransportParameters) readNumericTransportParameter(b []byte, paramID tr
+@@ -318,7 +318,13 @@
+ 			return fmt.Errorf("initial_max_streams_uni too large: %d (maximum %d)", p.MaxUniStreamNum, protocol.MaxStreamCount)
+ 		}
+ 	case maxIdleTimeoutParameterID:
 -		p.MaxIdleTimeout = max(protocol.MinRemoteIdleTimeout, time.Duration(val)*time.Millisecond)
 +		if val == 0 {
 +			p.MaxIdleTimeout = 0
@@ -1441,9 +2011,9 @@ index 8a32c1c..84c925f 100644
 +		} else {
 +			p.MaxIdleTimeout = max(protocol.MinRemoteIdleTimeout, time.Duration(val)*time.Millisecond)
 +		}
-diff --git a/migration_binding_test.go b/migration_binding_test.go
-new file mode 100644
-index 0000000..5301201
+ 	case maxUDPPayloadSizeParameterID:
+ 		if val < 1200 {
+ 			return fmt.Errorf("invalid value for max_udp_payload_size: %d (minimum 1200)", val)
 --- /dev/null
 +++ b/migration_binding_test.go
 @@ -0,0 +1,87 @@
@@ -1475,7 +2045,7 @@ index 0000000..5301201
 +			ctrl := gomock.NewController(t)
 +			unpacker := NewMockUnpacker(ctrl)
 +			c := newServerTestConnection(t, ctrl, nil, false, connectionOptUnpacker(unpacker), connectionOptHandshakeConfirmed())
-+			require.NoError(t, c.conn.handleTransportParameters(&wire.TransportParameters{MaxUDPPayloadSize: 1452}))
++			require.NoError(t, c.conn.handleTransportParameters(&wire.TransportParameters{MaxUDPPayloadSize: 1452, InitialSourceConnectionID: protocol.ZeroLengthConnectionID}))
 +			oldCID := protocol.ParseConnectionID([]byte{1, 1, 1, 1})
 +			newCID := protocol.ParseConnectionID([]byte{2, 2, 2, 2})
 +			c.conn.connIDManager = newConnIDManager(oldCID, func(protocol.StatelessResetToken) {}, func(protocol.StatelessResetToken) {}, func(wire.Frame) {})
@@ -1508,7 +2078,7 @@ index 0000000..5301201
 +				data[0] = 0x40
 +				copy(data[1:], incomingCID.Bytes())
 +				b := getPacketBuffer()
-+				processed, err := c.conn.handleShortHeaderPacket(receivedPacket{data: data, buffer: b, remoteAddr: remote, rcvTime: monotime.Now()}, false, 0)
++				processed, err := c.conn.handleShortHeaderPacket(receivedPacket{data: data, buffer: b, remoteAddr: remote, rcvTime: monotime.Now()}, false, 0, activePathID)
 +				b.MaybeRelease()
 +				require.NoError(t, err)
 +				require.True(t, processed)
@@ -1534,73 +2104,142 @@ index 0000000..5301201
 +		})
 +	}
 +}
-diff --git a/mock_packer_test.go b/mock_packer_test.go
-index 416f6b0..d2b1fa6 100644
 --- a/mock_packer_test.go
 +++ b/mock_packer_test.go
-@@ -322 +322 @@ func (c *MockPackerPackPTOProbePacketCall) DoAndReturn(f func(protocol.Encryptio
+@@ -319,9 +319,9 @@
+ }
+ 
+ // PackPathProbePacket mocks base method.
 -func (m *MockPacker) PackPathProbePacket(arg0 protocol.ConnectionID, arg1 []ackhandler.Frame, arg2 protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
-+func (m *MockPacker) PackPathProbePacket(arg0 protocol.ConnectionID, arg1 []ackhandler.Frame, arg2 protocol.ByteCount, arg3 protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
-@@ -324 +324 @@ func (m *MockPacker) PackPathProbePacket(arg0 protocol.ConnectionID, arg1 []ackh
+-	m.ctrl.T.Helper()
 -	ret := m.ctrl.Call(m, "PackPathProbePacket", arg0, arg1, arg2)
++func (m *MockPacker) PackPathProbePacket(arg0 protocol.ConnectionID, arg1 []ackhandler.Frame, arg2 protocol.ByteCount, arg3 protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
++	m.ctrl.T.Helper()
 +	ret := m.ctrl.Call(m, "PackPathProbePacket", arg0, arg1, arg2, arg3)
-@@ -332 +332 @@ func (m *MockPacker) PackPathProbePacket(arg0 protocol.ConnectionID, arg1 []ackh
+ 	ret0, _ := ret[0].(shortHeaderPacket)
+ 	ret1, _ := ret[1].(*packetBuffer)
+ 	ret2, _ := ret[2].(error)
+@@ -329,9 +329,9 @@
+ }
+ 
+ // PackPathProbePacket indicates an expected call of PackPathProbePacket.
 -func (mr *MockPackerMockRecorder) PackPathProbePacket(arg0, arg1, arg2 any) *MockPackerPackPathProbePacketCall {
-+func (mr *MockPackerMockRecorder) PackPathProbePacket(arg0, arg1, arg2, arg3 any) *MockPackerPackPathProbePacketCall {
-@@ -334 +334 @@ func (mr *MockPackerMockRecorder) PackPathProbePacket(arg0, arg1, arg2 any) *Moc
+-	mr.mock.ctrl.T.Helper()
 -	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PackPathProbePacket", reflect.TypeOf((*MockPacker)(nil).PackPathProbePacket), arg0, arg1, arg2)
++func (mr *MockPackerMockRecorder) PackPathProbePacket(arg0, arg1, arg2, arg3 any) *MockPackerPackPathProbePacketCall {
++	mr.mock.ctrl.T.Helper()
 +	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PackPathProbePacket", reflect.TypeOf((*MockPacker)(nil).PackPathProbePacket), arg0, arg1, arg2, arg3)
-@@ -350 +350 @@ func (c *MockPackerPackPathProbePacketCall) Return(arg0 shortHeaderPacket, arg1
+ 	return &MockPackerPackPathProbePacketCall{Call: call}
+ }
+ 
+@@ -347,13 +347,13 @@
+ }
+ 
+ // Do rewrite *gomock.Call.Do
 -func (c *MockPackerPackPathProbePacketCall) Do(f func(protocol.ConnectionID, []ackhandler.Frame, protocol.Version) (shortHeaderPacket, *packetBuffer, error)) *MockPackerPackPathProbePacketCall {
-+func (c *MockPackerPackPathProbePacketCall) Do(f func(protocol.ConnectionID, []ackhandler.Frame, protocol.ByteCount, protocol.Version) (shortHeaderPacket, *packetBuffer, error)) *MockPackerPackPathProbePacketCall {
-@@ -356 +356 @@ func (c *MockPackerPackPathProbePacketCall) Do(f func(protocol.ConnectionID, []a
+-	c.Call = c.Call.Do(f)
+-	return c
+-}
+-
+-// DoAndReturn rewrite *gomock.Call.DoAndReturn
 -func (c *MockPackerPackPathProbePacketCall) DoAndReturn(f func(protocol.ConnectionID, []ackhandler.Frame, protocol.Version) (shortHeaderPacket, *packetBuffer, error)) *MockPackerPackPathProbePacketCall {
++func (c *MockPackerPackPathProbePacketCall) Do(f func(protocol.ConnectionID, []ackhandler.Frame, protocol.ByteCount, protocol.Version) (shortHeaderPacket, *packetBuffer, error)) *MockPackerPackPathProbePacketCall {
++	c.Call = c.Call.Do(f)
++	return c
++}
++
++// DoAndReturn rewrite *gomock.Call.DoAndReturn
 +func (c *MockPackerPackPathProbePacketCall) DoAndReturn(f func(protocol.ConnectionID, []ackhandler.Frame, protocol.ByteCount, protocol.Version) (shortHeaderPacket, *packetBuffer, error)) *MockPackerPackPathProbePacketCall {
-diff --git a/mtu_discoverer.go b/mtu_discoverer.go
-index 76b28e7..a3a07e1 100644
+ 	c.Call = c.Call.DoAndReturn(f)
+ 	return c
+ }
 --- a/mtu_discoverer.go
 +++ b/mtu_discoverer.go
-@@ -115 +115 @@ func (f *mtuFinder) init(start, max protocol.ByteCount) {
+@@ -112,7 +112,7 @@
+ }
+ 
+ func (f *mtuFinder) init(start, max protocol.ByteCount) {
 -	f.min = start
 +	f.min = min(start, max)
-@@ -152,2 +152 @@ func (f *mtuFinder) ShouldSendProbe(now monotime.Time) bool {
--func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteCount) {
--	var size protocol.ByteCount
+ 	for i := range f.lost {
+ 		if i == 0 {
+ 			f.lost[i] = max
+@@ -149,13 +149,15 @@
+ 	return !now.Before(f.lastProbeTime.Add(mtuProbeDelay * f.rttStats.SmoothedRTT()))
+ }
+ 
 +func (f *mtuFinder) nextProbeSize() protocol.ByteCount {
-@@ -155,3 +154 @@ func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteC
--		size = (f.min + f.lost[0]) / 2
--	} else {
--		size = (f.min + f.max()) / 2
++	if f.lastProbeWasLost {
 +		return (f.min + f.lost[0]) / 2
-@@ -158,0 +156,5 @@ func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteC
++	}
 +	return (f.min + f.max()) / 2
 +}
 +
-+func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteCount) {
+ func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteCount) {
+-	var size protocol.ByteCount
+-	if f.lastProbeWasLost {
+-		size = (f.min + f.lost[0]) / 2
+-	} else {
+-		size = (f.min + f.max()) / 2
+-	}
 +	size := f.nextProbeSize()
-diff --git a/packet_packer.go b/packet_packer.go
-index 332e23e..278e861 100644
+ 	f.lastProbeTime = now
+ 	f.inFlight = size
+ 	return ackhandler.Frame{
 --- a/packet_packer.go
 +++ b/packet_packer.go
-@@ -27 +27 @@ type packer interface {
+@@ -26,7 +26,7 @@
+ 	PackPTOProbePacket(_ protocol.EncryptionLevel, _ protocol.ByteCount, addPingIfEmpty bool, now monotime.Time, v protocol.Version) (*coalescedPacket, error)
+ 	PackConnectionClose(*qerr.TransportError, protocol.ByteCount, protocol.Version) (*coalescedPacket, error)
+ 	PackApplicationClose(*qerr.ApplicationError, protocol.ByteCount, protocol.Version) (*coalescedPacket, error)
 -	PackPathProbePacket(protocol.ConnectionID, []ackhandler.Frame, protocol.Version) (shortHeaderPacket, *packetBuffer, error)
 +	PackPathProbePacket(protocol.ConnectionID, []ackhandler.Frame, protocol.ByteCount, protocol.Version) (shortHeaderPacket, *packetBuffer, error)
-@@ -346 +346 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
+ 	PackMTUProbePacket(ping ackhandler.Frame, size protocol.ByteCount, v protocol.Version) (shortHeaderPacket, *packetBuffer, error)
+ 
+ 	SetToken([]byte)
+@@ -358,7 +358,7 @@
+ 		return nil, err
+ 	}
+ 	var size protocol.ByteCount
 -	if initialSealer != nil {
 +	if initialSealer != nil && maxSize >= protocol.MinInitialPacketSize {
-@@ -718,0 +719,3 @@ func (p *packetPacker) PackPTOProbePacket(
+ 		initialHdr, initialPayload = p.maybeGetCryptoPacket(
+ 			maxSize-protocol.ByteCount(initialSealer.Overhead()),
+ 			protocol.EncryptionInitial,
+@@ -794,6 +794,9 @@
+ 	now monotime.Time,
+ 	v protocol.Version,
+ ) (*coalescedPacket, error) {
 +	if encLevel == protocol.EncryptionInitial && maxPacketSize < protocol.MinInitialPacketSize {
 +		return nil, nil
 +	}
-@@ -814 +817 @@ func (p *packetPacker) PackMTUProbePacket(ping ackhandler.Frame, size protocol.B
+ 	if encLevel == protocol.Encryption1RTT {
+ 		return p.packPTOProbePacket1RTT(maxPacketSize, addPingIfEmpty, now, v)
+ 	}
+@@ -895,7 +898,7 @@
+ 	return packet, buffer, err
+ }
+ 
 -func (p *packetPacker) PackPathProbePacket(connID protocol.ConnectionID, frames []ackhandler.Frame, v protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
 +func (p *packetPacker) PackPathProbePacket(connID protocol.ConnectionID, frames []ackhandler.Frame, maxSize protocol.ByteCount, v protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
-@@ -829,2 +832,2 @@ func (p *packetPacker) PackPathProbePacket(connID protocol.ConnectionID, frames
+ 	pn, pnLen := p.pnManager.PeekPacketNumber(protocol.PacketNumberSpaceAppData)
+ 	buf := getPacketBuffer()
+ 	s, err := p.cryptoSetup.Get1RTTSealer()
+@@ -910,8 +913,8 @@
+ 		frames: frames,
+ 		length: l,
+ 	}
 -	padding := protocol.MinInitialPacketSize - p.shortHeaderPacketLength(connID, pnLen, payload) - protocol.ByteCount(s.Overhead())
 -	packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, s.KeyPhase(), payload, padding, protocol.MinInitialPacketSize, s, false, v)
 +	padding := max(0, maxSize-p.shortHeaderPacketLength(connID, pnLen, payload)-protocol.ByteCount(s.Overhead()))
 +	packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, s.KeyPhase(), payload, padding, maxSize, s, false, v)
-@@ -921,0 +925,8 @@ func (p *packetPacker) appendShortHeaderPacket(
+ 	if err != nil {
+ 		return shortHeaderPacket{}, nil, err
+ 	}
+@@ -1000,6 +1003,14 @@
+ 		return shortHeaderPacket{}, err
+ 	}
+ 	payloadOffset := protocol.ByteCount(len(raw))
 +	if maxPacketSize >= protocol.MinInitialPacketSize {
 +		for _, frame := range pl.frames {
 +			switch frame.Frame.(type) {
@@ -1609,25 +2248,47 @@ index 332e23e..278e861 100644
 +			}
 +		}
 +	}
-diff --git a/packet_packer_test.go b/packet_packer_test.go
-index 331d099..ca25c0d 100644
+ 
+ 	raw, err = p.appendPacketPayload(raw, pl, paddingLen, v)
+ 	if err != nil {
 --- a/packet_packer_test.go
 +++ b/packet_packer_test.go
-@@ -6,0 +7 @@ import (
+@@ -4,6 +4,7 @@
+ 	"bytes"
+ 	"crypto/rand"
+ 	"errors"
 +	"fmt"
-@@ -740 +741 @@ func TestPackRetransmissions(t *testing.T) {
+ 	"testing"
+ 	"time"
+ 
+@@ -841,7 +842,7 @@
+ 	tp.sealingManager.EXPECT().GetHandshakeSealer().Return(nil, handshake.ErrKeysNotYetAvailable)
+ 	tp.sealingManager.EXPECT().Get1RTTSealer().Return(nil, handshake.ErrKeysNotYetAvailable)
+ 	tp.ackFramer.EXPECT().GetAckFrame(protocol.EncryptionInitial, gomock.Any(), false)
 -	p, err := tp.packer.PackCoalescedPacket(false, 1000, monotime.Now(), protocol.Version1)
 +	p, err := tp.packer.PackCoalescedPacket(false, protocol.MinInitialPacketSize, monotime.Now(), protocol.Version1)
-@@ -1084,0 +1086 @@ func TestPackPathProbePacket(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Len(t, p.longHdrPackets, 1)
+ 	require.Equal(t, protocol.EncryptionInitial, p.longHdrPackets[0].EncryptionLevel())
+@@ -1187,6 +1188,7 @@
+ 			{Frame: &wire.PathChallengeFrame{Data: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}}},
+ 			{Frame: &wire.PathResponseFrame{Data: [8]byte{8, 7, 6, 5, 4, 3, 2, 1}}},
+ 		},
 +		protocol.MinInitialPacketSize,
-@@ -1099,0 +1102,35 @@ func TestPackPathProbePacket(t *testing.T) {
+ 		protocol.Version1,
+ 	)
+ 	require.NoError(t, err)
+@@ -1202,3 +1204,38 @@
+ 	require.True(t, p.IsPathProbePacket)
+ 	require.False(t, p.IsPathMTUProbePacket)
+ }
 +
 +func TestPackPathProbePacketAmplificationBudget(t *testing.T) {
 +	mockCtrl := gomock.NewController(t)
 +	tp := newTestPacketPacker(t, mockCtrl, protocol.PerspectiveServer)
 +	tp.sealingManager.EXPECT().Get1RTTSealer().Return(newMockShortHeaderSealer(mockCtrl), nil)
-+	tp.pnManager.EXPECT().PeekPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x43), protocol.PacketNumberLen2)
-+	tp.pnManager.EXPECT().PopPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x43))
++	tp.pnManager.EXPECT().PeekPacketNumber(protocol.PacketNumberSpaceAppData).Return(protocol.PacketNumber(0x43), protocol.PacketNumberLen2)
++	tp.pnManager.EXPECT().PopPacketNumber(protocol.PacketNumberSpaceAppData).Return(protocol.PacketNumber(0x43))
 +	p, buf, err := tp.packer.PackPathProbePacket(protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
 +		[]ackhandler.Frame{{Frame: &wire.PathChallengeFrame{Data: [8]byte{1}}}}, 78, protocol.Version1)
 +	require.NoError(t, err)
@@ -1641,7 +2302,7 @@ index 331d099..ca25c0d 100644
 +		t.Run(fmt.Sprintf("%T", frame), func(t *testing.T) {
 +			mockCtrl := gomock.NewController(t)
 +			tp := newTestPacketPacker(t, mockCtrl, protocol.PerspectiveServer)
-+			tp.pnManager.EXPECT().PopPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x43))
++			tp.pnManager.EXPECT().PopPacketNumber(protocol.PacketNumberSpaceAppData).Return(protocol.PacketNumber(0x43))
 +			buf := getPacketBuffer()
 +			defer buf.Release()
 +			pl := payload{frames: []ackhandler.Frame{{Frame: frame}}, length: frame.Length(protocol.Version1)}
@@ -1656,9 +2317,6 @@ index 331d099..ca25c0d 100644
 +		})
 +	}
 +}
-diff --git a/path_control.go b/path_control.go
-new file mode 100644
-index 0000000..17145ba
 --- /dev/null
 +++ b/path_control.go
 @@ -0,0 +1,234 @@
@@ -1896,9 +2554,6 @@ index 0000000..17145ba
 +	}
 +	return nil
 +}
-diff --git a/path_control_cid_wait_test.go b/path_control_cid_wait_test.go
-new file mode 100644
-index 0000000..b4dd26f
 --- /dev/null
 +++ b/path_control_cid_wait_test.go
 @@ -0,0 +1,72 @@
@@ -1974,9 +2629,6 @@ index 0000000..b4dd26f
 +	require.NoError(t, tc.conn.flushBoundPathControls(monotime.Now()))
 +	require.Empty(t, tc.conn.boundPathControls)
 +}
-diff --git a/path_control_test.go b/path_control_test.go
-new file mode 100644
-index 0000000..91dc18d
 --- /dev/null
 +++ b/path_control_test.go
 @@ -0,0 +1,207 @@
@@ -2105,7 +2757,7 @@ index 0000000..91dc18d
 +	tc := newServerTestConnection(t, nil, nil, false)
 +	credit := tc.conn.pathControlCredit(tc.remoteAddr, packetInfo{})
 +	credit.inFlight = true
-+	h := &pathControlCreditHandler{credit: credit, conn: tc.conn}
++	h := &pathControlCreditHandler{credit: credit, conn: tc.conn.Conn}
 +	h.OnAcked(&wire.PathResponseFrame{})
 +	require.False(t, credit.inFlight)
 +	credit.inFlight = true // another packet has borrowed the same credit
@@ -2171,7 +2823,7 @@ index 0000000..91dc18d
 +	newCID := protocol.ParseConnectionID([]byte{5, 6, 7, 8})
 +	token := protocol.StatelessResetToken{3, 4}
 +	h.queue = append(h.queue, newConnID{SequenceNumber: 2, ConnectionID: newCID, StatelessResetToken: token})
-+	tc.connRunner.EXPECT().AddResetToken(token, tc.conn)
++	tc.connRunner.EXPECT().AddResetToken(token, &tc.conn.pathReceiver)
 +	tc.connRunner.EXPECT().RemoveResetToken(token)
 +	sph.EXPECT().HasCongestionBudget(protocol.ByteCount(1200)).Return(true)
 +	tc.packer.EXPECT().PackPathProbePacket(newCID, gomock.Any(), protocol.ByteCount(1200), gomock.Any()).DoAndReturn(
@@ -2187,9 +2839,6 @@ index 0000000..91dc18d
 +	require.Empty(t, tc.conn.boundPathControls)
 +	require.Empty(t, h.pathControlRefs)
 +}
-diff --git a/path_control_udp_test.go b/path_control_udp_test.go
-new file mode 100644
-index 0000000..4d180b2
 --- /dev/null
 +++ b/path_control_udp_test.go
 @@ -0,0 +1,211 @@
@@ -2404,59 +3053,110 @@ index 0000000..4d180b2
 +		})
 +	}
 +}
-diff --git a/path_manager.go b/path_manager.go
-index dd188ea..968fd4d 100644
 --- a/path_manager.go
 +++ b/path_manager.go
-@@ -32,6 +32,13 @@ type path struct {
+@@ -29,13 +29,22 @@
+ const pathTimeout = 5 * time.Second
+ 
+ type path struct {
 -	id             pathID
 -	addr           net.Addr
 -	lastPacketTime monotime.Time
--	pathChallenge  [8]byte
+-	pathChallenges [][8]byte // length is implicitly limited by exponential backoff
+-	nextProbeTime  monotime.Time
 -	validated      bool
 -	rcvdNonProbing bool
-+	id              pathID
-+	addr            net.Addr
-+	lastPacketTime  monotime.Time
-+	pathChallenge   [8]byte
-+	validated       bool
-+	rcvdNonProbing  bool
-+	probedPrevious  bool
-+	bytesReceived   protocol.ByteCount
-+	bytesSent       protocol.ByteCount
-+	challengePadded bool
-+	mtuValidated    bool
-+	needsMTUProbe   bool
-+	info            packetInfo
-@@ -69 +76 @@ func (pm *pathManager) HandlePacket(
++	id               pathID
++	addr             net.Addr
++	lastPacketTime   monotime.Time
++	pathChallenge    [8]byte
++	validated        bool
++	rcvdNonProbing   bool
++	probedPrevious   bool
++	bytesReceived    protocol.ByteCount
++	bytesSent        protocol.ByteCount
++	challengePadded  bool
++	mtuValidated     bool
++	needsMTUProbe    bool
++	info             packetInfo
++	pathChallenges   [][8]byte
++	nextProbeTime    monotime.Time
++	paddedChallenges map[[8]byte]bool
+ }
+ 
+ type pathManager struct {
+@@ -68,30 +77,34 @@
+ func (pm *pathManager) HandlePacket(
+ 	remoteAddr net.Addr,
+ 	t monotime.Time,
 -	pathChallenge *wire.PathChallengeFrame, // may be nil if the packet didn't contain a PATH_CHALLENGE
 +	pathChallenges []*wire.PathChallengeFrame, // may be nil if the packet did not contain a PATH_CHALLENGE
-@@ -70,0 +78,2 @@ func (pm *pathManager) HandlePacket(
+ 	isNonProbing bool,
 +	bytesReceived protocol.ByteCount,
 +	info packetInfo,
-@@ -76,0 +86 @@ func (pm *pathManager) HandlePacket(
+ ) (_ protocol.ConnectionID, _ []ackhandler.Frame, shouldSwitch bool) {
++	if _, _, ok := pm.GetOrCreatePath(remoteAddr, t); !ok {
++		return protocol.ConnectionID{}, nil, false
++	}
+ 	var p *path
+ 	for i, path := range pm.paths {
+ 		if addrsEqual(path.addr, remoteAddr) {
+ 			p = path
+ 			p.lastPacketTime = t
 +			p.bytesReceived += bytesReceived
-@@ -84 +94 @@ func (pm *pathManager) HandlePacket(
++			p.info = info
+ 			if isNonProbing {
+ 				path.rcvdNonProbing = true
+ 			}
+ 			if pm.logger.Debug() {
+ 				pm.logger.Debugf("received packet for path %s, validated: %t", remoteAddr, path.validated)
+ 			}
 -			shouldSwitch = path.validated && path.rcvdNonProbing
 +			shouldSwitch = path.validated && path.mtuValidated && path.rcvdNonProbing
-@@ -90 +100 @@ func (pm *pathManager) HandlePacket(
--			if pathChallenge == nil {
-+			if len(pathChallenges) == 0 && !path.needsMTUProbe {
-@@ -92,0 +103 @@ func (pm *pathManager) HandlePacket(
-+			break
-@@ -96 +107 @@ func (pm *pathManager) HandlePacket(
--	if len(pm.paths) >= maxPaths {
-+	if p == nil && len(pm.paths) >= maxPaths {
-@@ -131,0 +143,2 @@ func (pm *pathManager) HandlePacket(
-+			bytesReceived:  bytesReceived,
-+			info:           info,
-@@ -141 +154 @@ func (pm *pathManager) HandlePacket(
+ 			if i != len(pm.paths)-1 {
+ 				// move the path to the end of the list
+ 				pm.paths = slices.Delete(pm.paths, i, i+1)
+ 				pm.paths = append(pm.paths, p)
+ 			}
+-			// Nothing to send:
+-			// * the packet didn't contain a PATH_CHALLENGE, and
+-			// * the path does not need a probe (already validated, or still inside the backoff).
+-			if pathChallenge == nil && (path.validated || t.Before(path.nextProbeTime)) {
++			if len(pathChallenges) == 0 && !path.needsMTUProbe && (path.mtuValidated || t.Before(path.nextProbeTime)) {
+ 				return protocol.ConnectionID{}, nil, shouldSwitch
+ 			}
+ 			break
+@@ -112,25 +125,53 @@
+ 	// Probe an unvalidated path with a new PATH_CHALLENGE:
+ 	// * sent on the next packet once nextProbeTime has passed, and
+ 	// * repeated until a PATH_RESPONSE arrives, ignoring ACKs and loss.
+-	if !p.validated && !t.Before(p.nextProbeTime) {
++	if (!p.mtuValidated && !t.Before(p.nextProbeTime)) || p.needsMTUProbe {
+ 		backoffFactor := 1 << len(p.pathChallenges)
+ 		p.nextProbeTime = t.Add(utils.DefaultInitialRTT * time.Duration(backoffFactor))
+ 		var b [8]byte
+ 		rand.Read(b[:])
+ 		p.pathChallenges = append(p.pathChallenges, b)
++		p.pathChallenge = b
++		p.challengePadded = false
++		p.needsMTUProbe = false
+ 		frames = append(frames, ackhandler.Frame{
+ 			Frame:   &wire.PathChallengeFrame{Data: b},
+ 			Handler: emptyHandler{},
+ 		})
+ 		pm.logger.Debugf("enqueueing PATH_CHALLENGE for new path %s", remoteAddr)
+ 	}
 -	if pathChallenge != nil {
 +	for _, challenge := range pathChallenges {
-@@ -143 +156 @@ func (pm *pathManager) HandlePacket(
+ 		frames = append(frames, ackhandler.Frame{
 -			Frame:   &wire.PathResponseFrame{Data: pathChallenge.Data},
 +			Frame:   &wire.PathResponseFrame{Data: challenge.Data},
-@@ -149,0 +163,23 @@ func (pm *pathManager) HandlePacket(
+ 			Handler: emptyHandler{},
+ 		})
+ 	}
+ 	return connID, frames, shouldSwitch
++}
++
 +// NextMTUProbe also runs when a PATH_RESPONSE arrived on a different path.
 +// Address validation is path-independent; the MTU probe must use the path
 +// where the undersized challenge was sent.
@@ -2469,21 +3169,40 @@ index dd188ea..968fd4d 100644
 +		if !ok {
 +			continue
 +		}
++		p.nextProbeTime = monotime.Now().Add(utils.DefaultInitialRTT * time.Duration(1<<len(p.pathChallenges)))
 +		rand.Read(p.pathChallenge[:])
++		p.pathChallenges = append(p.pathChallenges, p.pathChallenge)
 +		p.needsMTUProbe = false
 +		p.challengePadded = false
 +		return connID, []ackhandler.Frame{{
 +			Frame:   &wire.PathChallengeFrame{Data: p.pathChallenge},
-+			Handler: (*pathManagerAckHandler)(pm),
++			Handler: emptyHandler{},
 +		}}, p
 +	}
 +	return protocol.ConnectionID{}, nil, nil
+ }
+ 
+ // GetOrCreatePath returns the ID of the path for the remote address, creating the path if necessary.
+@@ -173,11 +214,61 @@
+ 		if slices.Contains(p.pathChallenges, f.Data) {
+ 			// path validated
+ 			p.validated = true
+-			p.pathChallenges = nil
++			p.mtuValidated = p.mtuValidated || p.paddedChallenges[f.Data]
++			// Consume the proof once: duplicate small responses cannot create more MTU probes.
++			p.pathChallenges = slices.DeleteFunc(p.pathChallenges, func(data [8]byte) bool { return data == f.Data })
++			delete(p.paddedChallenges, f.Data)
++			p.needsMTUProbe = !p.mtuValidated
++			if p.mtuValidated {
++				p.pathChallenges = nil
++				clear(p.paddedChallenges)
++			}
+ 			pm.logger.Debugf("path %s validated", p.addr)
+ 			break
+ 		}
+ 	}
 +}
 +
-@@ -154,0 +191,2 @@ func (pm *pathManager) HandlePathResponseFrame(f *wire.PathResponseFrame) {
-+			p.mtuValidated = p.challengePadded
-+			p.needsMTUProbe = !p.mtuValidated
-@@ -160,0 +199,36 @@ func (pm *pathManager) HandlePathResponseFrame(f *wire.PathResponseFrame) {
 +func (pm *pathManager) ProbeSize(addr net.Addr) protocol.ByteCount {
 +	for _, p := range pm.paths {
 +		if addrsEqual(p.addr, addr) {
@@ -2503,8 +3222,14 @@ index dd188ea..968fd4d 100644
 +		}
 +		p.bytesSent += size
 +		for _, frame := range frames {
-+			if challenge, ok := frame.Frame.(*wire.PathChallengeFrame); ok && challenge.Data == p.pathChallenge {
-+				p.challengePadded = size >= protocol.MinInitialPacketSize
++			if challenge, ok := frame.Frame.(*wire.PathChallengeFrame); ok && slices.Contains(p.pathChallenges, challenge.Data) {
++				if p.paddedChallenges == nil {
++					p.paddedChallenges = make(map[[8]byte]bool)
++				}
++				p.paddedChallenges[challenge.Data] = size >= protocol.MinInitialPacketSize
++				if challenge.Data == p.pathChallenge {
++					p.challengePadded = size >= protocol.MinInitialPacketSize
++				}
 +			}
 +		}
 +		return
@@ -2518,67 +3243,154 @@ index dd188ea..968fd4d 100644
 +		}
 +	}
 +	return invalidPathID, false
-+}
-+
-diff --git a/path_manager_test.go b/path_manager_test.go
-index d756120..b2ec523 100644
+ }
+ 
+ // SwitchToPath is called when the connection switches to a new path
 --- a/path_manager_test.go
 +++ b/path_manager_test.go
-@@ -5,0 +6 @@ import (
+@@ -3,6 +3,7 @@
+ import (
+ 	"crypto/rand"
+ 	"net"
 +	"net/netip"
-@@ -37 +38 @@ func TestPathManagerIntentionalMigration(t *testing.T) {
+ 	"testing"
+ 	"time"
+ 
+@@ -39,8 +40,10 @@
+ 	connID, frames, shouldSwitch := pm.HandlePacket(
+ 		&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000},
+ 		now,
 -		&wire.PathChallengeFrame{Data: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}},
+-		false,
 +		[]*wire.PathChallengeFrame{{Data: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}}},
-@@ -38,0 +40,2 @@ func TestPathManagerIntentionalMigration(t *testing.T) {
++		false,
 +		protocol.MinInitialPacketSize,
 +		packetInfo{},
-@@ -55,0 +59,2 @@ func TestPathManagerIntentionalMigration(t *testing.T) {
+ 	)
+ 	require.Equal(t, connIDs[0], connID)
+ 	require.Len(t, frames, 2)
+@@ -62,6 +65,8 @@
+ 		now,
+ 		nil,
+ 		false,
 +		protocol.MinInitialPacketSize,
 +		packetInfo{},
-@@ -63 +68 @@ func TestPathManagerIntentionalMigration(t *testing.T) {
+ 	)
+ 	require.Zero(t, connID)
+ 	require.Empty(t, frames)
+@@ -73,7 +78,7 @@
+ 	require.True(t, ok)
+ 	require.True(t, isNew)
+ 	require.Equal(t, pathID(1), id)
 -	connID, frames, shouldSwitch = pm.HandlePacket(addr2, now, nil, false)
 +	connID, frames, shouldSwitch = pm.HandlePacket(addr2, now, nil, false, protocol.MinInitialPacketSize, packetInfo{})
-@@ -79,0 +85,2 @@ func TestPathManagerIntentionalMigration(t *testing.T) {
+ 	require.Equal(t, connIDs[1], connID)
+ 	require.Len(t, frames, 1)
+ 	require.IsType(t, &wire.PathChallengeFrame{}, frames[0].Frame)
+@@ -90,14 +95,17 @@
+ 		now,
+ 		nil,
+ 		false,
 +		protocol.MinInitialPacketSize,
 +		packetInfo{},
-@@ -85,0 +93 @@ func TestPathManagerIntentionalMigration(t *testing.T) {
+ 	)
+ 	require.Zero(t, connID)
+ 	require.Empty(t, frames)
+ 	require.False(t, shouldSwitch)
+ 
+ 	// receiving a PATH_RESPONSE for the second path confirms the path
 +	pm.SentProbe(addr2, protocol.MinInitialPacketSize, []ackhandler.Frame{{Frame: pc2}})
-@@ -87 +95 @@ func TestPathManagerIntentionalMigration(t *testing.T) {
+ 	pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: pc2.Data})
 -	connID, frames, shouldSwitch = pm.HandlePacket(addr2, now, nil, false)
 +	connID, frames, shouldSwitch = pm.HandlePacket(addr2, now, nil, false, protocol.MinInitialPacketSize, packetInfo{})
-@@ -98,0 +107,2 @@ func TestPathManagerIntentionalMigration(t *testing.T) {
+ 	require.Zero(t, connID)
+ 	require.Empty(t, frames)
+ 	require.False(t, shouldSwitch) // no non-probing packet received yet
+@@ -109,6 +117,8 @@
+ 		now,
+ 		nil,
+ 		false,
 +		protocol.MinInitialPacketSize,
 +		packetInfo{},
-@@ -109,0 +120,2 @@ func TestPathManagerIntentionalMigration(t *testing.T) {
+ 	)
+ 	require.Zero(t, connID)
+ 	require.Empty(t, frames)
+@@ -120,6 +130,8 @@
+ 		now,
+ 		nil,
+ 		true,
 +		protocol.MinInitialPacketSize,
 +		packetInfo{},
-@@ -119 +131 @@ func TestPathManagerIntentionalMigration(t *testing.T) {
+ 	)
+ 	require.Zero(t, connID)
+ 	require.Empty(t, frames)
+@@ -130,7 +142,7 @@
+ 
+ 	// switching to the path removes other paths
+ 	pm.GetOrCreatePath(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000}, now)
 -	connID, frames, shouldSwitch = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000}, now, nil, false)
 +	connID, frames, shouldSwitch = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000}, now, nil, false, protocol.MinInitialPacketSize, packetInfo{})
-@@ -142,0 +155,2 @@ func TestPathManagerMultipleProbes(t *testing.T) {
+ 	require.Equal(t, connIDs[2], connID)
+ 	require.NotEmpty(t, frames)
+ 	require.NotEqual(t, frames[0].Frame.(*wire.PathChallengeFrame).Data, pc1.Data)
+@@ -155,6 +167,8 @@
+ 		now,
+ 		nil,
+ 		false,
 +		protocol.MinInitialPacketSize,
 +		packetInfo{},
-@@ -153 +167 @@ func TestPathManagerMultipleProbes(t *testing.T) {
+ 	)
+ 	require.Equal(t, connIDs[0], connID)
+ 	require.Len(t, frames, 1)
+@@ -165,8 +179,10 @@
+ 	connID, frames, shouldSwitch = pm.HandlePacket(
+ 		&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000},
+ 		now,
 -		&wire.PathChallengeFrame{Data: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}},
+-		false,
 +		[]*wire.PathChallengeFrame{{Data: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}}},
-@@ -154,0 +169,2 @@ func TestPathManagerMultipleProbes(t *testing.T) {
++		false,
 +		protocol.MinInitialPacketSize,
 +		packetInfo{},
-@@ -165 +181 @@ func TestPathManagerMultipleProbes(t *testing.T) {
+ 	)
+ 	require.Equal(t, connIDs[0], connID)
+ 	require.Len(t, frames, 1)
+@@ -177,8 +193,10 @@
+ 	connID, frames, shouldSwitch = pm.HandlePacket(
+ 		&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000},
+ 		now,
 -		&wire.PathChallengeFrame{Data: [8]byte{8, 7, 6, 5, 4, 3, 2, 1}},
+-		false,
 +		[]*wire.PathChallengeFrame{{Data: [8]byte{8, 7, 6, 5, 4, 3, 2, 1}}},
-@@ -166,0 +183,2 @@ func TestPathManagerMultipleProbes(t *testing.T) {
++		false,
 +		protocol.MinInitialPacketSize,
 +		packetInfo{},
-@@ -192 +210 @@ func TestPathManagerNATRebinding(t *testing.T) {
+ 	)
+ 	require.Equal(t, connIDs[0], connID)
+ 	require.Len(t, frames, 1)
+@@ -205,7 +223,7 @@
+ 
+ 	now := monotime.Now()
+ 	pm.GetOrCreatePath(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000}, now)
 -	connID, frames, shouldSwitch := pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000}, now, nil, true)
 +	connID, frames, shouldSwitch := pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000}, now, nil, true, protocol.MinInitialPacketSize, packetInfo{})
-@@ -200,0 +219 @@ func TestPathManagerNATRebinding(t *testing.T) {
+ 	require.Equal(t, connIDs[0], connID)
+ 	require.Len(t, frames, 1)
+ 	require.IsType(t, &wire.PathChallengeFrame{}, frames[0].Frame)
+@@ -214,12 +232,68 @@
+ 	require.False(t, shouldSwitch)
+ 
+ 	// receiving a PATH_RESPONSE for the second path confirms the path
 +	pm.SentProbe(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000}, protocol.MinInitialPacketSize, []ackhandler.Frame{{Frame: pc1}})
-@@ -203 +222 @@ func TestPathManagerNATRebinding(t *testing.T) {
+ 	pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: pc1.Data})
+ 	// we now switch to the new path, as soon as the next packet on that path is received
 -	connID, frames, shouldSwitch = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000}, now, nil, false)
 +	connID, frames, shouldSwitch = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000}, now, nil, false, protocol.MinInitialPacketSize, packetInfo{})
-@@ -208,0 +228,53 @@ func TestPathManagerNATRebinding(t *testing.T) {
+ 	require.Zero(t, connID)
+ 	require.Empty(t, frames)
+ 	require.True(t, shouldSwitch)
++}
++
 +func TestPathManagerBudgetAndMTURevalidation(t *testing.T) {
 +	connID := protocol.ParseConnectionID([]byte{1, 2, 3, 4})
 +	pm := newPathManager(func(pathID) (protocol.ConnectionID, bool) { return connID, true }, func(pathID) {}, utils.DefaultLogger)
@@ -2608,6 +3420,8 @@ index d756120..b2ec523 100644
 +
 +	// An old duplicate response cannot complete the new full-size validation.
 +	pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: firstChallenge.Data})
++	_, _, duplicateProbe := pm.NextMTUProbe()
++	require.Nil(t, duplicateProbe, "an old response must not enqueue another full-size probe")
 +	_, _, switchPath = pm.HandlePacket(addr, monotime.Now(), nil, false, 26, info)
 +	require.False(t, switchPath)
 +	pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: secondChallenge.Data})
@@ -2630,39 +3444,148 @@ index d756120..b2ec523 100644
 +	require.Equal(t, &wire.PathResponseFrame{Data: challenges[0].Data}, frames[0].Frame)
 +	require.Equal(t, &wire.PathResponseFrame{Data: challenges[1].Data}, frames[1].Frame)
 +	require.Equal(t, protocol.ByteCount(117), pm.ProbeSize(addr1))
-+}
-+
-@@ -228 +300 @@ func TestPathManagerLimits(t *testing.T) {
+ }
+ 
+ func TestPathManagerRetransmissions(t *testing.T) {
+@@ -259,7 +333,7 @@
+ 				{19 * rtt, false},
+ 				{23 * rtt, true}, // fourth retry after eight RTTs from the late packet
+ 			} {
+-				id, frames, shouldSwitch := pm.HandlePacket(addr, now.Add(packet.at), nil, true)
++				id, frames, shouldSwitch := pm.HandlePacket(addr, now.Add(packet.at), nil, true, protocol.MinInitialPacketSize, packetInfo{})
+ 				require.False(t, shouldSwitch, "packet at %s", packet.at)
+ 				if !packet.wantChallenge {
+ 					require.Zero(t, id)
+@@ -268,6 +342,7 @@
+ 				}
+ 				require.Equal(t, connID, id)
+ 				require.Len(t, frames, 1, "packet at %s", packet.at)
++				pm.SentProbe(addr, protocol.MinInitialPacketSize, frames)
+ 				challenge := frames[0].Frame.(*wire.PathChallengeFrame).Data
+ 				require.NotContains(t, challenges, challenge)
+ 				challenges = append(challenges, challenge)
+@@ -286,14 +361,14 @@
+ 			pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: challenge})
+ 			// Once validated, even a packet at the next retry deadline needs no new challenge.
+ 			now = now.Add((23 + 16) * rtt)
+-			id, frames, shouldSwitch := pm.HandlePacket(addr, now, nil, false)
++			id, frames, shouldSwitch := pm.HandlePacket(addr, now, nil, false, protocol.MinInitialPacketSize, packetInfo{})
+ 			require.Zero(t, id)
+ 			require.Empty(t, frames)
+ 			require.True(t, shouldSwitch)
+ 
+ 			// A validated path still answers the peer's challenges without probing again.
+ 			pc := &wire.PathChallengeFrame{Data: [8]byte{8, 7, 6, 5, 4, 3, 2, 1}}
+-			id, frames, shouldSwitch = pm.HandlePacket(addr, now, pc, false)
++			id, frames, shouldSwitch = pm.HandlePacket(addr, now, []*wire.PathChallengeFrame{pc}, false, protocol.MinInitialPacketSize, packetInfo{})
+ 			require.Equal(t, connID, id)
+ 			require.Len(t, frames, 1)
+ 			require.Equal(t, &wire.PathResponseFrame{Data: pc.Data}, frames[0].Frame)
+@@ -322,7 +397,7 @@
+ 	require.Greater(t, pathTimeout, maxPaths*time.Second)
+ 	for i := range maxPaths {
+ 		pm.GetOrCreatePath(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000 + i}, now)
 -		connID, frames, _ := pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000 + i}, now, nil, true)
 +		connID, frames, _ := pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000 + i}, now, nil, true, protocol.MinInitialPacketSize, packetInfo{})
-@@ -238 +310 @@ func TestPathManagerLimits(t *testing.T) {
+ 		require.NotEmpty(t, frames)
+ 		require.Equal(t, connIDs[i], connID)
+ 		if i == 0 {
+@@ -331,10 +406,10 @@
+ 		now = now.Add(time.Second)
+ 	}
+ 	// the maximum number of paths is already being probed
+-	now = firstPathTime.Add(pathTimeout - time.Second)
++	now = firstPathTime.Add(pathTimeout - time.Nanosecond)
+ 	_, _, ok := pm.GetOrCreatePath(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 2000}, now)
+ 	require.False(t, ok)
 -	connID, frames, _ := pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 2000}, now, nil, true)
 +	connID, frames, _ := pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 2000}, now, nil, true, protocol.MinInitialPacketSize, packetInfo{})
-@@ -245 +317 @@ func TestPathManagerLimits(t *testing.T) {
+ 	require.Zero(t, connID)
+ 	require.Empty(t, frames)
+ 
+@@ -344,7 +419,7 @@
+ 	// 2. After it expires, respond without evicting it, since this is an existing path.
+ 	for _, rcvTime := range []monotime.Time{now, firstPathTime.Add(pathTimeout + time.Second)} {
+ 		connID, frames, shouldSwitch := pm.HandlePacket(
+-			&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000 + maxPaths - 1}, rcvTime, pc, false,
++			&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000 + maxPaths - 1}, rcvTime, []*wire.PathChallengeFrame{pc}, false, protocol.MinInitialPacketSize, packetInfo{},
+ 		)
+ 		require.Equal(t, connIDs[maxPaths-1], connID)
+ 		require.Len(t, frames, 2)
+@@ -358,7 +433,7 @@
+ 	now = firstPathTime.Add(pathTimeout + time.Second)
+ 	connIDIndex := maxPaths
+ 	pm.GetOrCreatePath(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000 + maxPaths}, now)
 -	connID, frames, _ = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000 + maxPaths}, now, nil, true)
 +	connID, frames, _ = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000 + maxPaths}, now, nil, true, protocol.MinInitialPacketSize, packetInfo{})
-@@ -255 +327 @@ func TestPathManagerLimits(t *testing.T) {
+ 	require.NotEmpty(t, frames)
+ 	require.Equal(t, connIDs[connIDIndex], connID)
+ 	require.Equal(t, []protocol.ConnectionID{firstPathConnID}, retiredConnIDs)
+@@ -369,7 +444,7 @@
+ 	pm.SwitchToPath(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000})
+ 	for i := range maxPaths {
+ 		pm.GetOrCreatePath(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 3000 + i}, now)
 -		connID, frames, _ := pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 3000 + i}, now, nil, true)
 +		connID, frames, _ := pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 3000 + i}, now, nil, true, protocol.MinInitialPacketSize, packetInfo{})
-@@ -264 +336 @@ func TestPathManagerLimits(t *testing.T) {
+ 		if i == 0 {
+ 			f1 = frames
+ 		}
+@@ -379,14 +454,18 @@
+ 	}
+ 	// again, the maximum number of paths is already being probed
+ 	pm.GetOrCreatePath(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 2000}, now)
 -	connID, frames, _ = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 2000}, now, nil, true)
 +	connID, frames, _ = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 2000}, now, nil, true, protocol.MinInitialPacketSize, packetInfo{})
-@@ -272 +344 @@ func TestPathManagerLimits(t *testing.T) {
+ 	require.Zero(t, connID)
+ 	require.Empty(t, frames)
+ 
+ 	// losing the frame doesn't free up a path
+ 	f1[0].Handler.OnLost(f1[0].Frame)
+-	pm.GetOrCreatePath(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4000}, now)
 -	connID, frames, _ = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4000}, now, nil, true)
++
++	// Loss leaves every slot reserved until the inactivity timeout.
 +	connID, frames, _ = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4000}, now, nil, true, protocol.MinInitialPacketSize, packetInfo{})
-@@ -275 +347 @@ func TestPathManagerLimits(t *testing.T) {
--	connID, frames, _ = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4001}, now, nil, true)
++	require.Empty(t, frames)
++	require.Zero(t, connID)
 +	connID, frames, _ = pm.HandlePacket(&net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4001}, now, nil, true, protocol.MinInitialPacketSize, packetInfo{})
-diff --git a/path_validation.go b/path_validation.go
-new file mode 100644
-index 0000000..fe616d8
+ 	require.Zero(t, connID)
+ 	require.Empty(t, frames)
+ }
+@@ -468,3 +547,25 @@
+ 		})
+ 	}
+ }
++
++func TestPathManagerRetriesLostMTUProbe(t *testing.T) {
++	pm := newPathManager(func(pathID) (protocol.ConnectionID, bool) { return protocol.ZeroLengthConnectionID, true }, func(pathID) {}, utils.DefaultLogger)
++	addr := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1234}
++	now := monotime.Now()
++	_, initial, _ := pm.HandlePacket(addr, now, nil, true, 26, packetInfo{})
++	pm.SentProbe(addr, 78, initial)
++	pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: initial[0].Frame.(*wire.PathChallengeFrame).Data})
++	_, first, p := pm.NextMTUProbe()
++	require.NotNil(t, p)
++	pm.SentProbe(addr, 1200, first)
++	first[0].Handler.OnLost(first[0].Frame)
++	_, retry, switchPath := pm.HandlePacket(addr, p.nextProbeTime, nil, true, 26, packetInfo{})
++	require.False(t, switchPath)
++	require.Len(t, retry, 1)
++	require.NotEqual(t, first[0].Frame, retry[0].Frame)
++	pm.SentProbe(addr, 1200, retry)
++	// A delayed response to the earlier full-size challenge remains valid.
++	pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: first[0].Frame.(*wire.PathChallengeFrame).Data})
++	_, _, switchPath = pm.HandlePacket(addr, p.nextProbeTime, nil, true, 26, packetInfo{})
++	require.True(t, switchPath)
++}
 --- /dev/null
 +++ b/path_validation.go
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,60 @@
 +package quic
 +
 +import (
 +	"net"
++	"strconv"
 +
 +	"github.com/quic-go/quic-go/internal/ackhandler"
 +	"github.com/quic-go/quic-go/internal/monotime"
@@ -2694,7 +3617,8 @@ index 0000000..fe616d8
 +			return err
 +		}
 +		c.logger.Debugf("sending path probe packet to %s", remoteAddr)
-+		c.logShortHeaderPacketWithDatagramPayloadChecksum(probe, protocol.ECNNon, buf.Len(), false, datagramPayloadChecksum)
++		id, _ := c.pathManager.IDForPath(remoteAddr)
++		c.logShortHeaderPacketWithDatagramPayloadChecksum(probe, protocol.ECNNon, buf.Len(), false, datagramPayloadChecksum, strconv.FormatInt(int64(id), 10))
 +		c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, now)
 +		c.pathManager.SentProbe(remoteAddr, buf.Len(), probeFrames)
 +		c.sendQueue.SendProbe(buf, remoteAddr, info)
@@ -2717,9 +3641,6 @@ index 0000000..fe616d8
 +		}
 +	}
 +}
-diff --git a/receipt_accounting_test.go b/receipt_accounting_test.go
-new file mode 100644
-index 0000000..37dd2ef
 --- /dev/null
 +++ b/receipt_accounting_test.go
 @@ -0,0 +1,118 @@
@@ -2760,7 +3681,7 @@ index 0000000..37dd2ef
 +			}
 +			physicalBytes := packet.Size()
 +			unpacker.EXPECT().UnpackLongHeader(gomock.Any(), gomock.Any()).Return(nil, handshake.ErrKeysNotYetAvailable).Times(count)
-+			processed, err := c.handleOnePacket(packet, 0)
++			processed, err := c.handleOnePacket(packet, 0, activePathID)
 +			require.NoError(t, err)
 +			require.False(t, processed)
 +			require.Len(t, c.undecryptablePackets, count)
@@ -2773,7 +3694,7 @@ index 0000000..37dd2ef
 +			c.undecryptablePackets = nil
 +			unpacker.EXPECT().UnpackLongHeader(gomock.Any(), gomock.Any()).Return(nil, handshake.ErrKeysNotYetAvailable).Times(count)
 +			for _, p := range queued {
-+				_, err = c.handleOnePacket(p.receivedPacket, p.checksum)
++				_, err = c.handleOnePacket(p.receivedPacket, p.checksum, activePathID)
 +				require.NoError(t, err)
 +			}
 +			t.Logf("network bytes=%d, bytes recorded after deferred retry=%d, remaining budget=%d", physicalBytes,
@@ -2792,7 +3713,7 @@ index 0000000..37dd2ef
 +			queued = c.undecryptablePackets
 +			c.undecryptablePackets = nil
 +			for _, p := range queued {
-+				processed, err = c.handleOnePacket(p.receivedPacket, p.checksum)
++				processed, err = c.handleOnePacket(p.receivedPacket, p.checksum, activePathID)
 +				require.NoError(t, err)
 +				require.True(t, processed)
 +			}
@@ -2812,7 +3733,7 @@ index 0000000..37dd2ef
 +					pn++
 +					return result, nil
 +				}).Times(count)
-+			_, err = c.handleOnePacket(duplicate, 0)
++			_, err = c.handleOnePacket(duplicate, 0, activePathID)
 +			require.NoError(t, err)
 +			require.Equal(t, uint64(2*physicalBytes), c.connStats.BytesReceived.Load())
 +			require.Equal(t, 6*physicalBytes, c.sentPacketHandler.AmplificationBudget())
@@ -2835,53 +3756,100 @@ index 0000000..37dd2ef
 +	for i := 0; i < 2; i++ {
 +		p := getLongHeaderPacket(t, tc.remoteAddr, &hdr, []byte{0})
 +		total += p.Size()
-+		_, err := c.handleOnePacket(p, 0)
++		_, err := c.handleOnePacket(p, 0, activePathID)
 +		require.NoError(t, err)
 +		require.Equal(t, 3*total, c.sentPacketHandler.AmplificationBudget())
 +	}
 +	require.Equal(t, uint64(total), c.connStats.BytesReceived.Load())
 +}
-diff --git a/send_conn.go b/send_conn.go
-index 4cbffc7..8b5dcf8 100644
 --- a/send_conn.go
 +++ b/send_conn.go
-@@ -25,0 +26 @@ type remoteAddrInfo struct {
+@@ -23,6 +23,7 @@
+ type remoteAddrInfo struct {
+ 	addr net.Addr
+ 	oob  []byte
 +	info packetInfo
-@@ -67,0 +69 @@ func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logge
+ }
+ 
+ type sconn struct {
+@@ -65,12 +66,16 @@
+ 	sc.remoteAddrInfo.Store(&remoteAddrInfo{
+ 		addr: remote,
+ 		oob:  oob,
 +		info: info,
-@@ -73 +75,4 @@ func (c *sconn) Write(p []byte, gsoSize uint16, ecn protocol.ECN) error {
+ 	})
+ 	return sc
+ }
+ 
+ func (c *sconn) Write(p []byte, gsoSize uint16, ecn protocol.ECN) error {
 -	ai := c.remoteAddrInfo.Load()
 +	return c.writeWithInfo(p, gsoSize, ecn, c.remoteAddrInfo.Load())
 +}
 +
 +func (c *sconn) writeWithInfo(p []byte, gsoSize uint16, ecn protocol.ECN, ai *remoteAddrInfo) error {
-@@ -119,0 +125 @@ func (c *sconn) ChangeRemoteAddr(addr net.Addr, info packetInfo) {
+ 	err := c.writePacket(p, ai.addr, ai.oob, gsoSize, ecn)
+ 	if err != nil && isGSOError(err) {
+ 		// disable GSO for future calls
+@@ -117,8 +122,11 @@
+ 	c.remoteAddrInfo.Store(&remoteAddrInfo{
+ 		addr: addr,
+ 		oob:  info.OOB(),
 +		info: info,
-@@ -122,0 +129,2 @@ func (c *sconn) ChangeRemoteAddr(addr net.Addr, info packetInfo) {
+ 	})
+ }
+ 
 +func (c *sconn) currentPacketInfo() packetInfo { return c.remoteAddrInfo.Load().info }
 +
-diff --git a/send_queue.go b/send_queue.go
-index c8060cb..f501e3c 100644
+ func (c *sconn) RemoteAddr() net.Addr { return c.remoteAddrInfo.Load().addr }
+ func (c *sconn) LocalAddr() net.Addr  { return c.localAddr }
 --- a/send_queue.go
 +++ b/send_queue.go
-@@ -21,0 +22 @@ type queueEntry struct {
+@@ -19,6 +19,7 @@
+ 	buf     *packetBuffer
+ 	gsoSize uint16
+ 	ecn     protocol.ECN
 +	remote  *remoteAddrInfo
-@@ -29,0 +31 @@ type sendQueue struct {
+ }
+ 
+ type sendQueue struct {
+@@ -27,6 +28,7 @@
+ 	runStopped  chan struct{} // runStopped when the run loop returns
+ 	available   chan struct{}
+ 	conn        sendConn
 +	sconn       *sconn
-@@ -36,0 +39 @@ func newSendQueue(conn sendConn) sender {
+ }
+ 
+ var _ sender = &sendQueue{}
+@@ -34,8 +36,10 @@
+ const sendQueueCapacity = 8
+ 
+ func newSendQueue(conn sendConn) sender {
 +	sc, _ := conn.(*sconn)
-@@ -38,0 +42 @@ func newSendQueue(conn sendConn) sender {
+ 	return &sendQueue{
+ 		conn:        conn,
 +		sconn:       sc,
-@@ -49,0 +54,5 @@ func (h *sendQueue) Send(p *packetBuffer, gsoSize uint16, ecn protocol.ECN) {
+ 		runStopped:  make(chan struct{}),
+ 		closeCalled: make(chan struct{}),
+ 		available:   make(chan struct{}, 1),
+@@ -47,8 +51,13 @@
+ // Callers need to make sure that there's actually space in the send queue by calling WouldBlock.
+ // Otherwise Send will panic.
+ func (h *sendQueue) Send(p *packetBuffer, gsoSize uint16, ecn protocol.ECN) {
 +	entry := queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn}
 +	if h.sconn != nil {
 +		// A migration can occur before the send worker drains this entry.
 +		entry.remote = h.sconn.remoteAddrInfo.Load()
 +	}
-@@ -51 +60 @@ func (h *sendQueue) Send(p *packetBuffer, gsoSize uint16, ecn protocol.ECN) {
+ 	select {
 -	case h.queue <- queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn}:
 +	case h.queue <- entry:
-@@ -90 +99,7 @@ func (h *sendQueue) Run() error {
+ 		// clear available channel if we've reached capacity
+ 		if len(h.queue) == sendQueueCapacity {
+ 			select {
+@@ -87,7 +96,13 @@
+ 			// make sure that all queued packets are actually sent out
+ 			shouldClose = true
+ 		case e := <-h.queue:
 -			if err := h.conn.Write(e.buf.Data, e.gsoSize, e.ecn); err != nil {
 +			var err error
 +			if e.remote != nil {
@@ -2890,9 +3858,9 @@ index c8060cb..f501e3c 100644
 +				err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
 +			}
 +			if err != nil {
-diff --git a/send_queue_path_test.go b/send_queue_path_test.go
-new file mode 100644
-index 0000000..609aefc
+ 				// This additional check enables:
+ 				// 1. Checking for "datagram too large" message from the kernel, as such,
+ 				// 2. Path MTU discovery,and
 --- /dev/null
 +++ b/send_queue_path_test.go
 @@ -0,0 +1,64 @@
@@ -2960,12 +3928,9 @@ index 0000000..609aefc
 +		})
 +	}
 +}
-diff --git a/transport_conformance_test.go b/transport_conformance_test.go
-new file mode 100644
-index 0000000..962e136
 --- /dev/null
 +++ b/transport_conformance_test.go
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,150 @@
 +package quic
 +
 +import (
@@ -3028,8 +3993,8 @@ index 0000000..962e136
 +					return append(src, bytes.Repeat([]byte{'s'}, 16)...)
 +				})
 +				tp.sealingManager.EXPECT().Get1RTTSealer().Return(sealer, nil)
-+				tp.pnManager.EXPECT().PeekPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x42), pnLen)
-+				tp.pnManager.EXPECT().PopPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(0x42))
++				tp.pnManager.EXPECT().PeekPacketNumber(protocol.PacketNumberSpaceAppData).Return(protocol.PacketNumber(0x42), pnLen)
++				tp.pnManager.EXPECT().PopPacketNumber(protocol.PacketNumberSpaceAppData).Return(protocol.PacketNumber(0x42))
 +				tp.framer.EXPECT().HasData().Return(false)
 +				tp.ackFramer.EXPECT().GetAckFrame(protocol.Encryption1RTT, gomock.Any(), true).Return(nil)
 +				buf := getPacketBuffer()
@@ -3048,10 +4013,11 @@ index 0000000..962e136
 +func TestConnectionMTUProbeRespectsCongestionBudget(t *testing.T) {
 +	ctrl := gomock.NewController(t)
 +	tc := newServerTestConnection(t, ctrl, &Config{InitialPacketSize: 1400}, false, connectionOptHandshakeConfirmed())
++	tc.conn.peerParams = &wire.TransportParameters{MaxUDPPayloadSize: 1452}
 +	now := monotime.Now()
 +	h := ackhandler.NewSentPacketHandler(0, 1400, utils.NewRTTStats(), &utils.ConnectionStats{}, true, false, nil, protocol.PerspectiveServer, nil, utils.DefaultLogger)
 +	for range 31 {
-+		pn := h.PopPacketNumber(protocol.Encryption1RTT)
++		pn := h.PopPacketNumber(protocol.PacketNumberSpaceAppData)
 +		h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []ackhandler.Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 1400, false, false)
 +	}
 +	tc.conn.sentPacketHandler = h
@@ -3072,7 +4038,7 @@ index 0000000..962e136
 +	now := monotime.Now()
 +	d.Start(now.Add(-time.Minute))
 +	require.False(t, d.ShouldSendProbe(now))
-+	d.Reset(now, 1400, 1300)
++	d.Reset(1400, 1300)
 +	require.Equal(t, protocol.ByteCount(1300), d.CurrentSize())
 +	require.False(t, d.ShouldSendProbe(now.Add(time.Minute)))
 +}
@@ -3102,8 +4068,8 @@ index 0000000..962e136
 +	tp.packer.handshakeStream.Write(make([]byte, 2000))
 +	tp.sealingManager.EXPECT().GetInitialSealer().Return(newMockShortHeaderSealer(ctrl), nil)
 +	tp.sealingManager.EXPECT().GetHandshakeSealer().Return(newMockShortHeaderSealer(ctrl), nil)
-+	tp.pnManager.EXPECT().PeekPacketNumber(protocol.EncryptionHandshake).Return(protocol.PacketNumber(0x42), protocol.PacketNumberLen2)
-+	tp.pnManager.EXPECT().PopPacketNumber(protocol.EncryptionHandshake).Return(protocol.PacketNumber(0x42))
++	tp.pnManager.EXPECT().PeekPacketNumber(protocol.PacketNumberSpaceHandshake).Return(protocol.PacketNumber(0x42), protocol.PacketNumberLen2)
++	tp.pnManager.EXPECT().PopPacketNumber(protocol.PacketNumberSpaceHandshake).Return(protocol.PacketNumber(0x42))
 +	tp.ackFramer.EXPECT().GetAckFrame(protocol.EncryptionHandshake, gomock.Any(), false).Return(nil)
 +	p, err := tp.packer.PackCoalescedPacket(false, 806, monotime.Now(), protocol.Version1)
 +	require.NoError(t, err)

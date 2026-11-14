@@ -202,7 +202,10 @@ func (h *Handler) reject(w http.ResponseWriter, r *http.Request, rej rejection) 
 	if rej.malformed && r.ProtoMajor == 3 {
 		_ = http.NewResponseController(w).Flush()
 		if s, ok := unwrapStreamer(w); ok {
-			str := s.HTTPStream()
+			str, err := s.HTTPStream()
+			if err != nil {
+				return err
+			}
 			str.CancelRead(h3MessageError)
 			_ = str.Close()
 		}
@@ -586,7 +589,10 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request, req request, ha
 		if err := rc.Flush(); err != nil {
 			return nil, true, err
 		}
-		str := s.HTTPStream()
+		str, err := s.HTTPStream()
+		if err != nil {
+			return nil, true, err
+		}
 		_ = str.SetReadDeadline(time.Time{})
 		_ = str.SetWriteDeadline(time.Time{})
 		return newH3Tunnel(str, quicDatagrams), true, nil
